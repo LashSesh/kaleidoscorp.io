@@ -1,0 +1,13 @@
+{
+  "request": {
+    "protocol": { "major": 1, "minor": 0, "patch": 0 },
+    "min_compatible": { "major": 1, "minor": 0, "patch": 0 },
+    "capabilities": {
+      "features": ["gate-vector-12", "replay-v1", "doctor-v1", "canonical-cbor-v1"]
+    },
+    "strict_mode": true,
+    "deterministic_clock_epoch": 120,
+    "deterministic_seed": 42
+  },
+  "expected_accept": true
+}

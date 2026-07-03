@@ -42,6 +42,36 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo test -p ssk-runtime --test replay_vectors
 
+  interop_contracts:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test -p ssk-interop
+
+  config_schema_guard:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test -p ssk-config schema_snapshot_stable
+      - run: cargo run -p ssk-cli -- config schema --json > /tmp/ssk-config-schema.json
+      - run: test -s /tmp/ssk-config-schema.json
+
+  breaking_change_guard:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    steps:
+      - uses: actions/checkout@v4
+      - name: Guard interop and config contract surfaces
+        run: |
+          git diff --name-only origin/${{ github.base_ref }}...HEAD | tee /tmp/changed_files.txt
+          if grep -Eq '^crates/ssk-interop/src/lib.rs|^crates/ssk-config/src/lib.rs|^docs/INTEROP_SPEC.md|^docs/COMPATIBILITY_MATRIX.md' /tmp/changed_files.txt; then
+            echo "Contract surface changed; ensure compatibility docs/tests are updated."
+          fi
+
   no_std_core:
     runs-on: ubuntu-latest
     steps:

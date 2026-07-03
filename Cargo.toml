@@ -17,6 +17,7 @@ members = [
   "crates/ssk-privacy",
   "crates/ssk-crypto",
   "crates/ssk-config",
+  "crates/ssk-interop",
   "crates/ssk-runtime",
   "crates/ssk-sim",
   "crates/ssk-cli",

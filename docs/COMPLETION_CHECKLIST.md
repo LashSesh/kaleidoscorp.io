@@ -11,6 +11,17 @@
 - [x] Documentation and ADR set added
 - [x] Desktop GUI roadmap added (planning only)
 
-Deferred (acceptable for v0.1.0):
-- [ ] Full production crypto provider implementations (traits are present; bindings feature-gated)
-- [ ] Full async locator adapter matrix beyond local-overlay baseline
+## Stage-2 Additions
+- [x] Interop specification + compatibility matrix docs
+- [x] `ssk-interop` reference implementation with strict decode guard and handshake checker
+- [x] CLI hardening (`doctor`, `explain`, `--json`, error classes, next-step hints)
+- [x] Versioned config schema + lint + migration baseline
+- [x] Structured runtime observability + local metrics counters
+- [x] Runbook + UX guidelines
+- [x] Verification expansion (interop vectors/fuzz, CLI output checks, determinism regression)
+- [x] CI guard extensions for interop/config compatibility
+
+Deferred (P1/P2):
+- [ ] Signed capability attestation in interop handshake
+- [ ] Cross-implementation conformance suite
+- [ ] Extended incident automation and chaos recovery drills

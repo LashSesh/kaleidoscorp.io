@@ -19,6 +19,7 @@ ssk-audit = { path = "../ssk-audit" }
 ssk-replay = { path = "../ssk-replay" }
 ssk-config = { path = "../ssk-config" }
 thiserror.workspace = true
+serde.workspace = true
 
 [lints]
 workspace = true

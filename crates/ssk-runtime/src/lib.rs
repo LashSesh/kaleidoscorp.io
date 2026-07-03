@@ -23,6 +23,53 @@ pub enum RuntimeError {
     Types(#[from] ssk_types::TypeError),
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeterminismContext {
+    pub seeded: bool,
+    pub epoch: u64,
+}
+
+impl Default for DeterminismContext {
+    fn default() -> Self {
+        Self {
+            seeded: false,
+            epoch: 0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct RuntimeEvent {
+    pub event: String,
+    pub run_id: String,
+    pub replay_id: String,
+    pub seeded: bool,
+    pub epoch: u64,
+    pub gate_outcome: GateOutcomeKind,
+    pub residues: usize,
+    pub trace_count: usize,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq, Default)]
+pub struct RuntimeMetrics {
+    pub run_count: u64,
+    pub gate_failures: u64,
+    pub replay_drifts: u64,
+}
+
+impl RuntimeMetrics {
+    pub fn record_run(&mut self, outcome: GateOutcomeKind) {
+        self.run_count += 1;
+        if outcome != GateOutcomeKind::Pass {
+            self.gate_failures += 1;
+        }
+    }
+
+    pub fn record_replay_drift(&mut self) {
+        self.replay_drifts += 1;
+    }
+}
+
 pub struct Runtime<'a, L: LedgerBackend> {
     pub gate_vector: GateVector,
     pub tensor: &'a L,
@@ -34,11 +81,20 @@ impl<'a, L: LedgerBackend> Runtime<'a, L> {
         intent: ConnectionIntent,
         pool: &LocatorPool,
     ) -> Result<(RuntimeOutcome, ReplayManifest), RuntimeError> {
+        self.run_once_with_context(intent, pool, &DeterminismContext::default())
+    }
+
+    pub fn run_once_with_context(
+        &self,
+        intent: ConnectionIntent,
+        pool: &LocatorPool,
+        determinism: &DeterminismContext,
+    ) -> Result<(RuntimeOutcome, ReplayManifest), RuntimeError> {
         let mut scheduler = DeterministicScheduler::new(
             ssk_types::PhaseVector::zero(),
             FrequencyVector::deterministic(),
-            false,
-            0,
+            determinism.seeded,
+            determinism.epoch,
         );
         let _phase = scheduler.tick();
 
@@ -96,13 +152,7 @@ impl<'a, L: LedgerBackend> Runtime<'a, L> {
             None
         };
 
-        let scheduler_state = SchedulerState {
-            theta0: ssk_types::PhaseVector::zero(),
-            freq: FrequencyVector::deterministic(),
-            seeded: false,
-            epoch: 0,
-            ticks: 1,
-        };
+        let scheduler_state = scheduler.state();
 
         let manifest = ReplayManifest {
             run: intent.run.clone(),
@@ -136,6 +186,25 @@ impl<'a, L: LedgerBackend> Runtime<'a, L> {
             },
             manifest,
         ))
+    }
+
+    #[must_use]
+    pub fn runtime_event(
+        &self,
+        outcome: &RuntimeOutcome,
+        manifest: &ReplayManifest,
+        determinism: &DeterminismContext,
+    ) -> RuntimeEvent {
+        RuntimeEvent {
+            event: "runtime.run.completed".into(),
+            run_id: outcome.run.0 .0.clone(),
+            replay_id: manifest.trace_head.0 .0.clone(),
+            seeded: determinism.seeded,
+            epoch: determinism.epoch,
+            gate_outcome: outcome.gate_report.outcome,
+            residues: outcome.residues.len(),
+            trace_count: outcome.traces.len(),
+        }
     }
 }
 
@@ -181,5 +250,40 @@ mod tests {
             .expect("runtime should execute");
         assert_ne!(outcome.gate_report.outcome, GateOutcomeKind::Pass);
         assert!(tensor.entries().expect("entries readable").is_empty());
+    }
+
+    #[test]
+    fn deterministic_context_is_reproducible() {
+        let tensor_a = ssk_tensor::MemoryBackend::new();
+        let tensor_b = ssk_tensor::MemoryBackend::new();
+        let runtime_a = Runtime {
+            gate_vector: GateVector::with_all_default(),
+            tensor: &tensor_a,
+        };
+        let runtime_b = Runtime {
+            gate_vector: GateVector::with_all_default(),
+            tensor: &tensor_b,
+        };
+        let pool = LocatorPool::new(vec![Locator {
+            id: ssk_types::LocatorId::new("local"),
+            locator_type: LocatorType::LocalOverlay,
+            trusted: true,
+            risk_score: 10,
+        }]);
+        let ctx = DeterminismContext {
+            seeded: true,
+            epoch: 77,
+        };
+
+        let (a, ma) = runtime_a
+            .run_once_with_context(sample_intent(true), &pool, &ctx)
+            .expect("first run");
+        let (b, mb) = runtime_b
+            .run_once_with_context(sample_intent(true), &pool, &ctx)
+            .expect("second run");
+
+        assert_eq!(a.gate_report, b.gate_report);
+        assert_eq!(ma.trace_head, mb.trace_head);
+        assert_eq!(ma.descriptor.scheduler, mb.descriptor.scheduler);
     }
 }
