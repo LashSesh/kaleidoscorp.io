@@ -3,8 +3,9 @@ use std::path::Path;
 use proptest::prelude::*;
 use serde::{Deserialize, Serialize};
 use ssk_interop::{
-    decode_strict, decode_with_mode, encode_canonical, Capabilities, CompatibilityPolicy,
-    DecodeMode, HandshakeRequest, ProtocolVersion,
+    decode_strict, decode_with_mode, encode_canonical, AttestationVerifier, Blake3KeyedVerifier,
+    Capabilities, CompatibilityPolicy, ConformanceSuite, DecodeMode, HandshakeRequest,
+    ProtocolVersion,
 };
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -25,7 +26,7 @@ fn golden_vector_roundtrip_and_compatibility() {
     let wire = encode_canonical(&vector.request).expect("canonical encode must work");
     let decoded: HandshakeRequest = decode_strict(&wire).expect("strict decode must work");
 
-    let result = CompatibilityPolicy::default().evaluate(&decoded);
+    let result = CompatibilityPolicy::default().evaluate(&decoded, None);
     assert_eq!(result.is_ok(), vector.expected_accept);
 }
 
@@ -49,14 +50,39 @@ fn capability_mismatch_rejected() {
         strict_mode: true,
         deterministic_clock_epoch: 10,
         deterministic_seed: 1,
+        attestation: None,
     };
     let error = CompatibilityPolicy::default()
-        .evaluate(&request)
+        .evaluate(&request, None)
         .expect_err("missing required capability must fail");
     assert_eq!(
         error.code(),
         ssk_interop::InteropErrorCode::CapabilityMismatch
     );
+}
+
+#[test]
+fn conformance_suite_reference_run() {
+    let suite = ConformanceSuite::default();
+    let report = suite.run(&CompatibilityPolicy::default());
+    assert!(
+        report.all_passed(),
+        "conformance failures: {:#?}",
+        report
+            .results
+            .iter()
+            .filter(|r| !r.passed)
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn blake3_verifier_sign_and_verify_roundtrip() {
+    let v = Blake3KeyedVerifier::test_key();
+    let data = b"capability-attestation-test";
+    let sig = v.sign(data);
+    assert!(v.verify_token(data, &sig));
+    assert!(!v.verify_token(data, "00000000"));
 }
 
 proptest::proptest! {

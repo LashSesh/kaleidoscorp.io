@@ -3,6 +3,292 @@
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::collections::BTreeSet;
 
+// ---------------------------------------------------------------------------
+// Attestation types
+// ---------------------------------------------------------------------------
+
+/// A capability attestation token that a peer presents during handshake.
+/// The token binds a subject identity to a capability set and time epoch.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AttestationToken {
+    /// Opaque subject identifier (e.g. peer canonical name or policy root id).
+    pub subject_id: String,
+    /// Capabilities the subject attests to holding.
+    pub capabilities: Vec<String>,
+    /// Deterministic clock epoch at which the token was issued.
+    pub epoch: u64,
+    /// Monotonic nonce to prevent replay of the same token bytes.
+    pub nonce: u64,
+}
+
+impl AttestationToken {
+    /// Produce the canonical byte representation used for signing/verifying.
+    pub fn canonical_bytes(&self) -> Result<Vec<u8>, InteropError> {
+        ssk_types::canonical_bytes(self).map_err(|e| InteropError::Encode(e.to_string()))
+    }
+}
+
+/// A signed attestation: the raw token plus its hex-encoded Blake3-keyed-MAC
+/// signature produced with the shared attestation key.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SignedAttestation {
+    pub token: AttestationToken,
+    /// Hex-encoded signature bytes (64 hex chars for Blake3 keyed hash).
+    pub signature_hex: String,
+}
+
+/// Pluggable verifier interface for attestation signatures.
+/// Implementations may use Blake3-keyed-hash, Ed25519, or any other scheme.
+pub trait AttestationVerifier: Send + Sync {
+    fn verify_token(&self, token_bytes: &[u8], signature_hex: &str) -> bool;
+}
+
+/// Default verifier: Blake3 keyed-hash with a fixed well-known test key.
+/// Not for production use; replace with a real asymmetric scheme.
+#[derive(Debug, Clone)]
+pub struct Blake3KeyedVerifier {
+    key: [u8; 32],
+}
+
+impl Blake3KeyedVerifier {
+    #[must_use]
+    pub const fn new(key: [u8; 32]) -> Self {
+        Self { key }
+    }
+
+    /// Well-known test key (all-zeros; replace in production).
+    #[must_use]
+    pub const fn test_key() -> Self {
+        Self::new([0u8; 32])
+    }
+
+    /// Sign a token with this key (for test/fixture generation).
+    pub fn sign(&self, token_bytes: &[u8]) -> String {
+        let hash = blake3::keyed_hash(&self.key, token_bytes);
+        hex::encode(hash.as_bytes())
+    }
+}
+
+impl AttestationVerifier for Blake3KeyedVerifier {
+    fn verify_token(&self, token_bytes: &[u8], signature_hex: &str) -> bool {
+        let expected = blake3::keyed_hash(&self.key, token_bytes);
+        let expected_hex = hex::encode(expected.as_bytes());
+        expected_hex == signature_hex
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Conformance Suite
+// ---------------------------------------------------------------------------
+
+/// A named conformance profile: a specific handshake scenario with expected outcome.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConformanceProfile {
+    pub name: String,
+    pub description: String,
+    pub request: HandshakeRequest,
+    pub expected_accept: bool,
+}
+
+/// Result of running a single conformance profile against a policy.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConformanceResult {
+    pub name: String,
+    pub passed: bool,
+    pub detail: String,
+}
+
+/// Aggregated report for a full conformance run.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConformanceReport {
+    pub results: Vec<ConformanceResult>,
+    pub total: usize,
+    pub passed: usize,
+    pub failed: usize,
+}
+
+impl ConformanceReport {
+    #[must_use]
+    pub fn all_passed(&self) -> bool {
+        self.failed == 0
+    }
+}
+
+/// A suite of conformance profiles.  `ConformanceSuite::default()` provides
+/// the standard cross-implementation reference profiles.
+pub struct ConformanceSuite {
+    pub profiles: Vec<ConformanceProfile>,
+}
+
+impl Default for ConformanceSuite {
+    fn default() -> Self {
+        Self {
+            profiles: vec![
+                ConformanceProfile {
+                    name: "full-featured".into(),
+                    description: "All required capabilities, strict mode, nominal epoch".into(),
+                    request: HandshakeRequest {
+                        protocol: ProtocolVersion::new(1, 0, 0),
+                        min_compatible: ProtocolVersion::new(1, 0, 0),
+                        capabilities: Capabilities {
+                            features: vec![
+                                "gate-vector-12".into(),
+                                "replay-v1".into(),
+                                "canonical-cbor-v1".into(),
+                                "doctor-v1".into(),
+                            ],
+                        },
+                        strict_mode: true,
+                        deterministic_clock_epoch: 120,
+                        deterministic_seed: 42,
+                        attestation: None,
+                    },
+                    expected_accept: true,
+                },
+                ConformanceProfile {
+                    name: "min-capabilities".into(),
+                    description: "Exactly the minimum required capabilities".into(),
+                    request: HandshakeRequest {
+                        protocol: ProtocolVersion::new(1, 0, 0),
+                        min_compatible: ProtocolVersion::new(1, 0, 0),
+                        capabilities: Capabilities {
+                            features: vec!["gate-vector-12".into(), "replay-v1".into()],
+                        },
+                        strict_mode: true,
+                        deterministic_clock_epoch: 0,
+                        deterministic_seed: 1,
+                        attestation: None,
+                    },
+                    expected_accept: true,
+                },
+                ConformanceProfile {
+                    name: "major-version-mismatch".into(),
+                    description: "Peer presents major version 2 which is incompatible".into(),
+                    request: HandshakeRequest {
+                        protocol: ProtocolVersion::new(2, 0, 0),
+                        min_compatible: ProtocolVersion::new(2, 0, 0),
+                        capabilities: Capabilities {
+                            features: vec!["gate-vector-12".into(), "replay-v1".into()],
+                        },
+                        strict_mode: true,
+                        deterministic_clock_epoch: 0,
+                        deterministic_seed: 0,
+                        attestation: None,
+                    },
+                    expected_accept: false,
+                },
+                ConformanceProfile {
+                    name: "missing-required-capability".into(),
+                    description: "Peer is missing the replay-v1 required capability".into(),
+                    request: HandshakeRequest {
+                        protocol: ProtocolVersion::new(1, 0, 0),
+                        min_compatible: ProtocolVersion::new(1, 0, 0),
+                        capabilities: Capabilities {
+                            features: vec!["gate-vector-12".into()],
+                        },
+                        strict_mode: true,
+                        deterministic_clock_epoch: 0,
+                        deterministic_seed: 0,
+                        attestation: None,
+                    },
+                    expected_accept: false,
+                },
+                ConformanceProfile {
+                    name: "non-strict-mode".into(),
+                    description: "Peer requests non-strict mode; must be rejected".into(),
+                    request: HandshakeRequest {
+                        protocol: ProtocolVersion::new(1, 0, 0),
+                        min_compatible: ProtocolVersion::new(1, 0, 0),
+                        capabilities: Capabilities {
+                            features: vec!["gate-vector-12".into(), "replay-v1".into()],
+                        },
+                        strict_mode: false,
+                        deterministic_clock_epoch: 0,
+                        deterministic_seed: 0,
+                        attestation: None,
+                    },
+                    expected_accept: false,
+                },
+                ConformanceProfile {
+                    name: "clock-epoch-exceeded".into(),
+                    description: "Epoch exceeds max_clock_skew_secs; must be rejected".into(),
+                    request: HandshakeRequest {
+                        protocol: ProtocolVersion::new(1, 0, 0),
+                        min_compatible: ProtocolVersion::new(1, 0, 0),
+                        capabilities: Capabilities {
+                            features: vec!["gate-vector-12".into(), "replay-v1".into()],
+                        },
+                        strict_mode: true,
+                        deterministic_clock_epoch: 999_999,
+                        deterministic_seed: 0,
+                        attestation: None,
+                    },
+                    expected_accept: false,
+                },
+                ConformanceProfile {
+                    name: "future-min-compatible".into(),
+                    description: "Peer demands min_compatible > our current version; reject".into(),
+                    request: HandshakeRequest {
+                        protocol: ProtocolVersion::new(1, 0, 0),
+                        min_compatible: ProtocolVersion::new(1, 99, 0),
+                        capabilities: Capabilities {
+                            features: vec!["gate-vector-12".into(), "replay-v1".into()],
+                        },
+                        strict_mode: true,
+                        deterministic_clock_epoch: 0,
+                        deterministic_seed: 0,
+                        attestation: None,
+                    },
+                    expected_accept: false,
+                },
+            ],
+        }
+    }
+}
+
+impl ConformanceSuite {
+    /// Run all profiles against the given policy.
+    /// Attestation verification is skipped for profiles without attestation.
+    pub fn run(&self, policy: &CompatibilityPolicy) -> ConformanceReport {
+        let results: Vec<ConformanceResult> = self
+            .profiles
+            .iter()
+            .map(|p| {
+                let outcome = policy.evaluate(&p.request, None);
+                let accepted = outcome.is_ok();
+                let passed = accepted == p.expected_accept;
+                ConformanceResult {
+                    name: p.name.clone(),
+                    passed,
+                    detail: if passed {
+                        format!("ok (accepted={})", accepted)
+                    } else {
+                        match outcome {
+                            Ok(_) => format!(
+                                "expected reject but was accepted (profile: {})",
+                                p.name
+                            ),
+                            Err(e) => format!(
+                                "expected accept but was rejected: {e} (profile: {})",
+                                p.name
+                            ),
+                        }
+                    },
+                }
+            })
+            .collect();
+
+        let passed = results.iter().filter(|r| r.passed).count();
+        let total = results.len();
+        ConformanceReport {
+            failed: total - passed,
+            results,
+            total,
+            passed,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProtocolVersion {
     pub major: u64,
@@ -100,6 +386,11 @@ pub struct HandshakeRequest {
     pub strict_mode: bool,
     pub deterministic_clock_epoch: u64,
     pub deterministic_seed: u64,
+    /// Optional signed capability attestation.  When present and the policy
+    /// `require_attestation` flag is set, the handshake verifies it before
+    /// accepting the peer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attestation: Option<SignedAttestation>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -109,6 +400,9 @@ pub struct HandshakeResponse {
     pub capabilities: Capabilities,
     pub strict_mode: bool,
     pub error: Option<InteropErrorCode>,
+    /// Whether a presented attestation was successfully verified.
+    #[serde(default)]
+    pub attestation_verified: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -126,6 +420,8 @@ pub enum InteropErrorCode {
     ClockOutOfRange,
     NonCanonicalEncoding,
     DecodeRejected,
+    AttestationRequired,
+    AttestationInvalid,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -146,6 +442,10 @@ pub enum InteropError {
     Decode(String),
     #[error("non-canonical wire encoding")]
     NonCanonicalEncoding,
+    #[error("signed capability attestation is required but was not presented")]
+    AttestationRequired,
+    #[error("signed capability attestation verification failed")]
+    AttestationInvalid,
 }
 
 impl InteropError {
@@ -159,6 +459,8 @@ impl InteropError {
             Self::CapabilityInvalid(_) | Self::Encode(_) => InteropErrorCode::DecodeRejected,
             Self::Decode(_) => InteropErrorCode::DecodeRejected,
             Self::NonCanonicalEncoding => InteropErrorCode::NonCanonicalEncoding,
+            Self::AttestationRequired => InteropErrorCode::AttestationRequired,
+            Self::AttestationInvalid => InteropErrorCode::AttestationInvalid,
         }
     }
 }
@@ -171,6 +473,8 @@ pub struct CompatibilityPolicy {
     pub max_clock_skew_secs: u64,
     pub strict_mode_only: bool,
     pub local_capabilities: Capabilities,
+    /// When `true`, the peer must present a valid `SignedAttestation`.
+    pub require_attestation: bool,
 }
 
 impl Default for CompatibilityPolicy {
@@ -189,12 +493,23 @@ impl Default for CompatibilityPolicy {
                     "doctor-v1".into(),
                 ],
             },
+            require_attestation: false,
         }
     }
 }
 
 impl CompatibilityPolicy {
-    pub fn evaluate(&self, request: &HandshakeRequest) -> Result<HandshakeResponse, InteropError> {
+    /// Evaluate a handshake request, optionally verifying its attestation.
+    ///
+    /// `verifier` is only consulted when the request carries an attestation or
+    /// when `require_attestation` is set.  Pass `None` to skip verification
+    /// (only valid when `require_attestation` is `false` and no attestation is
+    /// present).
+    pub fn evaluate(
+        &self,
+        request: &HandshakeRequest,
+        verifier: Option<&dyn AttestationVerifier>,
+    ) -> Result<HandshakeResponse, InteropError> {
         request.capabilities.validate()?;
         self.local_capabilities.validate()?;
 
@@ -219,12 +534,31 @@ impl CompatibilityPolicy {
             ));
         }
 
+        // Attestation check
+        let attestation_verified = match &request.attestation {
+            Some(signed) => {
+                let v = verifier.ok_or(InteropError::AttestationInvalid)?;
+                let token_bytes = signed.token.canonical_bytes()?;
+                if !v.verify_token(&token_bytes, &signed.signature_hex) {
+                    return Err(InteropError::AttestationInvalid);
+                }
+                true
+            }
+            None => {
+                if self.require_attestation {
+                    return Err(InteropError::AttestationRequired);
+                }
+                false
+            }
+        };
+
         Ok(HandshakeResponse {
             accepted: true,
             negotiated: self.current.clone(),
             capabilities: request.capabilities.intersection(&self.local_capabilities),
             strict_mode: true,
             error: None,
+            attestation_verified,
         })
     }
 }
@@ -279,11 +613,110 @@ mod tests {
             strict_mode: true,
             deterministic_clock_epoch: 10,
             deterministic_seed: 42,
+            attestation: None,
         };
         let resp = CompatibilityPolicy::default()
-            .evaluate(&req)
+            .evaluate(&req, None)
             .expect("must accept compatible peer");
         assert!(resp.accepted);
+        assert!(!resp.attestation_verified);
         assert_eq!(resp.negotiated, ProtocolVersion::new(1, 0, 0));
+    }
+
+    #[test]
+    fn attestation_verified_on_valid_token() {
+        let verifier = Blake3KeyedVerifier::test_key();
+        let token = AttestationToken {
+            subject_id: "peer-alpha".into(),
+            capabilities: vec!["gate-vector-12".into(), "replay-v1".into()],
+            epoch: 10,
+            nonce: 99,
+        };
+        let token_bytes = token.canonical_bytes().expect("canonical bytes");
+        let sig = verifier.sign(&token_bytes);
+        let req = HandshakeRequest {
+            protocol: ProtocolVersion::new(1, 0, 0),
+            min_compatible: ProtocolVersion::new(1, 0, 0),
+            capabilities: Capabilities {
+                features: vec!["gate-vector-12".into(), "replay-v1".into()],
+            },
+            strict_mode: true,
+            deterministic_clock_epoch: 10,
+            deterministic_seed: 0,
+            attestation: Some(SignedAttestation {
+                token,
+                signature_hex: sig,
+            }),
+        };
+        let resp = CompatibilityPolicy::default()
+            .evaluate(&req, Some(&verifier))
+            .expect("attestation must be accepted");
+        assert!(resp.attestation_verified);
+    }
+
+    #[test]
+    fn attestation_invalid_signature_rejected() {
+        let verifier = Blake3KeyedVerifier::test_key();
+        let token = AttestationToken {
+            subject_id: "peer-beta".into(),
+            capabilities: vec!["gate-vector-12".into(), "replay-v1".into()],
+            epoch: 10,
+            nonce: 1,
+        };
+        let req = HandshakeRequest {
+            protocol: ProtocolVersion::new(1, 0, 0),
+            min_compatible: ProtocolVersion::new(1, 0, 0),
+            capabilities: Capabilities {
+                features: vec!["gate-vector-12".into(), "replay-v1".into()],
+            },
+            strict_mode: true,
+            deterministic_clock_epoch: 10,
+            deterministic_seed: 0,
+            attestation: Some(SignedAttestation {
+                token,
+                signature_hex: "deadbeef".into(),
+            }),
+        };
+        let err = CompatibilityPolicy::default()
+            .evaluate(&req, Some(&verifier))
+            .expect_err("invalid attestation must be rejected");
+        assert_eq!(err.code(), InteropErrorCode::AttestationInvalid);
+    }
+
+    #[test]
+    fn require_attestation_rejects_missing_attestation() {
+        let policy = CompatibilityPolicy {
+            require_attestation: true,
+            ..CompatibilityPolicy::default()
+        };
+        let req = HandshakeRequest {
+            protocol: ProtocolVersion::new(1, 0, 0),
+            min_compatible: ProtocolVersion::new(1, 0, 0),
+            capabilities: Capabilities {
+                features: vec!["gate-vector-12".into(), "replay-v1".into()],
+            },
+            strict_mode: true,
+            deterministic_clock_epoch: 0,
+            deterministic_seed: 0,
+            attestation: None,
+        };
+        let err = policy
+            .evaluate(&req, None)
+            .expect_err("missing attestation must be rejected");
+        assert_eq!(err.code(), InteropErrorCode::AttestationRequired);
+    }
+
+    #[test]
+    fn conformance_suite_all_profiles_pass() {
+        let suite = ConformanceSuite::default();
+        let report = suite.run(&CompatibilityPolicy::default());
+        for result in &report.results {
+            assert!(
+                result.passed,
+                "conformance profile '{}' failed: {}",
+                result.name, result.detail
+            );
+        }
+        assert!(report.all_passed());
     }
 }

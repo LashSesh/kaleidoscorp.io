@@ -21,6 +21,8 @@ ssk-config = { path = "../ssk-config" }
 ssk-replay = { path = "../ssk-replay" }
 ssk-tensor = { path = "../ssk-tensor", features = ["storage"] }
 ssk-interop = { path = "../ssk-interop" }
+ssk-netadmin = { path = "../ssk-netadmin" }
+ssk-faultscan = { path = "../ssk-faultscan" }
 
 [lints]
 workspace = true

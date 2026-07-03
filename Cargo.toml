@@ -20,6 +20,7 @@ members = [
   "crates/ssk-interop",
   "crates/ssk-runtime",
   "crates/ssk-sim",
+  "crates/ssk-netadmin",
   "crates/ssk-cli",
 ]
 

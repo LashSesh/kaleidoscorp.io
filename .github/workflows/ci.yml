@@ -80,6 +80,30 @@ jobs:
       - run: cargo check -p ssk-types --no-default-features
       - run: cargo check -p ssk-core --no-default-features
 
+  netadmin_contracts:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test -p ssk-netadmin
+
+  conformance_suite:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test -p ssk-interop conformance
+
+  chaos_drills:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test -p ssk-faultscan
+
   cargo_audit:
     runs-on: ubuntu-latest
     steps:

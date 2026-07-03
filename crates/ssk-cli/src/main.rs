@@ -2,12 +2,21 @@
 
 use clap::{Parser, Subcommand};
 use serde::Serialize;
+use ssk_faultscan::{run_playbook, FaultKind};
 use ssk_gates::GateVector;
+use ssk_interop::{Blake3KeyedVerifier, CompatibilityPolicy, ConformanceSuite};
 use ssk_locator::LocatorPool;
+use ssk_netadmin::{
+    audit::{AuditLedger, AuditOutcome},
+    flow::{FlowDescriptor, FlowRecord, ProtocolKind, RiskLevel},
+    policy::{MatchCriteria, PolicyAction, PolicyEngine, PolicyRule},
+    route::{AdapterRegistryEntry, RouteOrchestrator},
+    session::SessionLedger,
+};
 use ssk_replay::{DeterministicReplayEngine, ReplayEngine};
 use ssk_runtime::{sample_intent, DeterminismContext, Runtime, RuntimeEvent, RuntimeMetrics};
 use ssk_tensor::{FileLedgerBackend, LedgerBackend, MemoryBackend};
-use ssk_types::{GateId, Locator, LocatorId, LocatorType, ReplayVerdict};
+use ssk_types::{GateId, GateOutcomeKind, Locator, LocatorId, LocatorType, ReplayVerdict};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -58,6 +67,79 @@ enum Command {
         #[command(subcommand)]
         command: ConfigCommand,
     },
+    /// Interoperability tools.
+    Interop {
+        #[command(subcommand)]
+        command: InteropCommand,
+    },
+    /// Chaos & recovery drills.
+    Chaos {
+        #[command(subcommand)]
+        command: ChaosCommand,
+    },
+    /// Network administration layer (Proxifier replacement).
+    NetAdmin {
+        #[command(subcommand)]
+        command: NetAdminCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum InteropCommand {
+    /// Run the cross-implementation conformance suite.
+    Conformance {
+        /// Run only the named profile.
+        #[arg(long)]
+        profile: Option<String>,
+        /// Require attestation verification (uses test key).
+        #[arg(long, default_value_t = false)]
+        require_attestation: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum ChaosCommand {
+    /// Execute a chaos/recovery drill.
+    Drill {
+        /// Fault kind to inject (signature-corruption, capability-withdrawal,
+        /// ttl-expiry, attestation-failure).  Omit to run all standard faults.
+        #[arg(long)]
+        fault: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum NetAdminCommand {
+    /// Inspect and classify a flow through the policy engine.
+    FlowInspect {
+        #[arg(long)]
+        app_id: String,
+        #[arg(long)]
+        dest_host: String,
+        #[arg(long, default_value_t = 443)]
+        dest_port: u16,
+        /// Protocol: tcp, udp, tls, http, https, dns (default: https)
+        #[arg(long, default_value = "https")]
+        protocol: String,
+        /// Risk level: low, medium, high, critical (default: medium)
+        #[arg(long, default_value = "medium")]
+        risk: String,
+    },
+    /// Show the route computed for a flow.
+    RouteTrace {
+        #[arg(long)]
+        app_id: String,
+        #[arg(long)]
+        dest_host: String,
+        #[arg(long, default_value_t = 443)]
+        dest_port: u16,
+        #[arg(long, default_value = "https")]
+        protocol: String,
+        #[arg(long, default_value = "medium")]
+        risk: String,
+    },
+    /// Dump a summary of the in-memory audit ledger for a sample pipeline run.
+    AuditDump,
 }
 
 #[derive(Subcommand)]
@@ -78,6 +160,9 @@ enum ErrorClass {
     Replay,
     Permission,
     Doctor,
+    Interop,
+    Chaos,
+    NetAdmin,
 }
 
 impl ErrorClass {
@@ -90,6 +175,9 @@ impl ErrorClass {
             Self::Replay => 14,
             Self::Permission => 15,
             Self::Doctor => 16,
+            Self::Interop => 17,
+            Self::Chaos => 18,
+            Self::NetAdmin => 19,
         }
     }
 }
@@ -176,6 +264,9 @@ fn run(cli: &Cli) -> Result<(), AppError> {
         Command::Doctor { ledger_path } => doctor_command(ledger_path.as_deref(), cli),
         Command::Explain { target } => explain_command(target, cli.json),
         Command::Config { command } => config_command(command, cli.json),
+        Command::Interop { command } => interop_command(command, cli.json),
+        Command::Chaos { command } => chaos_command(command, cli.json),
+        Command::NetAdmin { command } => net_admin_command(command, cli.json),
     }
 }
 
@@ -892,6 +983,555 @@ const fn gate_name(gate: GateId) -> &'static str {
         GateId::Replay => "Replay",
         GateId::Dissolution => "Dissolution",
     }
+}
+
+// ---------------------------------------------------------------------------
+// Interop conformance command
+// ---------------------------------------------------------------------------
+
+fn interop_command(command: &InteropCommand, json: bool) -> Result<(), AppError> {
+    match command {
+        InteropCommand::Conformance {
+            profile,
+            require_attestation,
+        } => {
+            let mut policy = CompatibilityPolicy::default();
+            policy.require_attestation = *require_attestation;
+
+            let verifier = Blake3KeyedVerifier::test_key();
+            let verifier_ref: Option<&dyn ssk_interop::AttestationVerifier> =
+                if *require_attestation {
+                    Some(&verifier)
+                } else {
+                    None
+                };
+
+            let suite = ConformanceSuite::default();
+
+            // Filter to a specific profile if requested.
+            let profiles_to_run: Vec<_> = if let Some(name) = profile {
+                suite
+                    .profiles
+                    .iter()
+                    .filter(|p| p.name == *name)
+                    .collect()
+            } else {
+                suite.profiles.iter().collect()
+            };
+
+            if profiles_to_run.is_empty() {
+                return Err(AppError::new(
+                    ErrorClass::Interop,
+                    "CONFORMANCE_PROFILE_NOT_FOUND",
+                    format!(
+                        "no conformance profile named '{}'",
+                        profile.as_deref().unwrap_or("<all>")
+                    ),
+                    vec!["Run `ssk interop conformance` without --profile to list all.".into()],
+                ));
+            }
+
+            let results: Vec<_> = profiles_to_run
+                .iter()
+                .map(|p| {
+                    let outcome = policy.evaluate(&p.request, verifier_ref);
+                    let accepted = outcome.is_ok();
+                    let passed = accepted == p.expected_accept;
+                    serde_json::json!({
+                        "name": p.name,
+                        "description": p.description,
+                        "expected_accept": p.expected_accept,
+                        "actual_accept": accepted,
+                        "passed": passed,
+                    })
+                })
+                .collect();
+
+            let all_passed = results
+                .iter()
+                .all(|r| r["passed"].as_bool().unwrap_or(false));
+
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "status": if all_passed { "ok" } else { "error" },
+                        "all_passed": all_passed,
+                        "results": results,
+                        "next_steps": [
+                            "Review failing profiles and update policy or peer capabilities.",
+                            "Consult docs/INTEROP_SPEC.md for compatibility requirements."
+                        ]
+                    }))
+                    .map_err(|e| AppError::new(ErrorClass::Runtime, "JSON_OUTPUT_FAILED", e.to_string(), vec![]))?
+                );
+            } else {
+                for r in &results {
+                    let marker = if r["passed"].as_bool().unwrap_or(false) {
+                        "[ok]"
+                    } else {
+                        "[!!]"
+                    };
+                    println!(
+                        "{marker} {}: expected_accept={} actual_accept={}",
+                        r["name"], r["expected_accept"], r["actual_accept"]
+                    );
+                }
+                if all_passed {
+                    println!("conformance: all profiles passed");
+                } else {
+                    println!("conformance: one or more profiles FAILED");
+                }
+            }
+
+            if all_passed {
+                Ok(())
+            } else {
+                Err(AppError::new(
+                    ErrorClass::Interop,
+                    "CONFORMANCE_FAILED",
+                    "conformance suite: one or more profiles failed",
+                    vec![
+                        "Fix peer capability or version configuration.".into(),
+                        "See docs/INTEROP_SPEC.md for the compatibility matrix.".into(),
+                    ],
+                ))
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Chaos drill command
+// ---------------------------------------------------------------------------
+
+fn chaos_command(command: &ChaosCommand, json: bool) -> Result<(), AppError> {
+    match command {
+        ChaosCommand::Drill { fault } => {
+            let clean_intent = sample_intent(true);
+
+            // Stub runner: mimics the gate heuristic used in faultscan tests.
+            let run_intent =
+                |intent: ssk_types::ConnectionIntent| -> (GateOutcomeKind, Vec<ssk_types::BoundaryResidue>) {
+                    if !intent.core.signature_ok
+                        || !intent.capability_witness
+                        || intent.ttl_epoch == 0
+                    {
+                        let residue = ssk_types::BoundaryResidue {
+                            id: ssk_types::ResidueId::new("chaos-fault"),
+                            kind: ssk_types::ResidueKind::Identity,
+                            source_gate: ssk_types::GateId::Core,
+                            detail: "chaos-injected fault detected".into(),
+                        };
+                        (GateOutcomeKind::Reject, vec![residue])
+                    } else {
+                        (GateOutcomeKind::Pass, vec![])
+                    }
+                };
+
+            if let Some(fault_str) = fault {
+                let fault_kind = parse_fault_kind(fault_str)?;
+                let report =
+                    ssk_faultscan::run_drill(clean_intent, fault_kind, &run_intent);
+                let passed = report.passed();
+                if json {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&serde_json::json!({
+                            "status": if passed { "ok" } else { "error" },
+                            "drill": report,
+                            "next_steps": [
+                                "Investigate failing drill: check gate logic for the fault kind.",
+                                "Consult docs/RUNBOOK.md for incident recovery procedures."
+                            ]
+                        }))
+                        .map_err(|e| AppError::new(ErrorClass::Runtime, "JSON_OUTPUT_FAILED", e.to_string(), vec![]))?
+                    );
+                } else {
+                    let marker = if passed { "[ok]" } else { "[!!]" };
+                    println!(
+                        "{marker} drill {:?}: detected={} recovered={}",
+                        report.fault, report.fault_detected, report.recovery_succeeded
+                    );
+                }
+                if passed {
+                    Ok(())
+                } else {
+                    Err(AppError::new(
+                        ErrorClass::Chaos,
+                        "CHAOS_DRILL_FAILED",
+                        format!("chaos drill {:?} failed", fault_kind),
+                        vec![
+                            "Review gate logic for the injected fault type.".into(),
+                            "Follow incident recovery procedures in docs/RUNBOOK.md.".into(),
+                        ],
+                    ))
+                }
+            } else {
+                // Run full playbook.
+                let playbook = run_playbook(clean_intent, &run_intent);
+                let all_passed = playbook.all_passed();
+                if json {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&serde_json::json!({
+                            "status": if all_passed { "ok" } else { "error" },
+                            "playbook": playbook,
+                            "next_steps": [
+                                "Resolve failing drills before production deployment.",
+                                "Consult docs/RUNBOOK.md for chaos/recovery guidance."
+                            ]
+                        }))
+                        .map_err(|e| AppError::new(ErrorClass::Runtime, "JSON_OUTPUT_FAILED", e.to_string(), vec![]))?
+                    );
+                } else {
+                    for drill in &playbook.drills {
+                        let marker = if drill.passed() { "[ok]" } else { "[!!]" };
+                        println!(
+                            "{marker} {:?}: detected={} recovered={}",
+                            drill.fault, drill.fault_detected, drill.recovery_succeeded
+                        );
+                    }
+                    if all_passed {
+                        println!("chaos playbook: all drills passed ({}/{})", playbook.passed, playbook.total);
+                    } else {
+                        println!("chaos playbook: {} drills FAILED", playbook.failed);
+                    }
+                }
+                if all_passed {
+                    Ok(())
+                } else {
+                    Err(AppError::new(
+                        ErrorClass::Chaos,
+                        "CHAOS_PLAYBOOK_FAILED",
+                        "chaos playbook: one or more drills failed",
+                        vec!["Resolve failing drills before production deployment.".into()],
+                    ))
+                }
+            }
+        }
+    }
+}
+
+fn parse_fault_kind(s: &str) -> Result<FaultKind, AppError> {
+    match s {
+        "signature-corruption" => Ok(FaultKind::SignatureCorruption),
+        "capability-withdrawal" => Ok(FaultKind::CapabilityWithdrawal),
+        "ttl-expiry" => Ok(FaultKind::TtlExpiry),
+        "replay-drift" => Ok(FaultKind::ReplayDrift),
+        "attestation-failure" => Ok(FaultKind::AttestationFailure),
+        "locator-untrust" => Ok(FaultKind::LocatorUntrust),
+        _ => Err(AppError::new(
+            ErrorClass::Usage,
+            "CHAOS_UNKNOWN_FAULT",
+            format!("unknown fault kind: {s}"),
+            vec![
+                "Valid faults: signature-corruption, capability-withdrawal, ttl-expiry, \
+                 replay-drift, attestation-failure, locator-untrust"
+                    .into(),
+            ],
+        )),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Net-admin commands
+// ---------------------------------------------------------------------------
+
+fn net_admin_command(command: &NetAdminCommand, json: bool) -> Result<(), AppError> {
+    match command {
+        NetAdminCommand::FlowInspect {
+            app_id,
+            dest_host,
+            dest_port,
+            protocol,
+            risk,
+        }
+        | NetAdminCommand::RouteTrace {
+            app_id,
+            dest_host,
+            dest_port,
+            protocol,
+            risk,
+        } => {
+            let proto = parse_protocol(protocol)?;
+            let risk_level = parse_risk(risk)?;
+            let flow = FlowRecord::new(
+                format!("flow-cli-{app_id}"),
+                0,
+                FlowDescriptor::new(app_id, dest_host, *dest_port, proto, risk_level),
+            );
+            let engine = default_policy_engine();
+            let orc = default_route_orchestrator();
+
+            let decision = engine.evaluate(&flow).map_err(|e| {
+                AppError::new(
+                    ErrorClass::NetAdmin,
+                    "NETADMIN_POLICY_EVAL_FAILED",
+                    e.to_string(),
+                    vec!["Check netadmin policy configuration.".into()],
+                )
+            })?;
+
+            let is_route_cmd = matches!(command, NetAdminCommand::RouteTrace { .. });
+
+            if is_route_cmd {
+                let candidate = orc.plan(&flow, &decision).map_err(|e| {
+                    AppError::new(
+                        ErrorClass::NetAdmin,
+                        "NETADMIN_ROUTE_PLAN_FAILED",
+                        e.to_string(),
+                        vec!["Register required adapters or fix policy.".into()],
+                    )
+                })?;
+
+                if json {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&serde_json::json!({
+                            "status": "ok",
+                            "flow_id": flow.flow_id,
+                            "policy_decision": decision,
+                            "route_candidate": candidate,
+                            "next_steps": [
+                                "Use the route_kind to configure your transport layer.",
+                                "If attestation is required, bind a signed token before dispatch."
+                            ]
+                        }))
+                        .map_err(|e| AppError::new(ErrorClass::Runtime, "JSON_OUTPUT_FAILED", e.to_string(), vec![]))?
+                    );
+                } else {
+                    println!(
+                        "flow={} action={:?} route={:?} requires_attestation={}",
+                        flow.flow_id,
+                        decision.action,
+                        candidate.route,
+                        candidate.requires_attestation
+                    );
+                }
+            } else {
+                if json {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&serde_json::json!({
+                            "status": "ok",
+                            "flow": flow,
+                            "decision": decision,
+                            "next_steps": [
+                                "Use `ssk net-admin route-trace` to inspect the computed route.",
+                                "Adjust policy rules if the decision is unexpected."
+                            ]
+                        }))
+                        .map_err(|e| AppError::new(ErrorClass::Runtime, "JSON_OUTPUT_FAILED", e.to_string(), vec![]))?
+                    );
+                } else {
+                    println!(
+                        "flow={} matched_rule={} action={:?}",
+                        flow.flow_id,
+                        decision.matched_rule.as_deref().unwrap_or("<fail-closed>"),
+                        decision.action
+                    );
+                }
+            }
+
+            Ok(())
+        }
+
+        NetAdminCommand::AuditDump => {
+            // Run a sample two-flow pipeline and dump the audit ledger.
+            let engine = default_policy_engine();
+            let orc = default_route_orchestrator();
+            let mut session = SessionLedger::new();
+            let mut audit = AuditLedger::new();
+
+            let flows = vec![
+                FlowRecord::new(
+                    "audit-demo-f1",
+                    1,
+                    FlowDescriptor::new(
+                        "demo-app",
+                        "db.internal",
+                        5432,
+                        ProtocolKind::Tcp,
+                        RiskLevel::Low,
+                    ),
+                ),
+                FlowRecord::new(
+                    "audit-demo-f2",
+                    2,
+                    FlowDescriptor::new(
+                        "demo-app",
+                        "risky.external.com",
+                        443,
+                        ProtocolKind::Https,
+                        RiskLevel::High,
+                    ),
+                ),
+            ];
+
+            for (i, flow) in flows.iter().enumerate() {
+                let decision = engine.evaluate(flow).map_err(|e| {
+                    AppError::new(ErrorClass::NetAdmin, "NETADMIN_AUDIT_DEMO_FAILED", e.to_string(), vec![])
+                })?;
+                let candidate = orc.plan(flow, &decision).map_err(|e| {
+                    AppError::new(ErrorClass::NetAdmin, "NETADMIN_AUDIT_DEMO_FAILED", e.to_string(), vec![])
+                })?;
+
+                let outcome = if candidate.is_denied() {
+                    AuditOutcome::Denied
+                } else {
+                    AuditOutcome::Dispatched
+                };
+
+                let sd = session
+                    .record(
+                        format!("sd-{i}"),
+                        &flow.flow_id,
+                        decision.clone(),
+                        candidate.clone(),
+                        None,
+                    )
+                    .map_err(|e| {
+                        AppError::new(
+                            ErrorClass::NetAdmin,
+                            "NETADMIN_SESSION_RECORD_FAILED",
+                            e.to_string(),
+                            vec![],
+                        )
+                    })?;
+
+                audit
+                    .record(
+                        format!("ae-{i}"),
+                        &flow.flow_id,
+                        Some(sd.decision_id.clone()),
+                        None,
+                        &candidate.route,
+                        outcome,
+                        flow.intake_epoch,
+                    )
+                    .map_err(|e| {
+                        AppError::new(
+                            ErrorClass::NetAdmin,
+                            "NETADMIN_AUDIT_RECORD_FAILED",
+                            e.to_string(),
+                            vec![],
+                        )
+                    })?;
+            }
+
+            audit.verify().map_err(|e| {
+                AppError::new(
+                    ErrorClass::Integrity,
+                    "NETADMIN_AUDIT_VERIFY_FAILED",
+                    e.to_string(),
+                    vec!["Audit chain broken; do not trust forensic records.".into()],
+                )
+            })?;
+
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "status": "ok",
+                        "entries": audit.entries().iter().map(|e| serde_json::json!({
+                            "entry_id": e.entry_id,
+                            "flow_id": e.flow_id,
+                            "outcome": e.outcome,
+                            "route_kind_summary": e.route_kind_summary,
+                            "epoch": e.epoch,
+                            "entry_hash": e.entry_hash,
+                        })).collect::<Vec<_>>(),
+                        "next_steps": ["Preserve audit ledger for incident forensics."]
+                    }))
+                    .map_err(|e| AppError::new(ErrorClass::Runtime, "JSON_OUTPUT_FAILED", e.to_string(), vec![]))?
+                );
+            } else {
+                println!("audit-ledger verified ({} entries):", audit.len());
+                for e in audit.entries() {
+                    println!(
+                        "  {} flow={} outcome={:?} route={}",
+                        e.entry_id, e.flow_id, e.outcome, e.route_kind_summary
+                    );
+                }
+            }
+
+            Ok(())
+        }
+    }
+}
+
+fn parse_protocol(s: &str) -> Result<ProtocolKind, AppError> {
+    match s.to_ascii_lowercase().as_str() {
+        "tcp" => Ok(ProtocolKind::Tcp),
+        "udp" => Ok(ProtocolKind::Udp),
+        "tls" => Ok(ProtocolKind::Tls),
+        "http" => Ok(ProtocolKind::Http),
+        "https" => Ok(ProtocolKind::Https),
+        "dns" => Ok(ProtocolKind::Dns),
+        _ => Err(AppError::new(
+            ErrorClass::Usage,
+            "NETADMIN_UNKNOWN_PROTOCOL",
+            format!("unknown protocol: {s}"),
+            vec!["Valid protocols: tcp, udp, tls, http, https, dns".into()],
+        )),
+    }
+}
+
+fn parse_risk(s: &str) -> Result<RiskLevel, AppError> {
+    match s.to_ascii_lowercase().as_str() {
+        "low" => Ok(RiskLevel::Low),
+        "medium" => Ok(RiskLevel::Medium),
+        "high" => Ok(RiskLevel::High),
+        "critical" => Ok(RiskLevel::Critical),
+        _ => Err(AppError::new(
+            ErrorClass::Usage,
+            "NETADMIN_UNKNOWN_RISK",
+            format!("unknown risk level: {s}"),
+            vec!["Valid risk levels: low, medium, high, critical".into()],
+        )),
+    }
+}
+
+fn default_policy_engine() -> PolicyEngine {
+    PolicyEngine::new(vec![
+        PolicyRule {
+            rule_id: "allow-internal".into(),
+            description: "allow internal low-risk traffic".into(),
+            priority: 10,
+            criteria: MatchCriteria {
+                app_prefix: None,
+                dest_suffix: Some(".internal".into()),
+                protocol: None,
+                min_risk: None,
+                max_risk: Some(RiskLevel::Low),
+            },
+            action: PolicyAction::Allow,
+        },
+        PolicyRule {
+            rule_id: "proxy-high-risk".into(),
+            description: "route high-risk external traffic via socks5".into(),
+            priority: 20,
+            criteria: MatchCriteria {
+                app_prefix: None,
+                dest_suffix: None,
+                protocol: None,
+                min_risk: Some(RiskLevel::High),
+                max_risk: None,
+            },
+            action: PolicyAction::Redirect {
+                adapter_id: "socks5-exit".into(),
+            },
+        },
+    ])
+}
+
+fn default_route_orchestrator() -> RouteOrchestrator {
+    use ssk_netadmin::route::HopSpec;
+    RouteOrchestrator::new(vec![AdapterRegistryEntry {
+        adapter_id: "socks5-exit".into(),
+        default_hop: HopSpec::new("socks5-exit", "proxy.corp.com", 1080),
+    }])
 }
 
 fn default_pool() -> LocatorPool {
