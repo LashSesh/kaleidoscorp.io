@@ -1,7 +1,6 @@
 #![forbid(unsafe_code)]
 
 use parking_lot::RwLock;
-use serde::{Deserialize, Serialize};
 use ssk_types::{digest_of, Digest, GateReport, HashAlg, RunId, StitchId, TensorEntry};
 use std::path::{Path, PathBuf};
 

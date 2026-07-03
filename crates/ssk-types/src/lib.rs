@@ -4,6 +4,7 @@
 extern crate alloc;
 
 use alloc::{string::String, vec::Vec};
+use alloc::{borrow::ToOwned, string::ToString};
 use core::fmt;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
@@ -63,8 +64,9 @@ pub struct MirrorFacet {
     pub replay_root: ReplayRoot,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum Sector {
+    #[default]
     Identity,
     Locator,
     Protocol,
@@ -72,12 +74,6 @@ pub enum Sector {
     Risk,
     Replay,
     Focus,
-}
-
-impl Default for Sector {
-    fn default() -> Self {
-        Self::Identity
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -108,6 +104,7 @@ pub struct ConnectionIntent {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[allow(clippy::struct_excessive_bools)]
 pub struct StitchCandidate {
     pub id: StitchId,
     pub run: RunId,
@@ -234,6 +231,7 @@ pub struct PhaseVector {
 }
 
 impl PhaseVector {
+    #[must_use]
     pub fn zero() -> Self {
         Self {
             identity: Phase(0),
@@ -259,6 +257,7 @@ pub struct FrequencyVector {
 }
 
 impl FrequencyVector {
+    #[must_use]
     pub fn deterministic() -> Self {
         Self {
             identity: 13,
@@ -337,7 +336,10 @@ pub struct ReplayManifest {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ReplayVerdict {
     Deterministic,
-    Divergent { first_diff: PipelineStep, detail: String },
+    Divergent {
+        first_diff: PipelineStep,
+        detail: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -383,12 +385,6 @@ pub fn digest_of<T: Serialize>(value: &T, alg: HashAlg) -> Result<Digest, TypeEr
         }
     };
     Ok(Digest::new(hex))
-}
-
-impl Digest {
-    pub fn new(value: impl Into<String>) -> Self {
-        Self(Id::new(value))
-    }
 }
 
 impl fmt::Display for Id {

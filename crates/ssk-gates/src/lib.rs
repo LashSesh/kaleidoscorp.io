@@ -2,8 +2,8 @@
 
 use ssk_bcik::CrossOutcome;
 use ssk_types::{
-    BoundaryResidue, GateId, GateOutcomeKind, GateReport, GateReportId, GateVerdict, GateWitness, Id,
-    ResidueId, ResidueKind, StitchCandidate,
+    BoundaryResidue, GateId, GateOutcomeKind, GateReport, GateReportId, GateVerdict, GateWitness,
+    Id, ResidueId, ResidueKind, StitchCandidate,
 };
 
 pub trait Gate: Send + Sync {
@@ -51,9 +51,15 @@ impl Gate for BasicGate {
 
     fn evaluate(&self, sc: &StitchCandidate) -> GateVerdict {
         match self.id {
-            GateId::Core if !sc.core.signature_ok => reject(self.id, ResidueKind::Identity, "core signature invalid"),
-            GateId::Mirror if sc.facet.core_id != sc.core.id => reject(self.id, ResidueKind::Identity, "facet not recoverable"),
-            GateId::Locator if !sc.locator.trusted || sc.locator.risk_score > 70 => reject(self.id, ResidueKind::Locator, "locator risk bound exceeded"),
+            GateId::Core if !sc.core.signature_ok => {
+                reject(self.id, ResidueKind::Identity, "core signature invalid")
+            }
+            GateId::Mirror if sc.facet.core_id != sc.core.id => {
+                reject(self.id, ResidueKind::Identity, "facet not recoverable")
+            }
+            GateId::Locator if !sc.locator.trusted || sc.locator.risk_score > 70 => {
+                reject(self.id, ResidueKind::Locator, "locator risk bound exceeded")
+            }
             GateId::Bcik => {
                 if matches!(ssk_bcik::cross(sc), CrossOutcome::Closed) {
                     pass(self.id)
@@ -61,11 +67,25 @@ impl Gate for BasicGate {
                     reject(self.id, ResidueKind::Boundary, "bcik crossing open")
                 }
             }
-            GateId::Capability if !sc.capability_witness => reject(self.id, ResidueKind::Capability, "missing capability witness"),
-            GateId::Boundary if !sc.boundary_complete => reject(self.id, ResidueKind::Boundary, "incomplete residue register"),
-            GateId::Focus if !sc.focus_ready => reject(self.id, ResidueKind::Focus, "focus recovery failed"),
-            GateId::Replay if !sc.replay_ready => reject(self.id, ResidueKind::Replay, "replay witness missing"),
-            GateId::Dissolution if sc.ttl_epoch == 0 => reject(self.id, ResidueKind::Timing, "ttl epoch missing"),
+            GateId::Capability if !sc.capability_witness => reject(
+                self.id,
+                ResidueKind::Capability,
+                "missing capability witness",
+            ),
+            GateId::Boundary if !sc.boundary_complete => reject(
+                self.id,
+                ResidueKind::Boundary,
+                "incomplete residue register",
+            ),
+            GateId::Focus if !sc.focus_ready => {
+                reject(self.id, ResidueKind::Focus, "focus recovery failed")
+            }
+            GateId::Replay if !sc.replay_ready => {
+                reject(self.id, ResidueKind::Replay, "replay witness missing")
+            }
+            GateId::Dissolution if sc.ttl_epoch == 0 => {
+                reject(self.id, ResidueKind::Timing, "ttl epoch missing")
+            }
             _ => pass(self.id),
         }
     }
@@ -94,7 +114,9 @@ impl GateVector {
         for gate in &self.gates {
             match gate.evaluate(sc) {
                 GateVerdict::Pass(w) => witnesses.push(w),
-                GateVerdict::Hold(r) | GateVerdict::Refine(r) => refine.get_or_insert(r),
+                GateVerdict::Hold(r) | GateVerdict::Refine(r) => {
+                    refine.get_or_insert(r);
+                }
                 GateVerdict::Quarantine(r) => {
                     quarantine.get_or_insert(r);
                     break;
@@ -117,7 +139,7 @@ impl GateVector {
         };
 
         GateReport {
-            id: GateReportId::new(format!("gate-report:{}", sc.id.0.0)),
+            id: GateReportId::new(format!("gate-report:{}", sc.id.0 .0)),
             outcome,
             witnesses,
             residues,
@@ -134,9 +156,24 @@ mod tests {
         StitchCandidate {
             id: StitchId::new("s1"),
             run: RunId::new("r1"),
-            core: CoreNode { id: CoreId::new("c1"), canonical_name: "n".into(), policy_root: PolicyId::new("p1"), signature_ok: true },
-            facet: MirrorFacet { facet_id: Id::new("f1"), core_id: CoreId::new("c1"), sector: Sector::Identity, replay_root: ReplayRoot::new("rr") },
-            locator: Locator { id: LocatorId::new("l1"), locator_type: LocatorType::LocalOverlay, trusted: true, risk_score: 1 },
+            core: CoreNode {
+                id: CoreId::new("c1"),
+                canonical_name: "n".into(),
+                policy_root: PolicyId::new("p1"),
+                signature_ok: true,
+            },
+            facet: MirrorFacet {
+                facet_id: Id::new("f1"),
+                core_id: CoreId::new("c1"),
+                sector: Sector::Identity,
+                replay_root: ReplayRoot::new("rr"),
+            },
+            locator: Locator {
+                id: LocatorId::new("l1"),
+                locator_type: LocatorType::LocalOverlay,
+                trusted: true,
+                risk_score: 1,
+            },
             capability_witness: true,
             seam_ok: true,
             boundary_complete: true,

@@ -9,8 +9,8 @@ use ssk_scheduler::DeterministicScheduler;
 use ssk_stitch::from_intent;
 use ssk_tensor::{make_entry, LedgerBackend, TensorError};
 use ssk_types::{
-    digest_of, ConnectionIntent, FrequencyVector, GateOutcomeKind, HashAlg, Id, PipelineStep, ReplayManifest,
-    ReplayRoot, RunDescriptor, RuntimeOutcome, SchedulerState, Sector, TraceId, TraceRecord,
+    digest_of, ConnectionIntent, FrequencyVector, GateOutcomeKind, HashAlg, PipelineStep,
+    ReplayManifest, RunDescriptor, RuntimeOutcome, SchedulerState, TraceId, TraceRecord,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -29,7 +29,11 @@ pub struct Runtime<'a, L: LedgerBackend> {
 }
 
 impl<'a, L: LedgerBackend> Runtime<'a, L> {
-    pub fn run_once(&self, intent: ConnectionIntent, pool: &LocatorPool) -> Result<(RuntimeOutcome, ReplayManifest), RuntimeError> {
+    pub fn run_once(
+        &self,
+        intent: ConnectionIntent,
+        pool: &LocatorPool,
+    ) -> Result<(RuntimeOutcome, ReplayManifest), RuntimeError> {
         let mut scheduler = DeterministicScheduler::new(
             ssk_types::PhaseVector::zero(),
             FrequencyVector::deterministic(),
@@ -57,7 +61,7 @@ impl<'a, L: LedgerBackend> Runtime<'a, L> {
             PipelineStep::Gates,
         ] {
             let trace = TraceRecord {
-                id: TraceId::new(format!("{}:{step:?}", intent.run.0.0)),
+                id: TraceId::new(format!("{}:{step:?}", intent.run.0 .0)),
                 run: intent.run.clone(),
                 step,
                 inputs: vec![digest_of(&candidate, HashAlg::Blake3)?],

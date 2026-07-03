@@ -14,7 +14,7 @@ pub fn cross(candidate: &StitchCandidate) -> CrossOutcome {
         CrossOutcome::Closed
     } else {
         CrossOutcome::Residue(BoundaryResidue {
-            id: ResidueId(Id::new(format!("residue:{}", candidate.id.0.0))),
+            id: ResidueId(Id::new(format!("residue:{}", candidate.id.0 .0))),
             kind: ResidueKind::Boundary,
             source_gate: GateId::Bcik,
             detail: "BCIK crossing not boundary-closed".into(),
@@ -43,7 +43,12 @@ mod tests {
                 sector: Sector::Identity,
                 replay_root: ReplayRoot::new("rr"),
             },
-            locator: Locator { id: LocatorId::new("l1"), locator_type: LocatorType::LocalOverlay, trusted: true, risk_score: 1 },
+            locator: Locator {
+                id: LocatorId::new("l1"),
+                locator_type: LocatorType::LocalOverlay,
+                trusted: true,
+                risk_score: 1,
+            },
             capability_witness: true,
             seam_ok,
             boundary_complete,

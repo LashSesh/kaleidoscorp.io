@@ -24,13 +24,20 @@ impl DeterministicScheduler {
     #[must_use]
     pub fn tick(&mut self) -> PhaseVector {
         self.state.ticks += 1;
-        self.state.theta0.identity = Phase((self.state.theta0.identity.0 + self.state.freq.identity) % PHASE_MODULUS);
-        self.state.theta0.locator = Phase((self.state.theta0.locator.0 + self.state.freq.locator) % PHASE_MODULUS);
-        self.state.theta0.protocol = Phase((self.state.theta0.protocol.0 + self.state.freq.protocol) % PHASE_MODULUS);
-        self.state.theta0.timing = Phase((self.state.theta0.timing.0 + self.state.freq.timing) % PHASE_MODULUS);
-        self.state.theta0.risk = Phase((self.state.theta0.risk.0 + self.state.freq.risk) % PHASE_MODULUS);
-        self.state.theta0.replay = Phase((self.state.theta0.replay.0 + self.state.freq.replay) % PHASE_MODULUS);
-        self.state.theta0.focus = Phase((self.state.theta0.focus.0 + self.state.freq.focus) % PHASE_MODULUS);
+        self.state.theta0.identity =
+            Phase((self.state.theta0.identity.0 + self.state.freq.identity) % PHASE_MODULUS);
+        self.state.theta0.locator =
+            Phase((self.state.theta0.locator.0 + self.state.freq.locator) % PHASE_MODULUS);
+        self.state.theta0.protocol =
+            Phase((self.state.theta0.protocol.0 + self.state.freq.protocol) % PHASE_MODULUS);
+        self.state.theta0.timing =
+            Phase((self.state.theta0.timing.0 + self.state.freq.timing) % PHASE_MODULUS);
+        self.state.theta0.risk =
+            Phase((self.state.theta0.risk.0 + self.state.freq.risk) % PHASE_MODULUS);
+        self.state.theta0.replay =
+            Phase((self.state.theta0.replay.0 + self.state.freq.replay) % PHASE_MODULUS);
+        self.state.theta0.focus =
+            Phase((self.state.theta0.focus.0 + self.state.freq.focus) % PHASE_MODULUS);
         self.state.theta0.clone()
     }
 

@@ -16,15 +16,21 @@ fn pool() -> LocatorPool {
 
 #[test]
 fn deterministic_replay_vector_matches() {
-    let tensor = MemoryBackend::new();
-    let runtime = Runtime {
+    let tensor_a = MemoryBackend::new();
+    let runtime_a = Runtime {
         gate_vector: GateVector::with_all_default(),
-        tensor: &tensor,
+        tensor: &tensor_a,
     };
-    let (first, manifest) = runtime
+    let (first, manifest) = runtime_a
         .run_once(sample_intent(true), &pool())
         .expect("first run should work");
-    let (second, _) = runtime
+
+    let tensor_b = MemoryBackend::new();
+    let runtime_b = Runtime {
+        gate_vector: GateVector::with_all_default(),
+        tensor: &tensor_b,
+    };
+    let (second, _) = runtime_b
         .run_once(sample_intent(true), &pool())
         .expect("second run should work");
 

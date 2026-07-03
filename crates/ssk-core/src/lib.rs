@@ -3,7 +3,7 @@
 
 extern crate alloc;
 
-use alloc::string::ToString;
+use alloc::format;
 use serde::{Deserialize, Serialize};
 use ssk_types::{CoreNode, Id, MirrorFacet, ReplayRoot, Sector};
 
@@ -13,15 +13,15 @@ pub struct Orbit;
 impl Orbit {
     pub fn derive(core: &CoreNode, sector: Sector) -> MirrorFacet {
         MirrorFacet {
-            facet_id: Id::new(format!("facet:{}:{sector:?}", core.id.0.0)),
+            facet_id: Id::new(format!("facet:{}:{sector:?}", core.id.0 .0)),
             core_id: core.id.clone(),
             sector,
-            replay_root: ReplayRoot::new(format!("replay:{}", core.id.0.0)),
+            replay_root: ReplayRoot::new(format!("replay:{}", core.id.0 .0)),
         }
     }
 
     pub fn recover(facet: &MirrorFacet, core: &CoreNode) -> bool {
-        facet.core_id == core.id && facet.replay_root.0.0.starts_with("replay:")
+        facet.core_id == core.id && facet.replay_root.0 .0.starts_with("replay:")
     }
 }
 
