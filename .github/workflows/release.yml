@@ -1,0 +1,19 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo build --workspace --release
+      - run: mkdir -p dist && tar -czf dist/ssk-omega-${GITHUB_REF_NAME}.tar.gz crates Cargo.toml README.md docs
+      - uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: dist/*.tar.gz

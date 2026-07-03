@@ -1,0 +1,15 @@
+name: Bug report
+description: Report runtime defects
+body:
+  - type: textarea
+    id: summary
+    attributes:
+      label: Summary
+  - type: textarea
+    id: steps
+    attributes:
+      label: Reproduction steps
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior

@@ -1,0 +1,24 @@
+[package]
+name = "ssk-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "ssk"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+serde_json.workspace = true
+ssk-types = { path = "../ssk-types" }
+ssk-runtime = { path = "../ssk-runtime" }
+ssk-locator = { path = "../ssk-locator" }
+ssk-gates = { path = "../ssk-gates" }
+ssk-config = { path = "../ssk-config" }
+ssk-replay = { path = "../ssk-replay" }
+ssk-tensor = { path = "../ssk-tensor", features = ["storage"] }
+
+[lints]
+workspace = true

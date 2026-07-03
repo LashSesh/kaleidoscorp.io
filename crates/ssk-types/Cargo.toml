@@ -1,0 +1,20 @@
+[package]
+name = "ssk-types"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[features]
+default = ["std"]
+std = []
+
+[dependencies]
+serde.workspace = true
+blake3.workspace = true
+ciborium.workspace = true
+thiserror.workspace = true
+hex.workspace = true
+sha2.workspace = true
+
+[lints]
+workspace = true

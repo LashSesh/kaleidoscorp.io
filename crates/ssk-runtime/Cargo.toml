@@ -1,0 +1,24 @@
+[package]
+name = "ssk-runtime"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+ssk-types = { path = "../ssk-types" }
+ssk-core = { path = "../ssk-core" }
+ssk-scheduler = { path = "../ssk-scheduler" }
+ssk-identity = { path = "../ssk-identity" }
+ssk-locator = { path = "../ssk-locator" }
+ssk-bcik = { path = "../ssk-bcik" }
+ssk-gates = { path = "../ssk-gates" }
+ssk-stitch = { path = "../ssk-stitch" }
+ssk-tensor = { path = "../ssk-tensor" }
+ssk-focus = { path = "../ssk-focus" }
+ssk-audit = { path = "../ssk-audit" }
+ssk-replay = { path = "../ssk-replay" }
+ssk-config = { path = "../ssk-config" }
+thiserror.workspace = true
+
+[lints]
+workspace = true

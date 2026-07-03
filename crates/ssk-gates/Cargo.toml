@@ -1,0 +1,13 @@
+[package]
+name = "ssk-gates"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+ssk-types = { path = "../ssk-types" }
+ssk-bcik = { path = "../ssk-bcik" }
+serde.workspace = true
+
+[lints]
+workspace = true
