@@ -2,7 +2,7 @@
 
 ## 1) Gap Analysis
 
-### Domain/Semantik
+### Domain/Semantics
 - Stable invariants existed, but no explicit interop contract for version/capability semantics.
 
 ### API/Protocol/Interop

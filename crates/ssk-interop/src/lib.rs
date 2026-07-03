@@ -111,16 +111,11 @@ pub struct HandshakeResponse {
     pub error: Option<InteropErrorCode>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum DecodeMode {
+    #[default]
     Strict,
     Permissive,
-}
-
-impl Default for DecodeMode {
-    fn default() -> Self {
-        Self::Strict
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -238,12 +233,12 @@ pub fn encode_canonical<T: Serialize>(value: &T) -> Result<Vec<u8>, InteropError
     ssk_types::canonical_bytes(value).map_err(|err| InteropError::Encode(err.to_string()))
 }
 
-pub fn decode_with_mode<T: DeserializeOwned>(
+pub fn decode_with_mode<T: DeserializeOwned + Serialize>(
     bytes: &[u8],
     mode: DecodeMode,
 ) -> Result<T, InteropError> {
-    let decoded: T = ciborium::de::from_reader(bytes)
-        .map_err(|err| InteropError::Decode(err.to_string()))?;
+    let decoded: T =
+        ciborium::de::from_reader(bytes).map_err(|err| InteropError::Decode(err.to_string()))?;
 
     if mode == DecodeMode::Strict {
         let canonical = encode_canonical(&decoded)?;
@@ -254,7 +249,7 @@ pub fn decode_with_mode<T: DeserializeOwned>(
     Ok(decoded)
 }
 
-pub fn decode_strict<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, InteropError> {
+pub fn decode_strict<T: DeserializeOwned + Serialize>(bytes: &[u8]) -> Result<T, InteropError> {
     decode_with_mode(bytes, DecodeMode::Strict)
 }
 
@@ -275,7 +270,11 @@ mod tests {
             protocol: ProtocolVersion::new(1, 0, 0),
             min_compatible: ProtocolVersion::new(1, 0, 0),
             capabilities: Capabilities {
-                features: vec!["gate-vector-12".into(), "replay-v1".into(), "doctor-v1".into()],
+                features: vec![
+                    "gate-vector-12".into(),
+                    "replay-v1".into(),
+                    "doctor-v1".into(),
+                ],
             },
             strict_mode: true,
             deterministic_clock_epoch: 10,

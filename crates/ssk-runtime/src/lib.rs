@@ -10,7 +10,7 @@ use ssk_stitch::from_intent;
 use ssk_tensor::{make_entry, LedgerBackend, TensorError};
 use ssk_types::{
     digest_of, ConnectionIntent, FrequencyVector, GateOutcomeKind, HashAlg, PipelineStep,
-    ReplayManifest, RunDescriptor, RuntimeOutcome, SchedulerState, TraceId, TraceRecord,
+    ReplayManifest, RunDescriptor, RuntimeOutcome, TraceId, TraceRecord,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -23,19 +23,10 @@ pub enum RuntimeError {
     Types(#[from] ssk_types::TypeError),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct DeterminismContext {
     pub seeded: bool,
     pub epoch: u64,
-}
-
-impl Default for DeterminismContext {
-    fn default() -> Self {
-        Self {
-            seeded: false,
-            epoch: 0,
-        }
-    }
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]

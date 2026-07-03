@@ -1,9 +1,10 @@
 use std::path::Path;
 
+use proptest::prelude::*;
 use serde::{Deserialize, Serialize};
 use ssk_interop::{
-    decode_strict, decode_with_mode, encode_canonical, Capabilities, CompatibilityPolicy, DecodeMode,
-    HandshakeRequest, ProtocolVersion,
+    decode_strict, decode_with_mode, encode_canonical, Capabilities, CompatibilityPolicy,
+    DecodeMode, HandshakeRequest, ProtocolVersion,
 };
 
 #[derive(Debug, Deserialize, Serialize)]

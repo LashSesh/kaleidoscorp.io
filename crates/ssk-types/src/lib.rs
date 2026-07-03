@@ -3,8 +3,8 @@
 
 extern crate alloc;
 
-use alloc::{string::String, vec::Vec};
 use alloc::{borrow::ToOwned, string::ToString};
+use alloc::{string::String, vec::Vec};
 use core::fmt;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};

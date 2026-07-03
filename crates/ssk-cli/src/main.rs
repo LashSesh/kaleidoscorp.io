@@ -28,17 +28,17 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     Run {
-        #[arg(long, default_value_t = true)]
+        #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
         valid_fixture: bool,
-        #[arg(long, default_value_t = false)]
+        #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
         seeded: bool,
         #[arg(long, default_value_t = 0)]
         epoch: u64,
     },
     ReplayVerify {
-        #[arg(long, default_value_t = true)]
+        #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
         valid_fixture: bool,
-        #[arg(long, default_value_t = false)]
+        #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
         seeded: bool,
         #[arg(long, default_value_t = 0)]
         epoch: u64,
@@ -73,7 +73,6 @@ enum ConfigCommand {
 enum ErrorClass {
     Usage,
     Config,
-    Interop,
     Runtime,
     Integrity,
     Replay,
@@ -86,7 +85,6 @@ impl ErrorClass {
         match self {
             Self::Usage => 2,
             Self::Config => 10,
-            Self::Interop => 11,
             Self::Runtime => 12,
             Self::Integrity => 13,
             Self::Replay => 14,
@@ -181,7 +179,12 @@ fn run(cli: &Cli) -> Result<(), AppError> {
     }
 }
 
-fn run_once_command(valid_fixture: bool, seeded: bool, epoch: u64, cli: &Cli) -> Result<(), AppError> {
+fn run_once_command(
+    valid_fixture: bool,
+    seeded: bool,
+    epoch: u64,
+    cli: &Cli,
+) -> Result<(), AppError> {
     let loaded = load_config(cli.config.as_deref())?;
     let tensor = MemoryBackend::new();
     let runtime = Runtime {
@@ -223,7 +226,12 @@ fn run_once_command(valid_fixture: bool, seeded: bool, epoch: u64, cli: &Cli) ->
                     "Use `ssk verify-ledger --path <ledger.json>` when using file ledger backend."
                 ]
             }))
-            .map_err(|err| AppError::new(ErrorClass::Runtime, "JSON_OUTPUT_FAILED", err.to_string(), vec![]))?
+            .map_err(|err| AppError::new(
+                ErrorClass::Runtime,
+                "JSON_OUTPUT_FAILED",
+                err.to_string(),
+                vec![]
+            ))?
         );
     } else {
         print_human_run_summary(&event, &metrics);
@@ -232,7 +240,12 @@ fn run_once_command(valid_fixture: bool, seeded: bool, epoch: u64, cli: &Cli) ->
     Ok(())
 }
 
-fn replay_verify_command(valid_fixture: bool, seeded: bool, epoch: u64, cli: &Cli) -> Result<(), AppError> {
+fn replay_verify_command(
+    valid_fixture: bool,
+    seeded: bool,
+    epoch: u64,
+    cli: &Cli,
+) -> Result<(), AppError> {
     let loaded = load_config(cli.config.as_deref())?;
     let tensor = MemoryBackend::new();
     let runtime = Runtime {
@@ -284,7 +297,12 @@ fn replay_verify_command(valid_fixture: bool, seeded: bool, epoch: u64, cli: &Cl
                             "Run `ssk doctor` if environment drift is suspected."
                         ]
                     }))
-                    .map_err(|err| AppError::new(ErrorClass::Runtime, "JSON_OUTPUT_FAILED", err.to_string(), vec![]))?
+                    .map_err(|err| AppError::new(
+                        ErrorClass::Runtime,
+                        "JSON_OUTPUT_FAILED",
+                        err.to_string(),
+                        vec![]
+                    ))?
                 );
             } else {
                 println!(
@@ -334,7 +352,12 @@ fn verify_ledger_command(path: &str, json: bool) -> Result<(), AppError> {
                 "ledger": path,
                 "message": "ledger-ok"
             }))
-            .map_err(|err| AppError::new(ErrorClass::Runtime, "JSON_OUTPUT_FAILED", err.to_string(), vec![]))?
+            .map_err(|err| AppError::new(
+                ErrorClass::Runtime,
+                "JSON_OUTPUT_FAILED",
+                err.to_string(),
+                vec![]
+            ))?
         );
     } else {
         println!("ledger-ok");
@@ -344,12 +367,12 @@ fn verify_ledger_command(path: &str, json: bool) -> Result<(), AppError> {
 }
 
 fn doctor_command(ledger_path: Option<&str>, cli: &Cli) -> Result<(), AppError> {
-    let mut checks = Vec::new();
-
-    checks.push(check_system_clock());
-    checks.push(check_entropy());
-    checks.push(check_paths());
-    checks.push(check_permissions());
+    let mut checks = vec![
+        check_system_clock(),
+        check_entropy(),
+        check_paths(),
+        check_permissions(),
+    ];
 
     match load_config(cli.config.as_deref()) {
         Ok(loaded) => checks.push(DoctorCheck {
@@ -369,7 +392,8 @@ fn doctor_command(ledger_path: Option<&str>, cli: &Cli) -> Result<(), AppError> 
             name: "config",
             ok: false,
             detail: err.message,
-            next_step: "Fix config and rerun `ssk doctor` (fail-closed startup is enforced).".into(),
+            next_step: "Fix config and rerun `ssk doctor` (fail-closed startup is enforced)."
+                .into(),
         }),
     }
 
@@ -402,7 +426,12 @@ fn doctor_command(ledger_path: Option<&str>, cli: &Cli) -> Result<(), AppError> 
                 "report": report,
                 "next_steps": ["Fix failing checks before production runs."]
             }))
-            .map_err(|err| AppError::new(ErrorClass::Runtime, "JSON_OUTPUT_FAILED", err.to_string(), vec![]))?
+            .map_err(|err| AppError::new(
+                ErrorClass::Runtime,
+                "JSON_OUTPUT_FAILED",
+                err.to_string(),
+                vec![]
+            ))?
         );
     } else {
         for check in &report.checks {
@@ -439,8 +468,12 @@ fn explain_command(target: &str, json: bool) -> Result<(), AppError> {
     if json {
         println!(
             "{}",
-            serde_json::to_string_pretty(&output)
-                .map_err(|err| AppError::new(ErrorClass::Runtime, "JSON_OUTPUT_FAILED", err.to_string(), vec![]))?
+            serde_json::to_string_pretty(&output).map_err(|err| AppError::new(
+                ErrorClass::Runtime,
+                "JSON_OUTPUT_FAILED",
+                err.to_string(),
+                vec![]
+            ))?
         );
     } else {
         println!("{} [{}]", output.target, output.category);
@@ -469,7 +502,12 @@ fn config_command(command: &ConfigCommand, json: bool) -> Result<(), AppError> {
                 println!(
                     "{}",
                     serde_json::to_string_pretty(&report).map_err(|err| {
-                        AppError::new(ErrorClass::Runtime, "JSON_OUTPUT_FAILED", err.to_string(), vec![])
+                        AppError::new(
+                            ErrorClass::Runtime,
+                            "JSON_OUTPUT_FAILED",
+                            err.to_string(),
+                            vec![],
+                        )
                     })?
                 );
             } else if report.ok {
@@ -502,14 +540,24 @@ fn config_command(command: &ConfigCommand, json: bool) -> Result<(), AppError> {
                 println!(
                     "{}",
                     serde_json::to_string_pretty(&schema).map_err(|err| {
-                        AppError::new(ErrorClass::Runtime, "JSON_OUTPUT_FAILED", err.to_string(), vec![])
+                        AppError::new(
+                            ErrorClass::Runtime,
+                            "JSON_OUTPUT_FAILED",
+                            err.to_string(),
+                            vec![],
+                        )
                     })?
                 );
             } else {
                 println!(
                     "{}",
                     serde_json::to_string_pretty(&schema).map_err(|err| {
-                        AppError::new(ErrorClass::Runtime, "JSON_OUTPUT_FAILED", err.to_string(), vec![])
+                        AppError::new(
+                            ErrorClass::Runtime,
+                            "JSON_OUTPUT_FAILED",
+                            err.to_string(),
+                            vec![],
+                        )
                     })?
                 );
             }
@@ -557,8 +605,12 @@ fn load_config(path: Option<&Path>) -> Result<ssk_config::LoadedConfig, AppError
         })?;
 
         let loaded = match config_format_from_path(path)? {
-            ssk_config::ConfigFormat::Yaml => ssk_config::AppConfig::parse_with_migration_yaml(&content),
-            ssk_config::ConfigFormat::Toml => ssk_config::AppConfig::parse_with_migration_toml(&content),
+            ssk_config::ConfigFormat::Yaml => {
+                ssk_config::AppConfig::parse_with_migration_yaml(&content)
+            }
+            ssk_config::ConfigFormat::Toml => {
+                ssk_config::AppConfig::parse_with_migration_toml(&content)
+            }
         }
         .map_err(|err| {
             AppError::new(
@@ -629,14 +681,23 @@ fn persist_metrics(path: &str, metrics: &RuntimeMetrics) -> Result<(), AppError>
             AppError::new(
                 ErrorClass::Permission,
                 "METRICS_DIR_CREATE_FAILED",
-                format!("cannot create metrics directory {}: {err}", parent.display()),
+                format!(
+                    "cannot create metrics directory {}: {err}",
+                    parent.display()
+                ),
                 vec!["Check write permissions on metrics directory.".into()],
             )
         })?;
     }
 
-    let payload = serde_json::to_vec_pretty(metrics)
-        .map_err(|err| AppError::new(ErrorClass::Runtime, "METRICS_ENCODE_FAILED", err.to_string(), vec![]))?;
+    let payload = serde_json::to_vec_pretty(metrics).map_err(|err| {
+        AppError::new(
+            ErrorClass::Runtime,
+            "METRICS_ENCODE_FAILED",
+            err.to_string(),
+            vec![],
+        )
+    })?;
     std::fs::write(&metrics_path, payload).map_err(|err| {
         AppError::new(
             ErrorClass::Permission,
@@ -667,7 +728,8 @@ fn check_system_clock() -> DoctorCheck {
                 name: "clock",
                 ok: false,
                 detail: format!("clock before unix epoch: {err}"),
-                next_step: "Correct system clock and timezone before running runtime commands.".into(),
+                next_step: "Correct system clock and timezone before running runtime commands."
+                    .into(),
             }
         }
     };
@@ -763,7 +825,10 @@ fn explain_target(target: &str) -> Option<ExplainOutput> {
         return Some(ExplainOutput {
             target: gate_name(gate).into(),
             category: "gate".into(),
-            summary: format!("Gate `{}` enforces fail-closed progression.", gate_name(gate)),
+            summary: format!(
+                "Gate `{}` enforces fail-closed progression.",
+                gate_name(gate)
+            ),
             details: vec![
                 "Any non-pass verdict blocks stitch persistence.".into(),
                 "Residues from this gate are replay-visible and auditable.".into(),
@@ -852,7 +917,7 @@ mod tests {
 
     #[test]
     fn explain_error_has_machine_readable_fields() {
-        let output = explain_target("replay").expect("replay explanation exists");
+        let output = explain_target("config").expect("config explanation exists");
         assert_eq!(output.category, "error");
         assert!(!output.details.is_empty());
     }
