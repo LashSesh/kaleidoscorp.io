@@ -113,10 +113,11 @@ and 2 complete:** SSKΩ-1/2 are now met to the letter (`HypertoroidalScheduler`'
 `LocatorPool::claims_external_plurality()`). SSKΩ-3's crossing now genuinely carries seam
 (`SeamWitness`, `HashProvider`-backed), boundary (`BoundaryRecord`), trace, and replay
 (`BcikStitch`'s full field set, Section J) — the one field still not populated is `gate_report`
-(always `None` today), since real per-gate evidence generation is Phase 3's job (Section K). The
-remaining gap to full SSKΩ-3/4 is now the gate system overhaul and the Projective Connection
-Hypercube (Sections K and I), both Phase 3. This document designs the closing architecture for
-SSKΩ-3 through SSKΩ-9.
+(always `None` today); wiring `GateVector`'s output back into `BcikStitch` remains open for a
+later phase. **Update — Phase 3 complete:** SSKΩ-4 is now met — the gate system overhaul (Section
+K, twelve real gate structs, no early-`break`) and the Projective Connection Hypercube (Section I,
+real 9-axis `Hypercube` plus the Gabriel Constraint Cells) both landed, tested, and verified. This
+document designs the closing architecture for SSKΩ-5 through SSKΩ-9 (remaining).
 
 ---
 
@@ -140,14 +141,14 @@ earlier pass without recheck).
 | `LocatorAdapter`/`LocatorPool` trait + `claims_external_plurality()` | **[1] Phase 1 done** | `crates/ssk-locator/src/lib.rs` — real traits; `StaticLocatorPool` implements both, with `claims_external_plurality()` genuinely counting distinct live endpoints (tested false-for-one, false-for-shared-endpoint, false-for-non-live, true-for-two-distinct-live) | Ch. 6.2 |
 | `StitchEdge`/`LocatorGraph`/`HyperEdge`/`select_path` | [4] | not present anywhere | Ch. 6.3-6.4 |
 | `SchedulerMode`/`SchedulerSeed`/`visible()` | **[1] Phase 1 done** | `crates/ssk-scheduler/src/lib.rs` — renamed `HypertoroidalScheduler`; `Seeded` mode genuinely jitters phase advancement via a `rand_pcg`-seeded PRNG keyed by `(seed, tick count)`; `visible()` implements the literal toroidal-distance formula, tested including wraparound | Ch. 7.2 |
-| Projective Connection Hypercube | [4] | not present anywhere | Ch. 8 |
-| Gabriel Constraint Cells | [4] | not present anywhere | Ch. 10 |
+| Projective Connection Hypercube | **[1] Phase 3 done** | `crates/ssk-gates/src/pch.rs` — real `Axis`/`Projection`/`Hypercube`; nine real per-axis projectors, `check()` returns `Pass`/`Hold`/`Fail` per the ch. 8.2 invariant (`OverBudget` holds, all else fails); `ProtocolProjector` honestly always-`Ok` (no fiber-invariant model yet) | Ch. 8 |
+| Gabriel Constraint Cells | **[1] Phase 3 done** | `crates/ssk-gates/src/gabriel.rs` — real `CellRole`/`CellVerdict`/`ConstraintCell`/`GabrielFilm`; nine real per-role cells, `evaluate_all()` tested (intact-candidate all-`Propose`, missing-capability `Reject`, high-risk `Quarantine`); `ProtocolCell` honestly always-`Propose` for the same reason | Ch. 10 |
 | `BcikStitch` payload | **[1] Phase 2 done** | `crates/ssk-types/src/lib.rs` — real struct with all ch. 9.1 fields; `CrossOutcome::Closed(BcikStitch)` carries it | Ch. 9.1 |
 | Real BCIK crossing kernel | **[2] Phase 2 partial** | `crates/ssk-bcik/src/lib.rs` — real `Bcik<'p>` struct (`HashProvider`-backed seam witness, `ResidueRegister`), tested (closed-stitch fields populated, residue recorded on open crossing); closure condition is still `candidate.seam_ok && candidate.boundary_complete` — real per-fiber invariant checking is Phase 3's `FiberGate` job | Ch. 9.1 |
 | Full `BoundaryResidue` (severity/origin/open_obligation) | **[1] Phase 2 done** | `crates/ssk-types/src/lib.rs` — all ch. 9.2 fields present via `BoundaryResidue::new(...)`, wired at every construction site | Ch. 9.2 |
 | `ResidueRegister` | **[1] Phase 2 done** | `crates/ssk-types/src/lib.rs` — real `emit()`/`open_obligations()`/`entries()`; `Bcik` owns one and emits into it on every open crossing | Ch. 9.2 |
-| Twelve real per-gate evaluators | [2] | `crates/ssk-gates/src/lib.rs:59-119` — single `BasicGate` dispatching all 12 `GateId` variants in one `match`; 11 of 12 checks are single-boolean-flag reads; only `PrivacyGate` (line 94-102) computes a derived value | Ch. 11.2 |
-| `GateVector::evaluate` — all-gates-evaluated | [3] | `crates/ssk-gates/src/lib.rs:148,153` — explicit `break` on Quarantine/Reject; PDF's own pseudocode (Ch. 11.2) has **no break** | Ch. 11.2 |
+| Twelve real per-gate evaluators | **[1] Phase 3 done** | `crates/ssk-gates/src/lib.rs` — twelve distinct gate structs (`CoreGate`, `MirrorGate`, `LocatorGate`, `BcikGate`, `HypercubeGate`, `CapabilityGate`, `FiberGate`, `PrivacyGate`, `BoundaryGate`, `FocusGate`, `ReplayGate`, `DissolutionGate`); `MirrorGate` drives real `MirrorOrbit::recover`, `BcikGate` drives real `Bcik::cross`, `HypercubeGate` drives the new `pch::Hypercube::check`, `CapabilityGate` checks real witness expiry/scope, `PrivacyGate` uses real `ssk_privacy::linkability_score` | Ch. 11.2 |
+| `GateVector::evaluate` — all-gates-evaluated | **[1] Phase 3 done** | `crates/ssk-gates/src/lib.rs` — both early `break`s removed; `all_twelve_gates_are_evaluated_even_after_an_early_reject` proves every gate fires exactly once via a counting spy, matching the PDF's own no-break pseudocode | Ch. 11.2 |
 | `GateProfile` richer fields | [2] | `crates/ssk-config/src/lib.rs:30-46` — only `order`, `fail_closed`; missing `thresholds, required_evidence, failure_policy, hold_policy, pass_policy` | Ch. 11.3 |
 | `CapabilityWitness` struct | **[1] Phase 2 done** | `crates/ssk-types/src/lib.rs` — real struct with all ch. 5.2 fields; `StitchCandidate`/`ConnectionIntent.capability_witness: bool` replaced by `capability: Option<CapabilityWitness>` | Ch. 5.2 |
 | `CapabilityWitnessProvider`/`KeyAgreementProvider` impls | **[1] Phase 2 done** | `crates/ssk-crypto/src/lib.rs` — `Ed25519CapabilityWitnessProvider` (`WitnessKind::Signature`, real issue/verify with scope+expiry checks, tested incl. tamper/expiry/scope-mismatch/wrong-issuer); `X25519KeyPair` real `KeyAgreementProvider` (zero new deps — `x25519-dalek` was already an unused optional dependency) | Ch. 5.1 |
@@ -200,7 +201,7 @@ if all tests for levels 0..*k* pass"):
 | SSKΩ-1 | Deterministic core + scheduler: fixed-point phase, deterministic tick, replayable phase selection. | ✅ met |
 | SSKΩ-2 | Mirror-facet orbit + locator pool with real typing and locator-reality checks. | ✅ met (Phase 1: content-addressed `MirrorOrbit`, real `claims_external_plurality()`) |
 | SSKΩ-3 | BCIK `StitchCandidate` pipeline: every crossing carries seam, boundary, gate, trace, replay. | ⚠️ seam/boundary/trace/replay are real (Phase 2); `gate_report` is still always `None` — real per-gate evidence is Phase 3 |
-| SSKΩ-4 | Gate vector + boundary residues: twelve gates, fail-closed, typed residues, PCH projection checks. | ❌ twelve gates exist but are thin; no PCH |
+| SSKΩ-4 | Gate vector + boundary residues: twelve gates, fail-closed, typed residues, PCH projection checks. | ✅ met (Phase 3: twelve real gate structs, no early-break, typed `ResidueKind` on every fail path, `HypercubeGate` drives the real 9-axis PCH) |
 | SSKΩ-5 | Persistent Stitch Tensor + audit: hash-chained append, storage backends, tensor-preservation theorem tested. | ⚠️ hash-chained append + storage backends are real; the theorem is provable only informally, not as a typestate guarantee |
 | SSKΩ-6 | Concave Reanalysis Focus + replay: class reconstruction, replay determinism harness green. | ❌ absent |
 | SSKΩ-7 | Locator pool + relay-fabric adapters: real egress adapters behind the async edge, health probing. | ❌ absent |
