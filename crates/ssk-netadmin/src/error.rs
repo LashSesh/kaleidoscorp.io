@@ -22,4 +22,10 @@ pub enum NetAdminError {
     Serialization(String),
     #[error("flow denied: fail-closed policy for flow `{0}`")]
     FailClosed(String),
+    #[error("ledger persistence error: {0}")]
+    Tensor(#[from] ssk_tensor::TensorError),
+    #[error(
+        "insecure attestation key rejected: an all-zero key may not be used outside test builds"
+    )]
+    InsecureKey,
 }

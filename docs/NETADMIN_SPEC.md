@@ -171,15 +171,21 @@ Each tenant has an `OperatorProfile` and a `RolloutMode`:
 
 ## Data Plane Adapters
 
-All adapters implement the `DataPlaneAdapter` trait:
+All adapters implement the `DataPlaneAdapter` trait. This trait is
+**descriptor-only** — it defines *how* a connection should be set up, not the
+networking implementation itself. It intentionally has no `connect()` method:
 
 ```rust
 pub trait DataPlaneAdapter: Send + Sync {
-    fn kind(&self) -> AdapterKind;
+    fn adapter_id(&self) -> &str;
     fn describe(&self) -> AdapterDescriptor;
-    fn connect(&self, destination: &str) -> Result<String, NetAdminError>;
 }
 ```
+
+A runtime `connect()` ships in Phase 3 as `ssk-netcore::AdapterRuntime::connect`
+(see `docs/DESKTOP_CLIENT_ARCHITECTURE.md` section G), layered *alongside* this
+descriptor trait — not added to it — so `ssk-netadmin` stays a pure,
+`no_std`-friendly decision/descriptor crate with no socket or async dependency.
 
 | Adapter | Protocol |
 |---------|---------|

@@ -1,0 +1,8 @@
+error[E0599]: no method named `materialize` found for struct `Connection<Intent>` in the current scope
+ --> tests/ui/illegal_materialize_from_intent.rs:8:15
+  |
+8 |     let _ = c.materialize(&mut ());
+  |               ^^^^^^^^^^^ method not found in `Connection<Intent>`
+  |
+  = note: the method was found for
+          - `Connection<GatePassed>`

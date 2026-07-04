@@ -12,5 +12,8 @@ async-edge = []
 ssk-types = { path = "../ssk-types" }
 serde.workspace = true
 
+[dev-dependencies]
+serde_json.workspace = true
+
 [lints]
 workspace = true

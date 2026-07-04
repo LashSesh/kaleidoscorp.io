@@ -125,10 +125,7 @@ impl ControlPlane {
     }
 
     /// Look up the profile for a tenant.
-    pub fn profile_for_tenant(
-        &self,
-        tenant_id: &str,
-    ) -> Result<&OperatorProfile, NetAdminError> {
+    pub fn profile_for_tenant(&self, tenant_id: &str) -> Result<&OperatorProfile, NetAdminError> {
         let tenant = self.tenant(tenant_id)?;
         self.profiles
             .iter()
@@ -137,11 +134,7 @@ impl ControlPlane {
     }
 
     /// Validate that an adapter is permitted for the tenant's profile.
-    pub fn check_adapter(
-        &self,
-        tenant_id: &str,
-        adapter_id: &str,
-    ) -> Result<(), NetAdminError> {
+    pub fn check_adapter(&self, tenant_id: &str, adapter_id: &str) -> Result<(), NetAdminError> {
         let profile = self.profile_for_tenant(tenant_id)?;
         if profile.allows_adapter(adapter_id) {
             Ok(())
@@ -153,11 +146,7 @@ impl ControlPlane {
     }
 
     /// Validate that a risk level is acceptable for the tenant's profile.
-    pub fn check_risk(
-        &self,
-        tenant_id: &str,
-        risk: RiskLevel,
-    ) -> Result<(), NetAdminError> {
+    pub fn check_risk(&self, tenant_id: &str, risk: RiskLevel) -> Result<(), NetAdminError> {
         let profile = self.profile_for_tenant(tenant_id)?;
         if profile.allows_risk(risk) {
             Ok(())

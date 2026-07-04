@@ -1,0 +1,8 @@
+error[E0599]: no method named `gate` found for struct `Connection<Canonical>` in the current scope
+ --> tests/ui/illegal_gate_from_canonical.rs:9:15
+  |
+9 |     let _ = c.gate(&());
+  |               ^^^^ method not found in `Connection<Canonical>`
+  |
+  = note: the method was found for
+          - `Connection<Placed>`

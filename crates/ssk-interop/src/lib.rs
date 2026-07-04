@@ -43,17 +43,33 @@ pub trait AttestationVerifier: Send + Sync {
     fn verify_token(&self, token_bytes: &[u8], signature_hex: &str) -> bool;
 }
 
-/// Default verifier: Blake3 keyed-hash with a fixed well-known test key.
-/// Not for production use; replace with a real asymmetric scheme.
+/// Default verifier: Blake3 keyed-hash. This is a symmetric MAC, not an
+/// asymmetric signature; consider `ssk_crypto::Ed25519KeyPair` (the `crypto`
+/// feature of `ssk-crypto`) for a real asymmetric scheme.
 #[derive(Debug, Clone)]
 pub struct Blake3KeyedVerifier {
     key: [u8; 32],
 }
 
 impl Blake3KeyedVerifier {
+    /// Build a verifier from a real secret key. Rejects an all-zero key
+    /// unconditionally, in every build configuration — the all-zero key is
+    /// reserved for [`Blake3KeyedVerifier::new_test_key`].
+    pub fn new(key: [u8; 32]) -> Result<Self, InteropError> {
+        if key == [0u8; 32] {
+            return Err(InteropError::InsecureKey);
+        }
+        Ok(Self { key })
+    }
+
+    /// The fixed, well-known all-zero reference key used only by protocol
+    /// conformance self-tests (e.g. `ssk interop conformance`) against golden
+    /// vectors — never for verifying an untrusted peer's attestation. Gated
+    /// so it cannot be reached from an ordinary release build.
+    #[cfg(any(test, feature = "insecure-test-keys"))]
     #[must_use]
-    pub const fn new(key: [u8; 32]) -> Self {
-        Self { key }
+    pub const fn new_test_key() -> Self {
+        Self { key: [0u8; 32] }
     }
 
     /// Sign a token with this key (for test/fixture generation).
@@ -258,10 +274,9 @@ impl ConformanceSuite {
                         format!("ok (accepted={})", accepted)
                     } else {
                         match outcome {
-                            Ok(_) => format!(
-                                "expected reject but was accepted (profile: {})",
-                                p.name
-                            ),
+                            Ok(_) => {
+                                format!("expected reject but was accepted (profile: {})", p.name)
+                            }
                             Err(e) => format!(
                                 "expected accept but was rejected: {e} (profile: {})",
                                 p.name
@@ -416,6 +431,7 @@ pub enum InteropErrorCode {
     DecodeRejected,
     AttestationRequired,
     AttestationInvalid,
+    InsecureKey,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -440,6 +456,8 @@ pub enum InteropError {
     AttestationRequired,
     #[error("signed capability attestation verification failed")]
     AttestationInvalid,
+    #[error("insecure key rejected: an all-zero key may not be used outside test builds")]
+    InsecureKey,
 }
 
 impl InteropError {
@@ -455,6 +473,7 @@ impl InteropError {
             Self::NonCanonicalEncoding => InteropErrorCode::NonCanonicalEncoding,
             Self::AttestationRequired => InteropErrorCode::AttestationRequired,
             Self::AttestationInvalid => InteropErrorCode::AttestationInvalid,
+            Self::InsecureKey => InteropErrorCode::InsecureKey,
         }
     }
 }
@@ -619,7 +638,7 @@ mod tests {
 
     #[test]
     fn attestation_verified_on_valid_token() {
-        let verifier = Blake3KeyedVerifier::new([0u8; 32]);
+        let verifier = Blake3KeyedVerifier::new_test_key();
         let token = AttestationToken {
             subject_id: "peer-alpha".into(),
             capabilities: vec!["gate-vector-12".into(), "replay-v1".into()],
@@ -650,7 +669,7 @@ mod tests {
 
     #[test]
     fn attestation_invalid_signature_rejected() {
-        let verifier = Blake3KeyedVerifier::new([0u8; 32]);
+        let verifier = Blake3KeyedVerifier::new_test_key();
         let token = AttestationToken {
             subject_id: "peer-beta".into(),
             capabilities: vec!["gate-vector-12".into(), "replay-v1".into()],
@@ -712,5 +731,16 @@ mod tests {
             );
         }
         assert!(report.all_passed());
+    }
+
+    #[test]
+    fn new_rejects_zero_key() {
+        let err = Blake3KeyedVerifier::new([0u8; 32]).expect_err("zero key must be rejected");
+        assert_eq!(err.code(), InteropErrorCode::InsecureKey);
+    }
+
+    #[test]
+    fn new_accepts_a_real_key() {
+        assert!(Blake3KeyedVerifier::new([7u8; 32]).is_ok());
     }
 }

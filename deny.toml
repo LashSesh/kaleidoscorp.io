@@ -2,9 +2,11 @@
 # Run: cargo deny check
 
 [advisories]
-# Deny crates with known security advisories.
+# Deny crates with known security advisories (cargo-deny's default behavior
+# for `[advisories]` already denies all reported vulnerabilities; `deny = []`
+# was removed here since newer cargo-deny versions (0.16+) no longer accept
+# that key in this section — ignore-listing stays available below).
 version = 2
-deny = []
 ignore = []
 
 [licenses]

@@ -1,9 +1,14 @@
 #![forbid(unsafe_code)]
 
-use ssk_bcik::CrossOutcome;
+pub mod gabriel;
+pub mod pch;
+
+use ssk_bcik::Bcik;
+use ssk_core::MirrorOrbit;
+use ssk_crypto::Blake3HashProvider;
 use ssk_types::{
-    BoundaryResidue, GateId, GateOutcomeKind, GateReport, GateReportId, GateVerdict, GateWitness,
-    Id, ResidueId, ResidueKind, StitchCandidate,
+    BoundaryResidue, CrossOutcome, GateId, GateOutcomeKind, GateReport, GateReportId, GateVerdict,
+    GateWitness, ResidueId, ResidueKind, Severity, StitchCandidate,
 };
 
 /// Risk score above which the Fiber gate rejects a locator.
@@ -13,22 +18,21 @@ const FIBER_RISK_THRESHOLD: u8 = 50;
 /// Linkability score above which the Privacy gate rejects a locator.
 const PRIVACY_LINKABILITY_THRESHOLD: u8 = 50;
 
+/// Phase 3 placeholder for shared gate-evaluation context (Master Spec Ω+1
+/// ch. 11.1's `GateCtx`) — carries nothing yet; no current check needs
+/// cross-gate state, but the PDF's own trait signature includes it.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct GateCtx;
+
+/// Every gate: input type, output witness, failure mode, residue, audit,
+/// replay (ch. 11.1, verbatim).
 pub trait Gate: Send + Sync {
     fn id(&self) -> GateId;
+    /// Mandatory gates cannot be skipped.
     fn required(&self) -> bool;
-    fn evaluate(&self, sc: &StitchCandidate) -> GateVerdict;
-}
-
-#[derive(Debug)]
-pub struct BasicGate {
-    id: GateId,
-}
-
-impl BasicGate {
-    #[must_use]
-    pub fn new(id: GateId) -> Self {
-        Self { id }
-    }
+    /// Typed residue emitted on failure.
+    fn residue_on_fail(&self) -> ResidueKind;
+    fn evaluate(&self, sc: &StitchCandidate, ctx: &GateCtx) -> GateVerdict;
 }
 
 fn pass(id: GateId) -> GateVerdict {
@@ -38,81 +42,311 @@ fn pass(id: GateId) -> GateVerdict {
     })
 }
 
-fn reject(id: GateId, kind: ResidueKind, detail: &str) -> GateVerdict {
-    GateVerdict::Reject(BoundaryResidue {
-        id: ResidueId(Id::new(format!("res-{id:?}"))),
+fn reject(id: GateId, kind: ResidueKind, detail: &str, sc: &StitchCandidate) -> GateVerdict {
+    GateVerdict::Reject(BoundaryResidue::new(
+        ResidueId::new(format!("res-{id:?}")),
         kind,
-        source_gate: id,
-        detail: detail.to_owned(),
-    })
+        id,
+        detail,
+        Severity::High,
+        sc.facet.trace.clone(),
+        true,
+    ))
 }
 
-impl Gate for BasicGate {
+fn hold(id: GateId, kind: ResidueKind, detail: &str, sc: &StitchCandidate) -> GateVerdict {
+    GateVerdict::Hold(BoundaryResidue::new(
+        ResidueId::new(format!("res-{id:?}")),
+        kind,
+        id,
+        detail,
+        Severity::Low,
+        sc.facet.trace.clone(),
+        true,
+    ))
+}
+
+macro_rules! simple_gate {
+    ($name:ident, $id:expr, $residue:expr, $check:expr, $detail:expr) => {
+        #[derive(Debug, Default)]
+        pub struct $name;
+
+        impl Gate for $name {
+            fn id(&self) -> GateId {
+                $id
+            }
+
+            fn required(&self) -> bool {
+                true
+            }
+
+            fn residue_on_fail(&self) -> ResidueKind {
+                $residue
+            }
+
+            fn evaluate(&self, sc: &StitchCandidate, _ctx: &GateCtx) -> GateVerdict {
+                if $check(sc) {
+                    pass($id)
+                } else {
+                    reject($id, $residue, $detail, sc)
+                }
+            }
+        }
+    };
+}
+
+// CoreGate: canonicalization, core signature, policy root.
+simple_gate!(
+    CoreGate,
+    GateId::Core,
+    ResidueKind::Identity,
+    |sc: &StitchCandidate| sc.core.signature.is_present(),
+    "core signature invalid"
+);
+
+/// MirrorGate: facet in core orbit, sector valid, recoverable. Real check —
+/// re-derives the orbit deterministically from the core and confirms the
+/// facet actually recovers to it (`MirrorOrbit::recover`, Phase 1), not just
+/// a `core_id` equality comparison.
+#[derive(Debug, Default)]
+pub struct MirrorGate;
+
+impl Gate for MirrorGate {
     fn id(&self) -> GateId {
-        self.id
+        GateId::Mirror
     }
 
     fn required(&self) -> bool {
         true
     }
 
-    fn evaluate(&self, sc: &StitchCandidate) -> GateVerdict {
-        match self.id {
-            GateId::Core if !sc.core.signature_ok => {
-                reject(self.id, ResidueKind::Identity, "core signature invalid")
-            }
-            GateId::Mirror if sc.facet.core_id != sc.core.id => {
-                reject(self.id, ResidueKind::Identity, "facet not recoverable")
-            }
-            GateId::Locator if !sc.locator.trusted || sc.locator.risk_score > 70 => {
-                reject(self.id, ResidueKind::Locator, "locator risk bound exceeded")
-            }
-            GateId::Bcik => {
-                if matches!(ssk_bcik::cross(sc), CrossOutcome::Closed) {
-                    pass(self.id)
-                } else {
-                    reject(self.id, ResidueKind::Boundary, "bcik crossing open")
-                }
-            }
-            // Defense-in-depth: Hypercube independently checks seam integrity.
-            // BCIK also checks seam_ok; this gate catches any bypass of BCIK.
-            GateId::Hypercube if !sc.seam_ok => {
-                reject(self.id, ResidueKind::Boundary, "hypercube seam integrity failed")
-            }
-            GateId::Capability if !sc.capability_witness => reject(
-                self.id,
-                ResidueKind::Capability,
-                "missing capability witness",
-            ),
-            // Fiber enforces a stricter risk ceiling than the Locator gate.
-            GateId::Fiber if sc.locator.risk_score > FIBER_RISK_THRESHOLD => {
-                reject(self.id, ResidueKind::Locator, "fiber risk ceiling exceeded")
-            }
-            // Privacy enforces a maximum linkability score on the locator.
-            GateId::Privacy
-                if ssk_privacy::linkability_score(&sc.locator)
-                    > PRIVACY_LINKABILITY_THRESHOLD =>
-            {
-                reject(self.id, ResidueKind::Correlation, "privacy linkability threshold exceeded")
-            }
-            GateId::Boundary if !sc.boundary_complete => reject(
-                self.id,
-                ResidueKind::Boundary,
-                "incomplete residue register",
-            ),
-            GateId::Focus if !sc.focus_ready => {
-                reject(self.id, ResidueKind::Focus, "focus recovery failed")
-            }
-            GateId::Replay if !sc.replay_ready => {
-                reject(self.id, ResidueKind::Replay, "replay witness missing")
-            }
-            GateId::Dissolution if sc.ttl_epoch == 0 => {
-                reject(self.id, ResidueKind::Timing, "ttl epoch missing")
-            }
-            _ => pass(self.id),
+    fn residue_on_fail(&self) -> ResidueKind {
+        ResidueKind::Identity
+    }
+
+    fn evaluate(&self, sc: &StitchCandidate, _ctx: &GateCtx) -> GateVerdict {
+        if MirrorOrbit::for_core(&sc.core).recover(&sc.facet).is_ok() {
+            pass(GateId::Mirror)
+        } else {
+            reject(
+                GateId::Mirror,
+                ResidueKind::Identity,
+                "facet not recoverable",
+                sc,
+            )
         }
     }
 }
+
+// LocatorGate: locator exists, type permitted, trust/cost/risk bounds.
+simple_gate!(
+    LocatorGate,
+    GateId::Locator,
+    ResidueKind::Locator,
+    |sc: &StitchCandidate| sc.locator.trusted && sc.locator.risk_score <= 70,
+    "locator risk bound exceeded"
+);
+
+/// BcikGate: seam, boundary, residual projector, no silent crossing. Drives
+/// the real `Bcik::cross()` kernel (Phase 2).
+#[derive(Debug, Default)]
+pub struct BcikGate;
+
+impl Gate for BcikGate {
+    fn id(&self) -> GateId {
+        GateId::Bcik
+    }
+
+    fn required(&self) -> bool {
+        true
+    }
+
+    fn residue_on_fail(&self) -> ResidueKind {
+        ResidueKind::Boundary
+    }
+
+    fn evaluate(&self, sc: &StitchCandidate, _ctx: &GateCtx) -> GateVerdict {
+        let provider = Blake3HashProvider;
+        let mut bcik = Bcik::new(&provider);
+        if matches!(
+            bcik.cross(&sc.facet, &sc.locator, ssk_types::FiberType::Data, sc),
+            CrossOutcome::Closed(_)
+        ) {
+            pass(GateId::Bcik)
+        } else {
+            reject(
+                GateId::Bcik,
+                ResidueKind::Boundary,
+                "bcik crossing open",
+                sc,
+            )
+        }
+    }
+}
+
+/// HypercubeGate: all PCH projections defined and compatible. Drives the
+/// real nine-axis `pch::Hypercube::check` (Section I) — an `OverBudget`
+/// axis holds (diagnosable, non-persistent) rather than rejecting outright,
+/// per ch. 8.2's invariant.
+#[derive(Debug, Default)]
+pub struct HypercubeGate;
+
+impl Gate for HypercubeGate {
+    fn id(&self) -> GateId {
+        GateId::Hypercube
+    }
+
+    fn required(&self) -> bool {
+        true
+    }
+
+    fn residue_on_fail(&self) -> ResidueKind {
+        ResidueKind::Boundary
+    }
+
+    fn evaluate(&self, sc: &StitchCandidate, _ctx: &GateCtx) -> GateVerdict {
+        match crate::pch::Hypercube::default().check(sc) {
+            crate::pch::PchOutcome::Pass => pass(GateId::Hypercube),
+            crate::pch::PchOutcome::Hold { axis, reason } => hold(
+                GateId::Hypercube,
+                ResidueKind::Boundary,
+                &format!("axis {axis:?} over budget: {reason}"),
+                sc,
+            ),
+            crate::pch::PchOutcome::Fail { axis, reason } => reject(
+                GateId::Hypercube,
+                ResidueKind::Boundary,
+                &format!("axis {axis:?} failed: {reason}"),
+                sc,
+            ),
+        }
+    }
+}
+
+/// CapabilityGate: witness valid, scoped, unexpired, replayable. Checks real
+/// structural fields of the witness (expiry, scope), not just presence —
+/// full cryptographic re-verification needs the issuer's public key, which
+/// this gate does not hold; that wiring is a later phase's job.
+#[derive(Debug, Default)]
+pub struct CapabilityGate;
+
+impl Gate for CapabilityGate {
+    fn id(&self) -> GateId {
+        GateId::Capability
+    }
+
+    fn required(&self) -> bool {
+        true
+    }
+
+    fn residue_on_fail(&self) -> ResidueKind {
+        ResidueKind::Capability
+    }
+
+    fn evaluate(&self, sc: &StitchCandidate, _ctx: &GateCtx) -> GateVerdict {
+        match &sc.capability {
+            None => reject(
+                GateId::Capability,
+                ResidueKind::Capability,
+                "missing capability witness",
+                sc,
+            ),
+            Some(w) if w.expiry.0 == 0 => reject(
+                GateId::Capability,
+                ResidueKind::Capability,
+                "capability witness has zero expiry",
+                sc,
+            ),
+            Some(w) if w.scope.action.is_empty() => reject(
+                GateId::Capability,
+                ResidueKind::Capability,
+                "capability witness has an empty scope action",
+                sc,
+            ),
+            Some(_) => pass(GateId::Capability),
+        }
+    }
+}
+
+// FiberGate: fiber typed, transform invariants preserved. Stricter risk
+// ceiling than LocatorGate — no real fiber-transform model exists yet (see
+// pch::ProtocolProjector's identical disclosure).
+simple_gate!(
+    FiberGate,
+    GateId::Fiber,
+    ResidueKind::Protocol,
+    |sc: &StitchCandidate| sc.locator.risk_score <= FIBER_RISK_THRESHOLD,
+    "fiber risk ceiling exceeded"
+);
+
+/// PrivacyGate: linkability within budget; metadata budget respected. Uses
+/// the real (if heuristic) `ssk_privacy::linkability_score`.
+#[derive(Debug, Default)]
+pub struct PrivacyGate;
+
+impl Gate for PrivacyGate {
+    fn id(&self) -> GateId {
+        GateId::Privacy
+    }
+
+    fn required(&self) -> bool {
+        true
+    }
+
+    fn residue_on_fail(&self) -> ResidueKind {
+        ResidueKind::Correlation
+    }
+
+    fn evaluate(&self, sc: &StitchCandidate, _ctx: &GateCtx) -> GateVerdict {
+        if ssk_privacy::linkability_score(&sc.locator) > PRIVACY_LINKABILITY_THRESHOLD {
+            reject(
+                GateId::Privacy,
+                ResidueKind::Correlation,
+                "privacy linkability threshold exceeded",
+                sc,
+            )
+        } else {
+            pass(GateId::Privacy)
+        }
+    }
+}
+
+// BoundaryGate: residue register consistent; no missing residue field.
+simple_gate!(
+    BoundaryGate,
+    GateId::Boundary,
+    ResidueKind::Boundary,
+    |sc: &StitchCandidate| sc.boundary_complete,
+    "incomplete residue register"
+);
+
+// FocusGate: responses can refocus to canonical core class. Uses the real
+// ssk_focus::refocuses check (facet/core linkage + focus readiness).
+simple_gate!(
+    FocusGate,
+    GateId::Focus,
+    ResidueKind::Focus,
+    |sc: &StitchCandidate| ssk_focus::refocuses(sc),
+    "focus recovery failed"
+);
+
+// ReplayGate: deterministic replay under run descriptor.
+simple_gate!(
+    ReplayGate,
+    GateId::Replay,
+    ResidueKind::Replay,
+    |sc: &StitchCandidate| sc.replay_ready,
+    "replay witness missing"
+);
+
+// DissolutionGate: TTL/epoch fields present and finalizable.
+simple_gate!(
+    DissolutionGate,
+    GateId::Dissolution,
+    ResidueKind::Timing,
+    |sc: &StitchCandidate| sc.ttl_epoch != 0,
+    "ttl epoch missing"
+);
 
 pub struct GateVector {
     gates: Vec<Box<dyn Gate>>,
@@ -122,31 +356,44 @@ impl GateVector {
     #[must_use]
     pub fn with_all_default() -> Self {
         Self {
-            gates: GateId::ALL
-                .into_iter()
-                .map(|id| Box::new(BasicGate::new(id)) as Box<dyn Gate>)
-                .collect(),
+            gates: vec![
+                Box::new(CoreGate) as Box<dyn Gate>,
+                Box::new(MirrorGate),
+                Box::new(LocatorGate),
+                Box::new(BcikGate),
+                Box::new(HypercubeGate),
+                Box::new(CapabilityGate),
+                Box::new(FiberGate),
+                Box::new(PrivacyGate),
+                Box::new(BoundaryGate),
+                Box::new(FocusGate),
+                Box::new(ReplayGate),
+                Box::new(DissolutionGate),
+            ],
         }
     }
 
+    /// Evaluates every gate, always — the PDF's own pseudocode (ch. 11.2) has
+    /// no early `break`; resolution priority (Quarantine > Refine > Reject >
+    /// Pass) is applied only after the full loop, so a later gate's evidence
+    /// is never silently skipped by an earlier gate's failure.
     #[must_use]
     pub fn evaluate(&self, sc: &StitchCandidate) -> GateReport {
+        let ctx = GateCtx;
         let mut witnesses = Vec::new();
         let (mut refine, mut quarantine, mut reject) = (None, None, None);
 
         for gate in &self.gates {
-            match gate.evaluate(sc) {
+            match gate.evaluate(sc, &ctx) {
                 GateVerdict::Pass(w) => witnesses.push(w),
                 GateVerdict::Hold(r) | GateVerdict::Refine(r) => {
                     refine.get_or_insert(r);
                 }
                 GateVerdict::Quarantine(r) => {
                     quarantine.get_or_insert(r);
-                    break;
                 }
                 GateVerdict::Reject(r) => {
                     reject.get_or_insert(r);
-                    break;
                 }
             }
         }
@@ -170,6 +417,16 @@ impl GateVector {
     }
 }
 
+/// Real `GateAuthority` for the `Connection<Placed>::gate` typestate
+/// transition (`ssk-core`'s dependency-inverted trait) — `ssk-gates` already
+/// depends on `ssk-core`, so implementing the trait here (rather than
+/// `ssk-core` naming `GateVector`) is what keeps the graph acyclic.
+impl ssk_core::connection::GateAuthority for GateVector {
+    fn evaluate(&self, sc: &StitchCandidate) -> GateReport {
+        GateVector::evaluate(self, sc)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -181,23 +438,43 @@ mod tests {
             run: RunId::new("r1"),
             core: CoreNode {
                 id: CoreId::new("c1"),
-                canonical_name: "n".into(),
+                canonical: CanonicalForm("n".into()),
+                signature: CoreSignature(vec![1, 2, 3]),
                 policy_root: PolicyId::new("p1"),
-                signature_ok: true,
+                replay_root: ReplayRoot::new("rr"),
+                audit_root: AuditRoot::new("ar"),
+                closure: ClosureState::Closed,
             },
             facet: MirrorFacet {
-                facet_id: Id::new("f1"),
-                core_id: CoreId::new("c1"),
+                id: FacetId::of(&"f1", HashAlg::Blake3).expect("hash"),
+                core: CoreId::new("c1"),
+                phase: PhaseVector::zero(),
+                orientation: Orientation::Forward,
                 sector: Sector::Identity,
-                replay_root: ReplayRoot::new("rr"),
+                key_ctx: KeyContextRef::new("kc"),
+                session: SessionId::new("sess"),
+                policy: PolicyId::new("p1"),
+                trace: TraceId::new("tr"),
+                boundary: BoundaryRef::new("bd"),
+                residue: ResidueRef::new("rs"),
             },
-            locator: Locator {
+            locator: LocatorFacet {
                 id: LocatorId::new("l1"),
-                locator_type: LocatorType::LocalOverlay,
+                kind: LocatorKind::LocalOverlay,
+                endpoint: EndpointRef::new("ep1"),
+                route: RouteClass::Direct,
+                transport: TransportClass::Tcp,
+                epoch: EpochId(0),
+                ttl: Ttl(100),
+                trust: TrustClass::Owned,
+                cost: CostClass::Free,
+                risk: RiskClass::Low,
+                health: HealthStatus::Live,
+                trace: TraceId::new("loc-trace"),
                 trusted: true,
                 risk_score: 1,
             },
-            capability_witness: true,
+            capability: Some(sample_capability_witness()),
             seam_ok: true,
             boundary_complete: true,
             replay_ready: true,
@@ -206,69 +483,86 @@ mod tests {
         }
     }
 
+    fn sample_capability_witness() -> CapabilityWitness {
+        CapabilityWitness {
+            id: CapabilityId::of(&"gate-test-capability", HashAlg::Blake3).expect("hash"),
+            claim: CapabilityClaim("use-local-overlay".into()),
+            scope: Scope {
+                action: "connect".into(),
+                facet_class: ObjectKind::Core,
+            },
+            issuer: IssuerRef::new("issuer-1"),
+            subject_class: SubjectClass::Core,
+            epoch: EpochId(0),
+            expiry: Ttl(100),
+            proof: ProofBytes(vec![1, 2, 3]),
+            trace: TraceId::new("cap-trace"),
+        }
+    }
+
     #[test]
     fn gate_vector_fail_closed() {
         let mut sc = candidate();
-        sc.capability_witness = false;
+        sc.capability = None;
         let report = GateVector::with_all_default().evaluate(&sc);
         assert_eq!(report.outcome, GateOutcomeKind::Reject);
     }
 
     #[test]
     fn hypercube_gate_rejects_broken_seam() {
-        let gate = BasicGate::new(GateId::Hypercube);
+        let gate = HypercubeGate;
         let mut sc = candidate();
         sc.seam_ok = false;
         assert!(
-            matches!(gate.evaluate(&sc), GateVerdict::Reject(_)),
+            matches!(gate.evaluate(&sc, &GateCtx), GateVerdict::Reject(_)),
             "Hypercube must reject when seam_ok is false"
         );
     }
 
     #[test]
     fn hypercube_gate_passes_intact_seam() {
-        let gate = BasicGate::new(GateId::Hypercube);
+        let gate = HypercubeGate;
         let sc = candidate();
-        assert!(matches!(gate.evaluate(&sc), GateVerdict::Pass(_)));
+        assert!(matches!(gate.evaluate(&sc, &GateCtx), GateVerdict::Pass(_)));
     }
 
     #[test]
     fn fiber_gate_rejects_high_risk_locator() {
-        let gate = BasicGate::new(GateId::Fiber);
+        let gate = FiberGate;
         let mut sc = candidate();
         sc.locator.risk_score = FIBER_RISK_THRESHOLD + 1;
         assert!(
-            matches!(gate.evaluate(&sc), GateVerdict::Reject(_)),
+            matches!(gate.evaluate(&sc, &GateCtx), GateVerdict::Reject(_)),
             "Fiber must reject risk_score > FIBER_RISK_THRESHOLD"
         );
     }
 
     #[test]
     fn fiber_gate_passes_acceptable_risk() {
-        let gate = BasicGate::new(GateId::Fiber);
+        let gate = FiberGate;
         let mut sc = candidate();
         sc.locator.risk_score = FIBER_RISK_THRESHOLD;
-        assert!(matches!(gate.evaluate(&sc), GateVerdict::Pass(_)));
+        assert!(matches!(gate.evaluate(&sc, &GateCtx), GateVerdict::Pass(_)));
     }
 
     #[test]
     fn privacy_gate_rejects_high_linkability_untrusted() {
-        let gate = BasicGate::new(GateId::Privacy);
+        let gate = PrivacyGate;
         let mut sc = candidate();
         sc.locator.trusted = false;
         sc.locator.risk_score = PRIVACY_LINKABILITY_THRESHOLD + 1;
         // linkability_score = risk_score (untrusted) = 51 > 50
         assert!(
-            matches!(gate.evaluate(&sc), GateVerdict::Reject(_)),
+            matches!(gate.evaluate(&sc, &GateCtx), GateVerdict::Reject(_)),
             "Privacy must reject when linkability score exceeds threshold"
         );
     }
 
     #[test]
     fn privacy_gate_passes_low_linkability() {
-        let gate = BasicGate::new(GateId::Privacy);
+        let gate = PrivacyGate;
         let sc = candidate(); // trusted, risk_score=1 → linkability=0
-        assert!(matches!(gate.evaluate(&sc), GateVerdict::Pass(_)));
+        assert!(matches!(gate.evaluate(&sc, &GateCtx), GateVerdict::Pass(_)));
     }
 
     #[test]
@@ -277,5 +571,83 @@ mod tests {
         sc.locator.risk_score = 60; // passes Locator (≤70) but fails Fiber (>50)
         let report = GateVector::with_all_default().evaluate(&sc);
         assert_eq!(report.outcome, GateOutcomeKind::Reject);
+    }
+
+    /// A spy gate that always fails and counts its own invocations, used to
+    /// prove `GateVector::evaluate` never early-`break`s (ch. 11.2's "every
+    /// gate is always evaluated" pseudocode).
+    struct CountingRejectSpy {
+        id: GateId,
+        count: std::sync::atomic::AtomicUsize,
+    }
+
+    impl Gate for CountingRejectSpy {
+        fn id(&self) -> GateId {
+            self.id
+        }
+
+        fn required(&self) -> bool {
+            true
+        }
+
+        fn residue_on_fail(&self) -> ResidueKind {
+            ResidueKind::Boundary
+        }
+
+        fn evaluate(&self, sc: &StitchCandidate, _ctx: &GateCtx) -> GateVerdict {
+            self.count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            reject(self.id, ResidueKind::Boundary, "spy always rejects", sc)
+        }
+    }
+
+    #[test]
+    fn all_twelve_gates_are_evaluated_even_after_an_early_reject() {
+        let spies: Vec<_> = GateId::ALL
+            .into_iter()
+            .map(|id| {
+                std::sync::Arc::new(CountingRejectSpy {
+                    id,
+                    count: std::sync::atomic::AtomicUsize::new(0),
+                })
+            })
+            .collect();
+        let gates: Vec<Box<dyn Gate>> = spies
+            .iter()
+            .map(|s| Box::new(ArcGate(s.clone())) as Box<dyn Gate>)
+            .collect();
+        let vector = GateVector { gates };
+        let report = vector.evaluate(&candidate());
+        assert_eq!(report.outcome, GateOutcomeKind::Reject);
+        for spy in &spies {
+            assert_eq!(
+                spy.count.load(std::sync::atomic::Ordering::SeqCst),
+                1,
+                "gate {:?} must be evaluated exactly once",
+                spy.id
+            );
+        }
+    }
+
+    /// Thin `Gate` wrapper so an `Arc<CountingRejectSpy>` can be boxed as
+    /// `Box<dyn Gate>` while the test also keeps its own `Arc` handles to
+    /// read the counters afterward.
+    struct ArcGate(std::sync::Arc<CountingRejectSpy>);
+
+    impl Gate for ArcGate {
+        fn id(&self) -> GateId {
+            self.0.id()
+        }
+
+        fn required(&self) -> bool {
+            self.0.required()
+        }
+
+        fn residue_on_fail(&self) -> ResidueKind {
+            self.0.residue_on_fail()
+        }
+
+        fn evaluate(&self, sc: &StitchCandidate, ctx: &GateCtx) -> GateVerdict {
+            self.0.evaluate(sc, ctx)
+        }
     }
 }

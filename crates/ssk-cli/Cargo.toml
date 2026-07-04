@@ -20,9 +20,19 @@ ssk-gates = { path = "../ssk-gates" }
 ssk-config = { path = "../ssk-config" }
 ssk-replay = { path = "../ssk-replay" }
 ssk-tensor = { path = "../ssk-tensor", features = ["storage"] }
-ssk-interop = { path = "../ssk-interop" }
+# `insecure-test-keys` is enabled here deliberately: `ssk interop conformance`
+# runs a protocol self-test against golden vectors using the fixed reference
+# key, not a peer-trust decision (see main.rs's `interop_command`). This is
+# the one production exception; `ssk-netadmin`'s `AttestationBinder` (real
+# flow attestation, below) has no such opt-in anywhere.
+ssk-interop = { path = "../ssk-interop", features = ["insecure-test-keys"] }
 ssk-netadmin = { path = "../ssk-netadmin" }
 ssk-faultscan = { path = "../ssk-faultscan" }
+ssk-ipc = { path = "../ssk-ipc" }
+# Only "rt" + "net" + "macros": one-shot current-thread runtime for the new
+# daemon-backed commands (status/activate/deactivate/list-profiles). `run` /
+# `replay-verify` / `doctor` / etc. remain fully synchronous and local.
+tokio = { version = "1", features = ["rt", "net", "macros"] }
 
 [lints]
 workspace = true

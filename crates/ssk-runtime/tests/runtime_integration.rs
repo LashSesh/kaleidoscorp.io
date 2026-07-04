@@ -1,13 +1,26 @@
 use ssk_gates::GateVector;
-use ssk_locator::LocatorPool;
+use ssk_locator::StaticLocatorPool;
 use ssk_runtime::{sample_intent, Runtime};
-use ssk_tensor::{LedgerBackend, MemoryBackend};
-use ssk_types::{GateOutcomeKind, Locator, LocatorId, LocatorType};
+use ssk_tensor::{GenericLedgerBackend, MemoryBackend};
+use ssk_types::{
+    CostClass, EndpointRef, EpochId, GateOutcomeKind, HealthStatus, LocatorFacet, LocatorId,
+    LocatorKind, RiskClass, TraceId, TrustClass, Ttl,
+};
 
-fn pool() -> LocatorPool {
-    LocatorPool::new(vec![Locator {
+fn pool() -> StaticLocatorPool {
+    StaticLocatorPool::new(vec![LocatorFacet {
         id: LocatorId::new("local"),
-        locator_type: LocatorType::LocalOverlay,
+        kind: LocatorKind::LocalOverlay,
+        endpoint: EndpointRef::new("local-endpoint"),
+        route: ssk_types::RouteClass::Direct,
+        transport: ssk_types::TransportClass::Tcp,
+        epoch: EpochId(0),
+        ttl: Ttl(100),
+        trust: TrustClass::Owned,
+        cost: CostClass::Free,
+        risk: RiskClass::Low,
+        health: HealthStatus::Live,
+        trace: TraceId::new("trace-local"),
         trusted: true,
         risk_score: 10,
     }])

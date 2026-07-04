@@ -14,7 +14,7 @@ denies, quarantines, and records forensically rather than silently allowing.
 | **No unsafe code** | `#![forbid(unsafe_code)]` enforced workspace-wide. |
 | **Deterministic execution** | All pipeline runs are replay-verifiable via hash-chained manifests. |
 | **Immutable audit trail** | Session and forensic ledgers are Blake3 hash-chained; tampering is detectable. |
-| **Strict attestation** | Interop handshakes verify capability attestations before accepting peers. |
+| **Strict attestation** | Interop handshakes verify capability attestations (Blake3 keyed-MAC by default; real ed25519 signing is available via `ssk-crypto`'s `crypto` feature) before accepting peers. |
 | **Least privilege** | Operator profiles constrain adapters and risk levels per tenant. |
 | **Supply-chain hygiene** | GitHub Actions are pinned to commit SHAs; `cargo audit` and `cargo deny` run in CI. |
 
@@ -44,9 +44,16 @@ Security fixes are not back-ported to older releases.
 - **Never commit secrets** to this repository.
 - Use environment variables for all integration credentials.
 - `.env.example` lists placeholder names only — it contains no real values.
-- The `Blake3KeyedVerifier` and `AttestationBinder` zero-key constructors are
-  compile-time restricted to test builds.  Production deployments **must** supply
-  a secret key sourced from a secret manager (e.g. `SSK_KMS_ENDPOINT`).
+- `Blake3KeyedVerifier::new`/`AttestationBinder::new` reject an all-zero key
+  unconditionally, in every build. A separate `new_test_key()` constructor
+  (gated by `cfg(test)` or the crate's `insecure-test-keys` Cargo feature,
+  off by default) supplies the fixed reference key used only by
+  `ssk interop conformance`'s protocol self-test against golden vectors. The
+  shipped `ssk` binary deliberately enables `ssk-interop`'s
+  `insecure-test-keys` feature for that one command (see `crates/ssk-cli/Cargo.toml`);
+  `ssk-netadmin`'s `AttestationBinder` (real flow attestation) has no such
+  exception in any shipped binary — production deployments **must** supply a
+  non-zero secret key sourced from a secret manager (e.g. `SSK_KMS_ENDPOINT`).
 
 ## Dependency Security
 

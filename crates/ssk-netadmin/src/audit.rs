@@ -2,11 +2,19 @@
 
 //! Audit & Forensics — immutable, hash-chained decision and traffic metadata
 //! for incident investigation.
+//!
+//! `AuditLedger` is generic over its storage backend (defaulting to an
+//! in-memory `ssk_tensor::GenericMemoryBackend`); use [`AuditLedger::persisted`]
+//! to get a disk-backed ledger whose entries survive a process restart. The
+//! hash-chain itself (hex-string `prev_hash`/`entry_hash` over a hand-built
+//! JSON body) is unchanged from the original in-memory-only implementation —
+//! only *where the entries live* is now pluggable.
 
 use serde::{Deserialize, Serialize};
 
 use crate::error::NetAdminError;
 use crate::route::RouteKind;
+use ssk_tensor::{GenericFileLedgerBackend, GenericLedgerBackend, GenericMemoryBackend};
 
 /// Outcome of a dispatched (or denied) flow.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -21,6 +29,16 @@ pub enum AuditOutcome {
     AttestationFailed,
     /// The flow was allowed in shadow/audit mode (not enforced).
     ShadowAllowed,
+    /// Reserved: an adapter's circuit breaker opened mid-flow. Not yet
+    /// produced by any code path until the `ssk-netcore` data-plane runtime
+    /// ships (Phase 3).
+    AdapterUnreachable,
+    /// Reserved: the kill switch was armed and blocked egress. Not yet
+    /// produced until `ssk-netcore`/`ssk-daemon` ship (Phase 3/4).
+    KillSwitchBlocked,
+    /// Reserved: a `RouteKind::Fallback` route executed its fallback branch.
+    /// Not yet produced until `ssk-netcore` ships (Phase 3).
+    FallbackDispatched,
 }
 
 /// A single immutable forensic audit entry.
@@ -76,23 +94,50 @@ fn hash_forensic_body(e: &ForensicEntry) -> Result<String, NetAdminError> {
         "epoch": e.epoch,
         "prev_hash": e.prev_hash,
     });
-    let bytes = serde_json::to_vec(&body)
-        .map_err(|err| NetAdminError::Serialization(err.to_string()))?;
+    let bytes =
+        serde_json::to_vec(&body).map_err(|err| NetAdminError::Serialization(err.to_string()))?;
     Ok(hex::encode(blake3::hash(&bytes).as_bytes()))
 }
 
-/// Append-only, hash-chained forensic audit ledger.
-#[derive(Debug, Default)]
-pub struct AuditLedger {
-    entries: Vec<ForensicEntry>,
+/// Append-only, hash-chained forensic audit ledger, generic over its storage
+/// backend. Defaults to an ephemeral in-memory backend; use
+/// [`AuditLedger::persisted`] for a disk-backed ledger.
+#[derive(Debug)]
+pub struct AuditLedger<B = GenericMemoryBackend<ForensicEntry>>
+where
+    B: GenericLedgerBackend<ForensicEntry>,
+{
+    backend: B,
 }
 
-impl AuditLedger {
+impl Default for AuditLedger<GenericMemoryBackend<ForensicEntry>> {
+    fn default() -> Self {
+        Self {
+            backend: GenericMemoryBackend::new(),
+        }
+    }
+}
+
+impl AuditLedger<GenericMemoryBackend<ForensicEntry>> {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
+}
 
+impl AuditLedger<GenericFileLedgerBackend<ForensicEntry>> {
+    /// A disk-persisted audit ledger: every `record()` call is durably
+    /// written, so `verify()` succeeds across a process restart at the same
+    /// `path`.
+    #[must_use]
+    pub fn persisted(path: impl AsRef<std::path::Path>) -> Self {
+        Self {
+            backend: GenericFileLedgerBackend::new(path),
+        }
+    }
+}
+
+impl<B: GenericLedgerBackend<ForensicEntry>> AuditLedger<B> {
     /// Append a new forensic entry for a flow event.
     #[allow(clippy::too_many_arguments)]
     pub fn record(
@@ -104,9 +149,10 @@ impl AuditLedger {
         route: &RouteKind,
         outcome: AuditOutcome,
         epoch: u64,
-    ) -> Result<&ForensicEntry, NetAdminError> {
+    ) -> Result<ForensicEntry, NetAdminError> {
         let prev_hash = self
-            .entries
+            .backend
+            .entries()?
             .last()
             .map(|e| e.entry_hash.clone())
             .unwrap_or_else(|| "genesis".to_string());
@@ -123,15 +169,15 @@ impl AuditLedger {
             entry_hash: String::new(),
         };
         entry.entry_hash = hash_forensic_body(&entry)?;
-        self.entries.push(entry);
-        Ok(self.entries.last().expect("just pushed"))
+        self.backend.append(entry.clone())?;
+        Ok(entry)
     }
 
     /// Verify the integrity of the entire hash chain.
     pub fn verify(&self) -> Result<(), NetAdminError> {
         let mut prev = "genesis".to_string();
-        for e in &self.entries {
-            let expected = hash_forensic_body(e)?;
+        for e in self.backend.entries()? {
+            let expected = hash_forensic_body(&e)?;
             if expected != e.entry_hash {
                 return Err(NetAdminError::AuditChainBroken(e.entry_id.clone()));
             }
@@ -143,19 +189,16 @@ impl AuditLedger {
         Ok(())
     }
 
-    #[must_use]
-    pub fn entries(&self) -> &[ForensicEntry] {
-        &self.entries
+    pub fn entries(&self) -> Result<Vec<ForensicEntry>, NetAdminError> {
+        Ok(self.backend.entries()?)
     }
 
-    #[must_use]
-    pub fn len(&self) -> usize {
-        self.entries.len()
+    pub fn len(&self) -> Result<usize, NetAdminError> {
+        Ok(self.backend.entries()?.len())
     }
 
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.entries.is_empty()
+    pub fn is_empty(&self) -> Result<bool, NetAdminError> {
+        Ok(self.len()? == 0)
     }
 }
 
@@ -191,7 +234,7 @@ mod tests {
             )
             .expect("record must succeed");
         ledger.verify().expect("chain must be valid");
-        assert_eq!(ledger.len(), 2);
+        assert_eq!(ledger.len().expect("len"), 2);
     }
 
     #[test]
@@ -208,7 +251,9 @@ mod tests {
                 1,
             )
             .expect("record");
-        ledger.entries[0].entry_hash = "tampered".into();
+        let mut entries = ledger.entries().expect("entries");
+        entries[0].entry_hash = "tampered".into();
+        ledger.backend.replace_all(entries);
         assert!(ledger.verify().is_err());
     }
 
@@ -222,5 +267,45 @@ mod tests {
         let summary = summarise_route(&route);
         assert!(summary.contains("hop1"));
         assert!(summary.contains("hop2"));
+    }
+
+    #[test]
+    fn persisted_chain_survives_reopen() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("audit.json");
+
+        {
+            let mut ledger = AuditLedger::persisted(&path);
+            ledger
+                .record(
+                    "e-0",
+                    "f-0",
+                    None,
+                    None,
+                    &RouteKind::Direct,
+                    AuditOutcome::Dispatched,
+                    1,
+                )
+                .expect("record");
+            ledger
+                .record(
+                    "e-1",
+                    "f-1",
+                    None,
+                    None,
+                    &RouteKind::Denied {
+                        reason: "policy-deny".into(),
+                    },
+                    AuditOutcome::Denied,
+                    2,
+                )
+                .expect("record");
+            ledger.verify().expect("chain valid before reopen");
+        }
+
+        let reopened = AuditLedger::persisted(&path);
+        reopened.verify().expect("chain valid after reopen");
+        assert_eq!(reopened.len().expect("len"), 2);
+        assert_eq!(reopened.entries().expect("entries")[1].entry_id, "e-1");
     }
 }

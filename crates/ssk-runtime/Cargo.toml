@@ -11,15 +11,23 @@ ssk-scheduler = { path = "../ssk-scheduler" }
 ssk-identity = { path = "../ssk-identity" }
 ssk-locator = { path = "../ssk-locator" }
 ssk-bcik = { path = "../ssk-bcik" }
+ssk-crypto = { path = "../ssk-crypto" }
 ssk-gates = { path = "../ssk-gates" }
 ssk-stitch = { path = "../ssk-stitch" }
 ssk-tensor = { path = "../ssk-tensor" }
 ssk-focus = { path = "../ssk-focus" }
+ssk-privacy = { path = "../ssk-privacy" }
 ssk-audit = { path = "../ssk-audit" }
-ssk-replay = { path = "../ssk-replay" }
 ssk-config = { path = "../ssk-config" }
 thiserror.workspace = true
 serde.workspace = true
+
+[dev-dependencies]
+# Only used by tests/replay_vectors.rs — production code in src/ never
+# depends on ssk-replay. Kept as a dev-dependency (not a regular one) so
+# ssk-replay is free to depend on ssk-runtime itself (Section Q's shared
+# `execute_pipeline` re-execution) without a dependency cycle.
+ssk-replay = { path = "../ssk-replay" }
 
 [lints]
 workspace = true

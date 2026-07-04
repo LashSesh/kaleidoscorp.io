@@ -1,0 +1,35 @@
+[package]
+name = "ssk-ipc"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+ssk-types = { path = "../ssk-types" }
+ssk-netadmin = { path = "../ssk-netadmin" }
+ssk-config = { path = "../ssk-config" }
+serde.workspace = true
+serde_json.workspace = true
+ciborium.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+rand.workspace = true
+tokio = { version = "1", features = [
+    "net",
+    "rt-multi-thread",
+    "sync",
+    "io-util",
+    "time",
+    "macros",
+] }
+
+[target.'cfg(unix)'.dependencies]
+# Only safe, minimal way to read our own uid (for the local peer-credential
+# check in `auth.rs`) without adding `unsafe` or a raw libc dependency.
+rustix = { version = "0.38", default-features = false, features = ["process"] }
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

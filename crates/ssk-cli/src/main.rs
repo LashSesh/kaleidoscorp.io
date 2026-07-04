@@ -2,10 +2,10 @@
 
 use clap::{Parser, Subcommand};
 use serde::Serialize;
-use ssk_faultscan::{run_playbook, FaultKind};
+use ssk_faultscan::{run_playbook, ChaosFaultKind};
 use ssk_gates::GateVector;
 use ssk_interop::{Blake3KeyedVerifier, CompatibilityPolicy, ConformanceSuite};
-use ssk_locator::LocatorPool;
+use ssk_locator::StaticLocatorPool;
 use ssk_netadmin::{
     audit::{AuditLedger, AuditOutcome},
     flow::{FlowDescriptor, FlowRecord, ProtocolKind, RiskLevel},
@@ -16,7 +16,7 @@ use ssk_netadmin::{
 use ssk_replay::{DeterministicReplayEngine, ReplayEngine};
 use ssk_runtime::{sample_intent, DeterminismContext, Runtime, RuntimeEvent, RuntimeMetrics};
 use ssk_tensor::{FileLedgerBackend, LedgerBackend, MemoryBackend};
-use ssk_types::{GateId, GateOutcomeKind, Locator, LocatorId, LocatorType, ReplayVerdict};
+use ssk_types::{GateId, GateOutcomeKind, LocatorId, ReplayVerdict};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -45,6 +45,17 @@ enum Command {
         epoch: u64,
     },
     ReplayVerify {
+        #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+        valid_fixture: bool,
+        #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
+        seeded: bool,
+        #[arg(long, default_value_t = 0)]
+        epoch: u64,
+    },
+    /// Drive the full decision-core pipeline (BCIK crossing → tensor
+    /// materialization → fiber execution → concave focus) to a real
+    /// 3-variant `RunOutcome`.
+    Connect {
         #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
         valid_fixture: bool,
         #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
@@ -82,6 +93,20 @@ enum Command {
         #[command(subcommand)]
         command: NetAdminCommand,
     },
+    /// Daemon-backed commands (talk to `sskd` over `ssk-ipc`).
+    Status,
+    /// Activate a profile via the daemon.
+    Activate {
+        #[arg(long)]
+        profile: String,
+    },
+    /// Deactivate protection via the daemon.
+    Deactivate {
+        #[arg(long, default_value_t = false)]
+        release_kill_switch: bool,
+    },
+    /// List profiles known to the daemon.
+    ListProfiles,
 }
 
 #[derive(Subcommand)]
@@ -206,6 +231,51 @@ impl AppError {
     }
 }
 
+/// Maps `ssk-ipc`'s string-based error class back onto this binary's
+/// `ErrorClass` enum, so daemon-backed commands report through the exact
+/// same machine-readable contract as every local command.
+impl From<ssk_ipc::IpcError> for AppError {
+    fn from(err: ssk_ipc::IpcError) -> Self {
+        let class = match err.class.as_str() {
+            "Usage" => ErrorClass::Usage,
+            "Config" => ErrorClass::Config,
+            "Integrity" => ErrorClass::Integrity,
+            "Replay" => ErrorClass::Replay,
+            "Permission" => ErrorClass::Permission,
+            "Doctor" => ErrorClass::Doctor,
+            "Interop" => ErrorClass::Interop,
+            "Chaos" => ErrorClass::Chaos,
+            "NetAdmin" => ErrorClass::NetAdmin,
+            _ => ErrorClass::Runtime,
+        };
+        AppError::new(class, err.code, err.message, err.next_steps)
+    }
+}
+
+/// Connect to `sskd` over its Unix socket, issue one request, and return its
+/// response. Spins up a lightweight current-thread Tokio runtime for the
+/// single call rather than making the whole `ssk` binary async — `run` /
+/// `replay-verify` / `doctor` / etc. stay fully synchronous and local.
+fn call_daemon(req: ssk_ipc::Request) -> Result<ssk_ipc::Response, AppError> {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| {
+            AppError::new(
+                ErrorClass::Runtime,
+                "IPC_RUNTIME_INIT_FAILED",
+                e.to_string(),
+                vec![],
+            )
+        })?;
+    rt.block_on(async {
+        let mut client = ssk_ipc::client::UnixClient::connect(ssk_ipc::paths::socket_path())
+            .await
+            .map_err(AppError::from)?;
+        client.call(req).await.map_err(AppError::from)
+    })
+}
+
 #[derive(Serialize)]
 struct ErrorOutput<'a> {
     status: &'a str,
@@ -260,6 +330,11 @@ fn run(cli: &Cli) -> Result<(), AppError> {
             seeded,
             epoch,
         } => replay_verify_command(*valid_fixture, *seeded, *epoch, cli),
+        Command::Connect {
+            valid_fixture,
+            seeded,
+            epoch,
+        } => connect_command(*valid_fixture, *seeded, *epoch, cli),
         Command::VerifyLedger { path } => verify_ledger_command(path, cli.json),
         Command::Doctor { ledger_path } => doctor_command(ledger_path.as_deref(), cli),
         Command::Explain { target } => explain_command(target, cli.json),
@@ -267,7 +342,108 @@ fn run(cli: &Cli) -> Result<(), AppError> {
         Command::Interop { command } => interop_command(command, cli.json),
         Command::Chaos { command } => chaos_command(command, cli.json),
         Command::NetAdmin { command } => net_admin_command(command, cli.json),
+        Command::Status => status_command(cli.json),
+        Command::Activate { profile } => activate_command(profile, cli.json),
+        Command::Deactivate {
+            release_kill_switch,
+        } => deactivate_command(*release_kill_switch, cli.json),
+        Command::ListProfiles => list_profiles_command(cli.json),
     }
+}
+
+fn status_command(json: bool) -> Result<(), AppError> {
+    match call_daemon(ssk_ipc::Request::GetStatus)? {
+        ssk_ipc::Response::Status(status) => print_status(&status, json),
+        ssk_ipc::Response::Err(err) => Err(AppError::from(err)),
+        other => Err(unexpected_response(&other)),
+    }
+}
+
+fn activate_command(profile: &str, json: bool) -> Result<(), AppError> {
+    match call_daemon(ssk_ipc::Request::ActivateProfile(
+        ssk_ipc::ActivateProfileRequest {
+            profile_id: profile.to_string(),
+        },
+    ))? {
+        ssk_ipc::Response::Status(status) => print_status(&status, json),
+        ssk_ipc::Response::Err(err) => Err(AppError::from(err)),
+        other => Err(unexpected_response(&other)),
+    }
+}
+
+fn deactivate_command(release_kill_switch: bool, json: bool) -> Result<(), AppError> {
+    match call_daemon(ssk_ipc::Request::Deactivate(ssk_ipc::DeactivateRequest {
+        release_kill_switch,
+    }))? {
+        ssk_ipc::Response::Status(status) => print_status(&status, json),
+        ssk_ipc::Response::Err(err) => Err(AppError::from(err)),
+        other => Err(unexpected_response(&other)),
+    }
+}
+
+fn list_profiles_command(json: bool) -> Result<(), AppError> {
+    match call_daemon(ssk_ipc::Request::ListProfiles)? {
+        ssk_ipc::Response::Profiles(profiles) => {
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "status": "ok",
+                        "profiles": profiles,
+                        "next_steps": []
+                    }))
+                    .map_err(|e| AppError::new(
+                        ErrorClass::Runtime,
+                        "JSON_OUTPUT_FAILED",
+                        e.to_string(),
+                        vec![]
+                    ))?
+                );
+            } else {
+                for p in &profiles {
+                    println!("{} ({})", p.id, p.name);
+                }
+            }
+            Ok(())
+        }
+        ssk_ipc::Response::Err(err) => Err(AppError::from(err)),
+        other => Err(unexpected_response(&other)),
+    }
+}
+
+fn print_status(status: &ssk_ipc::StatusDto, json: bool) -> Result<(), AppError> {
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "status": "ok",
+                "state": status,
+                "next_steps": []
+            }))
+            .map_err(|e| AppError::new(
+                ErrorClass::Runtime,
+                "JSON_OUTPUT_FAILED",
+                e.to_string(),
+                vec![]
+            ))?
+        );
+    } else {
+        println!(
+            "state={:?} active_profile={}",
+            status.state,
+            status.active_profile.as_deref().unwrap_or("<none>")
+        );
+    }
+    Ok(())
+}
+
+fn unexpected_response(resp: &ssk_ipc::Response) -> AppError {
+    AppError::new(
+        ErrorClass::Runtime,
+        "IPC_UNEXPECTED_RESPONSE",
+        format!("unexpected daemon response: {resp:?}"),
+        vec![],
+    )
 }
 
 fn run_once_command(
@@ -331,6 +507,79 @@ fn run_once_command(
     Ok(())
 }
 
+fn connect_command(
+    valid_fixture: bool,
+    seeded: bool,
+    epoch: u64,
+    cli: &Cli,
+) -> Result<(), AppError> {
+    let mut tensor = ssk_tensor::StitchTensor::open(Box::new(ssk_tensor::GenericMemoryBackend::<
+        ssk_types::StitchTensorEntry,
+    >::new()))
+    .map_err(|_| {
+        AppError::new(
+            ErrorClass::Runtime,
+            "TENSOR_OPEN_FAILED",
+            "could not open stitch tensor",
+            vec!["Check storage backend availability.".into()],
+        )
+    })?;
+    let determinism = DeterminismContext { seeded, epoch };
+    let outcome = ssk_runtime::run_to_outcome(
+        &sample_intent(valid_fixture),
+        &default_pool(),
+        &determinism,
+        &GateVector::with_all_default(),
+        &mut tensor,
+        &ssk_runtime::LocalFiberExecutor,
+        ssk_types::EpochId(epoch),
+    )
+    .map_err(|err| {
+        AppError::new(
+            ErrorClass::Runtime,
+            "RUNTIME_CONNECT_FAILED",
+            format!("connect pipeline failed: {err}"),
+            vec!["Run `ssk doctor` and inspect locator/policy checks.".into()],
+        )
+    })?;
+
+    let (kind, stitches, residues) = match &outcome {
+        ssk_runtime::RunOutcome::Pass { stitches, .. } => ("pass", stitches.len(), 0),
+        ssk_runtime::RunOutcome::HoldRefine { residues } => ("hold_refine", 0, residues.len()),
+        ssk_runtime::RunOutcome::DissolveRejectQuarantine { residues, .. } => {
+            ("dissolve_reject_quarantine", 0, residues.len())
+        }
+    };
+
+    if cli.json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "status": "ok",
+                "outcome_kind": kind,
+                "materialized_stitches": stitches,
+                "residues": residues,
+                "tensor_head": tensor.head().to_hex(),
+                "next_steps": [
+                    "A `pass` materialized the stitch into the tensor.",
+                    "A `dissolve_*` outcome is fail-closed: no tensor mutation, residues recorded."
+                ]
+            }))
+            .map_err(|err| AppError::new(
+                ErrorClass::Runtime,
+                "JSON_OUTPUT_FAILED",
+                err.to_string(),
+                vec![]
+            ))?
+        );
+    } else {
+        println!("connect: outcome={kind} materialized={stitches} residues={residues}");
+        println!("tensor head: {}", tensor.head().to_hex());
+    }
+
+    Ok(())
+}
+
 fn replay_verify_command(
     valid_fixture: bool,
     seeded: bool,
@@ -356,19 +605,27 @@ fn replay_verify_command(
                 vec!["Retry run with a valid fixture and strict config.".into()],
             )
         })?;
-    let (expected, _) = runtime
-        .run_once_with_context(sample_intent(valid_fixture), &pool, &determinism)
+
+    // The engine re-executes the pipeline from the original intent and
+    // diffs the result against the manifest itself — it is not handed two
+    // pre-computed outcomes to compare.
+    let engine = DeterministicReplayEngine;
+    let verdict = engine
+        .replay(
+            &manifest,
+            sample_intent(valid_fixture),
+            &pool,
+            &determinism,
+            &runtime.gate_vector,
+        )
         .map_err(|err| {
             AppError::new(
                 ErrorClass::Runtime,
-                "RUNTIME_REPLAY_EXPECTED_FAILED",
+                "RUNTIME_REPLAY_REEXEC_FAILED",
                 err.to_string(),
                 vec!["Inspect run setup and replay inputs.".into()],
             )
         })?;
-
-    let engine = DeterministicReplayEngine;
-    let verdict = engine.replay(&manifest, &actual, &expected);
 
     let mut metrics = load_metrics(&loaded.config.runtime.metrics_path)?;
     let event = runtime.runtime_event(&actual, &manifest, &determinism);
@@ -1000,7 +1257,12 @@ fn interop_command(command: &InteropCommand, json: bool) -> Result<(), AppError>
                 ..CompatibilityPolicy::default()
             };
 
-            let verifier = Blake3KeyedVerifier::new([0u8; 32]);
+            // This is a protocol conformance self-test against golden vectors,
+            // not a peer-trust decision — the fixed reference key is
+            // deliberately used here (see `insecure-test-keys` on ssk-interop
+            // in Cargo.toml). Never use `new_test_key()` to verify an actual
+            // peer's attestation.
+            let verifier = Blake3KeyedVerifier::new_test_key();
             let verifier_ref: Option<&dyn ssk_interop::AttestationVerifier> =
                 if *require_attestation {
                     Some(&verifier)
@@ -1012,11 +1274,7 @@ fn interop_command(command: &InteropCommand, json: bool) -> Result<(), AppError>
 
             // Filter to a specific profile if requested.
             let profiles_to_run: Vec<_> = if let Some(name) = profile {
-                suite
-                    .profiles
-                    .iter()
-                    .filter(|p| p.name == *name)
-                    .collect()
+                suite.profiles.iter().filter(|p| p.name == *name).collect()
             } else {
                 suite.profiles.iter().collect()
             };
@@ -1065,7 +1323,12 @@ fn interop_command(command: &InteropCommand, json: bool) -> Result<(), AppError>
                             "Consult docs/INTEROP_SPEC.md for compatibility requirements."
                         ]
                     }))
-                    .map_err(|e| AppError::new(ErrorClass::Runtime, "JSON_OUTPUT_FAILED", e.to_string(), vec![]))?
+                    .map_err(|e| AppError::new(
+                        ErrorClass::Runtime,
+                        "JSON_OUTPUT_FAILED",
+                        e.to_string(),
+                        vec![]
+                    ))?
                 );
             } else {
                 for r in &results {
@@ -1115,16 +1378,19 @@ fn chaos_command(command: &ChaosCommand, json: bool) -> Result<(), AppError> {
             // Stub runner: mimics the gate heuristic used in faultscan tests.
             let run_intent =
                 |intent: ssk_types::ConnectionIntent| -> (GateOutcomeKind, Vec<ssk_types::BoundaryResidue>) {
-                    if !intent.core.signature_ok
-                        || !intent.capability_witness
+                    if !intent.core.signature.is_present()
+                        || intent.capability.is_none()
                         || intent.ttl_epoch == 0
                     {
-                        let residue = ssk_types::BoundaryResidue {
-                            id: ssk_types::ResidueId::new("chaos-fault"),
-                            kind: ssk_types::ResidueKind::Identity,
-                            source_gate: ssk_types::GateId::Core,
-                            detail: "chaos-injected fault detected".into(),
-                        };
+                        let residue = ssk_types::BoundaryResidue::new(
+                            ssk_types::ResidueId::new("chaos-fault"),
+                            ssk_types::ResidueKind::Identity,
+                            ssk_types::GateId::Core,
+                            "chaos-injected fault detected",
+                            ssk_types::Severity::High,
+                            ssk_types::TraceId::new("chaos-fault-trace"),
+                            true,
+                        );
                         (GateOutcomeKind::Reject, vec![residue])
                     } else {
                         (GateOutcomeKind::Pass, vec![])
@@ -1133,8 +1399,7 @@ fn chaos_command(command: &ChaosCommand, json: bool) -> Result<(), AppError> {
 
             if let Some(fault_str) = fault {
                 let fault_kind = parse_fault_kind(fault_str)?;
-                let report =
-                    ssk_faultscan::run_drill(clean_intent, fault_kind, &run_intent);
+                let report = ssk_faultscan::run_drill(clean_intent, fault_kind, &run_intent);
                 let passed = report.passed();
                 if json {
                     println!(
@@ -1147,7 +1412,12 @@ fn chaos_command(command: &ChaosCommand, json: bool) -> Result<(), AppError> {
                                 "Consult docs/RUNBOOK.md for incident recovery procedures."
                             ]
                         }))
-                        .map_err(|e| AppError::new(ErrorClass::Runtime, "JSON_OUTPUT_FAILED", e.to_string(), vec![]))?
+                        .map_err(|e| AppError::new(
+                            ErrorClass::Runtime,
+                            "JSON_OUTPUT_FAILED",
+                            e.to_string(),
+                            vec![]
+                        ))?
                     );
                 } else {
                     let marker = if passed { "[ok]" } else { "[!!]" };
@@ -1184,7 +1454,12 @@ fn chaos_command(command: &ChaosCommand, json: bool) -> Result<(), AppError> {
                                 "Consult docs/RUNBOOK.md for chaos/recovery guidance."
                             ]
                         }))
-                        .map_err(|e| AppError::new(ErrorClass::Runtime, "JSON_OUTPUT_FAILED", e.to_string(), vec![]))?
+                        .map_err(|e| AppError::new(
+                            ErrorClass::Runtime,
+                            "JSON_OUTPUT_FAILED",
+                            e.to_string(),
+                            vec![]
+                        ))?
                     );
                 } else {
                     for drill in &playbook.drills {
@@ -1195,7 +1470,10 @@ fn chaos_command(command: &ChaosCommand, json: bool) -> Result<(), AppError> {
                         );
                     }
                     if all_passed {
-                        println!("chaos playbook: all drills passed ({}/{})", playbook.passed, playbook.total);
+                        println!(
+                            "chaos playbook: all drills passed ({}/{})",
+                            playbook.passed, playbook.total
+                        );
                     } else {
                         println!("chaos playbook: {} drills FAILED", playbook.failed);
                     }
@@ -1215,14 +1493,14 @@ fn chaos_command(command: &ChaosCommand, json: bool) -> Result<(), AppError> {
     }
 }
 
-fn parse_fault_kind(s: &str) -> Result<FaultKind, AppError> {
+fn parse_fault_kind(s: &str) -> Result<ChaosFaultKind, AppError> {
     match s {
-        "signature-corruption" => Ok(FaultKind::SignatureCorruption),
-        "capability-withdrawal" => Ok(FaultKind::CapabilityWithdrawal),
-        "ttl-expiry" => Ok(FaultKind::TtlExpiry),
-        "replay-drift" => Ok(FaultKind::ReplayDrift),
-        "attestation-failure" => Ok(FaultKind::AttestationFailure),
-        "locator-untrust" => Ok(FaultKind::LocatorUntrust),
+        "signature-corruption" => Ok(ChaosFaultKind::SignatureCorruption),
+        "capability-withdrawal" => Ok(ChaosFaultKind::CapabilityWithdrawal),
+        "ttl-expiry" => Ok(ChaosFaultKind::TtlExpiry),
+        "replay-drift" => Ok(ChaosFaultKind::ReplayDrift),
+        "attestation-failure" => Ok(ChaosFaultKind::AttestationFailure),
+        "locator-untrust" => Ok(ChaosFaultKind::LocatorUntrust),
         _ => Err(AppError::new(
             ErrorClass::Usage,
             "CHAOS_UNKNOWN_FAULT",
@@ -1300,7 +1578,12 @@ fn net_admin_command(command: &NetAdminCommand, json: bool) -> Result<(), AppErr
                                 "If attestation is required, bind a signed token before dispatch."
                             ]
                         }))
-                        .map_err(|e| AppError::new(ErrorClass::Runtime, "JSON_OUTPUT_FAILED", e.to_string(), vec![]))?
+                        .map_err(|e| AppError::new(
+                            ErrorClass::Runtime,
+                            "JSON_OUTPUT_FAILED",
+                            e.to_string(),
+                            vec![]
+                        ))?
                     );
                 } else {
                     println!(
@@ -1324,7 +1607,12 @@ fn net_admin_command(command: &NetAdminCommand, json: bool) -> Result<(), AppErr
                                 "Adjust policy rules if the decision is unexpected."
                             ]
                         }))
-                        .map_err(|e| AppError::new(ErrorClass::Runtime, "JSON_OUTPUT_FAILED", e.to_string(), vec![]))?
+                        .map_err(|e| AppError::new(
+                            ErrorClass::Runtime,
+                            "JSON_OUTPUT_FAILED",
+                            e.to_string(),
+                            vec![]
+                        ))?
                     );
                 } else {
                     println!(
@@ -1373,10 +1661,20 @@ fn net_admin_command(command: &NetAdminCommand, json: bool) -> Result<(), AppErr
 
             for (i, flow) in flows.iter().enumerate() {
                 let decision = engine.evaluate(flow).map_err(|e| {
-                    AppError::new(ErrorClass::NetAdmin, "NETADMIN_AUDIT_DEMO_FAILED", e.to_string(), vec![])
+                    AppError::new(
+                        ErrorClass::NetAdmin,
+                        "NETADMIN_AUDIT_DEMO_FAILED",
+                        e.to_string(),
+                        vec![],
+                    )
                 })?;
                 let candidate = orc.plan(flow, &decision).map_err(|e| {
-                    AppError::new(ErrorClass::NetAdmin, "NETADMIN_AUDIT_DEMO_FAILED", e.to_string(), vec![])
+                    AppError::new(
+                        ErrorClass::NetAdmin,
+                        "NETADMIN_AUDIT_DEMO_FAILED",
+                        e.to_string(),
+                        vec![],
+                    )
                 })?;
 
                 let outcome = if candidate.is_denied() {
@@ -1431,12 +1729,21 @@ fn net_admin_command(command: &NetAdminCommand, json: bool) -> Result<(), AppErr
                 )
             })?;
 
+            let entries = audit.entries().map_err(|e| {
+                AppError::new(
+                    ErrorClass::NetAdmin,
+                    "NETADMIN_AUDIT_READ_FAILED",
+                    e.to_string(),
+                    vec![],
+                )
+            })?;
+
             if json {
                 println!(
                     "{}",
                     serde_json::to_string_pretty(&serde_json::json!({
                         "status": "ok",
-                        "entries": audit.entries().iter().map(|e| serde_json::json!({
+                        "entries": entries.iter().map(|e| serde_json::json!({
                             "entry_id": e.entry_id,
                             "flow_id": e.flow_id,
                             "outcome": e.outcome,
@@ -1446,11 +1753,16 @@ fn net_admin_command(command: &NetAdminCommand, json: bool) -> Result<(), AppErr
                         })).collect::<Vec<_>>(),
                         "next_steps": ["Preserve audit ledger for incident forensics."]
                     }))
-                    .map_err(|e| AppError::new(ErrorClass::Runtime, "JSON_OUTPUT_FAILED", e.to_string(), vec![]))?
+                    .map_err(|e| AppError::new(
+                        ErrorClass::Runtime,
+                        "JSON_OUTPUT_FAILED",
+                        e.to_string(),
+                        vec![]
+                    ))?
                 );
             } else {
-                println!("audit-ledger verified ({} entries):", audit.len());
-                for e in audit.entries() {
+                println!("audit-ledger verified ({} entries):", entries.len());
+                for e in &entries {
                     println!(
                         "  {} flow={} outcome={:?} route={}",
                         e.entry_id, e.flow_id, e.outcome, e.route_kind_summary
@@ -1536,10 +1848,20 @@ fn default_route_orchestrator() -> RouteOrchestrator {
     }])
 }
 
-fn default_pool() -> LocatorPool {
-    LocatorPool::new(vec![Locator {
+fn default_pool() -> StaticLocatorPool {
+    StaticLocatorPool::new(vec![ssk_types::LocatorFacet {
         id: LocatorId::new("local"),
-        locator_type: LocatorType::LocalOverlay,
+        kind: ssk_types::LocatorKind::LocalOverlay,
+        endpoint: ssk_types::EndpointRef::new("local-endpoint"),
+        route: ssk_types::RouteClass::Direct,
+        transport: ssk_types::TransportClass::Tcp,
+        epoch: ssk_types::EpochId(0),
+        ttl: ssk_types::Ttl(100),
+        trust: ssk_types::TrustClass::Owned,
+        cost: ssk_types::CostClass::Free,
+        risk: ssk_types::RiskClass::Low,
+        health: ssk_types::HealthStatus::Live,
+        trace: ssk_types::TraceId::new("trace-local"),
         trusted: true,
         risk_score: 10,
     }])

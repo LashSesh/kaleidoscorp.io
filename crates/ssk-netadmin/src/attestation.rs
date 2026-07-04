@@ -2,9 +2,12 @@
 
 //! Identity & Attestation Binder — signed peer/capability binding before flow release.
 //!
-//! Uses Blake3 keyed-hash (HMAC-equivalent) for the reference implementation.
-//! Production deployments should replace `Blake3AttestationBinder` with an
-//! implementation backed by Ed25519 or a HSM via the `ssk-crypto` traits.
+//! `AttestationBinder` uses Blake3 keyed-hash (HMAC-equivalent) as its
+//! reference scheme — a symmetric MAC, not an asymmetric signature. Its
+//! zero-key constructor is rejected unconditionally in every build (see
+//! [`AttestationBinder::new`]); an ed25519-backed alternative is available via
+//! `ssk_crypto::Ed25519KeyPair`/`Ed25519Verifier` (the `crypto` feature of
+//! `ssk-crypto`) for deployments that need real asymmetric signatures.
 
 use serde::{Deserialize, Serialize};
 
@@ -58,9 +61,25 @@ pub struct AttestationBinder {
 }
 
 impl AttestationBinder {
+    /// Build a binder from a real secret key. Rejects an all-zero key
+    /// unconditionally, in every build configuration — no shipped binary
+    /// enables an exception for this type (contrast with
+    /// `ssk_interop::Blake3KeyedVerifier`, which `ssk-cli` deliberately opts
+    /// into `insecure-test-keys` for its protocol conformance self-test).
+    pub fn new(key: [u8; 32]) -> Result<Self, NetAdminError> {
+        if key == [0u8; 32] {
+            return Err(NetAdminError::InsecureKey);
+        }
+        Ok(Self { key })
+    }
+
+    /// The fixed, well-known all-zero reference key used only by this
+    /// crate's own tests. Gated so it cannot be reached from an ordinary
+    /// release build.
+    #[cfg(any(test, feature = "insecure-test-keys"))]
     #[must_use]
-    pub const fn new(key: [u8; 32]) -> Self {
-        Self { key }
+    pub const fn new_test_key() -> Self {
+        Self { key: [0u8; 32] }
     }
 
     /// Sign a raw attestation token, returning the hex-encoded MAC.
@@ -71,8 +90,8 @@ impl AttestationBinder {
             token_epoch: raw.token_epoch,
             nonce: raw.nonce,
         };
-        let bytes = serde_json::to_vec(&body)
-            .map_err(|e| NetAdminError::Serialization(e.to_string()))?;
+        let bytes =
+            serde_json::to_vec(&body).map_err(|e| NetAdminError::Serialization(e.to_string()))?;
         let mac = blake3::keyed_hash(&self.key, &bytes);
         Ok(hex::encode(mac.as_bytes()))
     }
@@ -90,8 +109,8 @@ impl AttestationBinder {
             token_epoch: raw.token_epoch,
             nonce: raw.nonce,
         };
-        let bytes = serde_json::to_vec(&body)
-            .map_err(|e| NetAdminError::Serialization(e.to_string()))?;
+        let bytes =
+            serde_json::to_vec(&body).map_err(|e| NetAdminError::Serialization(e.to_string()))?;
         let expected_mac = blake3::keyed_hash(&self.key, &bytes);
         let expected_hex = hex::encode(expected_mac.as_bytes());
 
@@ -122,7 +141,13 @@ mod tests {
         FlowRecord::new(
             "flow-attest-1",
             10,
-            FlowDescriptor::new("app", "secure.example.com", 443, ProtocolKind::Tls, RiskLevel::High),
+            FlowDescriptor::new(
+                "app",
+                "secure.example.com",
+                443,
+                ProtocolKind::Tls,
+                RiskLevel::High,
+            ),
         )
     }
 
@@ -140,7 +165,7 @@ mod tests {
 
     #[test]
     fn valid_attestation_produces_binding() {
-        let binder = AttestationBinder::new([0u8; 32]);
+        let binder = AttestationBinder::new_test_key();
         let flow = sample_flow();
         let raw = sample_raw(&binder);
         let binding = binder.bind(&flow, &raw, 10).expect("bind must succeed");
@@ -151,7 +176,7 @@ mod tests {
 
     #[test]
     fn tampered_signature_rejected() {
-        let binder = AttestationBinder::new([0u8; 32]);
+        let binder = AttestationBinder::new_test_key();
         let flow = sample_flow();
         let mut raw = sample_raw(&binder);
         raw.signature_hex = "deadbeef00000000".into();
@@ -163,13 +188,26 @@ mod tests {
 
     #[test]
     fn different_key_rejected() {
-        let signer = AttestationBinder::new([0u8; 32]);
-        let verifier = AttestationBinder::new([1u8; 32]);
+        let signer = AttestationBinder::new_test_key();
+        let verifier = AttestationBinder::new([1u8; 32]).expect("non-zero key must be accepted");
         let flow = sample_flow();
         let raw = sample_raw(&signer);
         let err = verifier
             .bind(&flow, &raw, 10)
             .expect_err("wrong key must fail");
         assert!(matches!(err, NetAdminError::AttestationInvalid(_, _)));
+    }
+
+    #[test]
+    fn new_rejects_zero_key() {
+        assert!(matches!(
+            AttestationBinder::new([0u8; 32]),
+            Err(NetAdminError::InsecureKey)
+        ));
+    }
+
+    #[test]
+    fn new_accepts_a_real_key() {
+        assert!(AttestationBinder::new([9u8; 32]).is_ok());
     }
 }

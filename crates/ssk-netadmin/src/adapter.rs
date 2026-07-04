@@ -82,11 +82,7 @@ pub struct Socks5Adapter {
 }
 
 impl Socks5Adapter {
-    pub fn new(
-        id: impl Into<String>,
-        proxy_host: impl Into<String>,
-        proxy_port: u16,
-    ) -> Self {
+    pub fn new(id: impl Into<String>, proxy_host: impl Into<String>, proxy_port: u16) -> Self {
         Self {
             id: id.into(),
             proxy_host: proxy_host.into(),
@@ -133,11 +129,7 @@ pub struct HttpConnectAdapter {
 }
 
 impl HttpConnectAdapter {
-    pub fn new(
-        id: impl Into<String>,
-        proxy_host: impl Into<String>,
-        proxy_port: u16,
-    ) -> Self {
+    pub fn new(id: impl Into<String>, proxy_host: impl Into<String>, proxy_port: u16) -> Self {
         Self {
             id: id.into(),
             proxy_host: proxy_host.into(),
@@ -283,8 +275,7 @@ mod tests {
 
     #[test]
     fn socks5_adapter_descriptor() {
-        let a = Socks5Adapter::new("socks5-exit", "proxy.example.com", 1080)
-            .with_auth("user:pass");
+        let a = Socks5Adapter::new("socks5-exit", "proxy.example.com", 1080).with_auth("user:pass");
         let d = a.describe();
         assert_eq!(d.kind, AdapterKind::Socks5);
         assert_eq!(d.port, 1080);
@@ -296,7 +287,10 @@ mod tests {
         let a = HttpConnectAdapter::new("http-proxy", "proxy.corp.com", 3128);
         let d = a.describe();
         assert_eq!(d.kind, AdapterKind::HttpConnect);
-        assert!(d.metadata.iter().any(|(k, v)| k == "method" && v == "CONNECT"));
+        assert!(d
+            .metadata
+            .iter()
+            .any(|(k, v)| k == "method" && v == "CONNECT"));
     }
 
     #[test]

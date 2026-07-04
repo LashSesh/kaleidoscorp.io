@@ -7,6 +7,7 @@ license.workspace = true
 [dependencies]
 ssk-types = { path = "../ssk-types" }
 ssk-locator = { path = "../ssk-locator" }
+ssk-crypto = { path = "../ssk-crypto" }
 
 [lints]
 workspace = true

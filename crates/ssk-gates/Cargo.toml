@@ -7,6 +7,9 @@ license.workspace = true
 [dependencies]
 ssk-types = { path = "../ssk-types" }
 ssk-bcik = { path = "../ssk-bcik" }
+ssk-core = { path = "../ssk-core" }
+ssk-crypto = { path = "../ssk-crypto" }
+ssk-focus = { path = "../ssk-focus" }
 ssk-privacy = { path = "../ssk-privacy" }
 serde.workspace = true
 

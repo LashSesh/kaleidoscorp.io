@@ -127,7 +127,13 @@ fn full_pipeline_allow_internal() {
     assert_eq!(candidate.route, RouteKind::Direct);
 
     let sd = session
-        .record("sd-1", &flow.flow_id, decision.clone(), candidate.clone(), None)
+        .record(
+            "sd-1",
+            &flow.flow_id,
+            decision.clone(),
+            candidate.clone(),
+            None,
+        )
         .expect("session record");
     assert_eq!(sd.flow_id, "f-internal-001");
 
@@ -171,7 +177,13 @@ fn full_pipeline_redirect_via_socks5() {
     assert!(matches!(candidate.route, RouteKind::SingleHop(_)));
 
     let sd = session
-        .record("sd-2", &flow.flow_id, decision.clone(), candidate.clone(), None)
+        .record(
+            "sd-2",
+            &flow.flow_id,
+            decision.clone(),
+            candidate.clone(),
+            None,
+        )
         .expect("session record");
 
     audit
@@ -194,7 +206,7 @@ fn full_pipeline_redirect_via_socks5() {
 fn full_pipeline_attestation_required_and_verified() {
     let engine = build_engine();
     let orc = build_orchestrator();
-    let binder = AttestationBinder::new([0u8; 32]);
+    let binder = AttestationBinder::new_test_key();
     let mut session = SessionLedger::new();
     let mut audit = AuditLedger::new();
 
@@ -212,7 +224,10 @@ fn full_pipeline_attestation_required_and_verified() {
 
     let decision = engine.evaluate(&flow).expect("policy eval");
     let candidate = orc.plan(&flow, &decision).expect("route plan");
-    assert!(candidate.requires_attestation, "TLS flow must require attestation");
+    assert!(
+        candidate.requires_attestation,
+        "TLS flow must require attestation"
+    );
 
     // Build and sign a valid attestation.
     let mut raw = RawAttestation {
@@ -261,7 +276,13 @@ fn full_pipeline_fail_closed_no_match() {
     let flow = FlowRecord::new(
         "f-unknown-001",
         4,
-        FlowDescriptor::new("unknown-app", "unknown.host", 9999, ProtocolKind::Tcp, RiskLevel::High),
+        FlowDescriptor::new(
+            "unknown-app",
+            "unknown.host",
+            9999,
+            ProtocolKind::Tcp,
+            RiskLevel::High,
+        ),
     );
 
     let decision = engine.evaluate(&flow).expect("policy eval");
@@ -321,5 +342,7 @@ fn audit_chain_integrity_multi_entry() {
             )
             .expect("record");
     }
-    ledger.verify().expect("chain must be intact after 10 entries");
+    ledger
+        .verify()
+        .expect("chain must be intact after 10 entries");
 }

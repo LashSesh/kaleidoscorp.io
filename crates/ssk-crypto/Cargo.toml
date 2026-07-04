@@ -6,14 +6,24 @@ license.workspace = true
 
 [features]
 default = []
-crypto = ["dep:ed25519-dalek", "dep:x25519-dalek", "dep:chacha20poly1305"]
+crypto = ["dep:ed25519-dalek", "dep:x25519-dalek", "dep:chacha20poly1305", "dep:rand"]
 
 [dependencies]
 ssk-types = { path = "../ssk-types" }
+serde.workspace = true
 thiserror.workspace = true
-ed25519-dalek = { version = "2", optional = true }
-x25519-dalek = { version = "2", optional = true }
+blake3.workspace = true
+zeroize = { version = "1", features = ["derive"] }
+ed25519-dalek = { version = "2", optional = true, features = ["zeroize"] }
+x25519-dalek = { version = "2", optional = true, features = ["static_secrets"] }
 chacha20poly1305 = { version = "0.10", optional = true }
+rand = { workspace = true, optional = true }
+
+[dev-dependencies]
+# Self-dependency: unifies the `crypto` feature on for `cargo test -p ssk-crypto`
+# (and hence `cargo test --workspace`) without turning it on by default for
+# real consumers such as ssk-netadmin.
+ssk-crypto = { path = ".", features = ["crypto"] }
 
 [lints]
 workspace = true
