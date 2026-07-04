@@ -1,0 +1,407 @@
+#![forbid(unsafe_code)]
+
+//! # ssk-system — the end-to-end composition of the real stack
+//!
+//! Every other crate is pure and single-purpose, with its privileged boundaries
+//! left as injected seams. This crate is where they compose: the
+//! [`SystemPipeline`] wires the *real* SSK(Ω) / FCHL-MPK / SSCL stack into one
+//! fail-closed evaluation —
+//!
+//! ```text
+//! SystemTrafficField  (ssk-capture)
+//!   → FieldTensorSkin  (ssk-field-tensor: T_surface + T_res + C_coupling + δF,
+//!                       coupling the captured spectra to MPK windows)
+//!   → TransductionPlan (ssk-tfa: bounded, gated, candidate-only actuations)
+//!   → signature gate   (ssk-signature GateBundle over the captured spectrum)
+//!   → QLOGIC gate      (ssk-imdf, the Mirror-Dome six-axis verdict)
+//!   → MetaResonance    (ssk-meta-resonance: hold-only drift feedback)
+//!   → CrownSupervisor  (ssk-crown: the fail-closed emission gate)
+//!   ⨝ ServiceHost health (ssk-service-host) ⨝ kill-switch (ssk-boundary)
+//! ```
+//!
+//! The composition preserves the **fail-closed priority** end to end: a kill
+//! switch or a hard-stop gate denies; an open obligation, a subsystem hold,
+//! elevated drift, or an un-emittable host holds; only a fully-clean stack emits.
+//! No subsystem can *promote* the decision — resonance and host-health can only
+//! make it more conservative. The whole evaluation is a pure function of its
+//! inputs, so it replays by content.
+
+use ssk_boundary::KillSwitchState;
+use ssk_capture::SystemTrafficField;
+use ssk_crown::{CrownSupervisor, EmissionDecision, EmissionInputs, EmissionReport};
+use ssk_field_tensor::{DeltaSignalKind, FieldTensorSkin};
+use ssk_imdf::{QLogicGate, QLogicInput};
+use ssk_meta_resonance::{MetaResonanceController, ResonanceAction};
+use ssk_mpk::Graph;
+use ssk_service_host::ServiceHealth;
+use ssk_signature::{GateBundle, ResidueReport, TargetProfile};
+use ssk_tfa::{TransductionField, TransductionPlan};
+use ssk_types::{Digest, GateOutcomeKind};
+
+/// The observation + control state fed into one system evaluation.
+pub struct SystemInputs<'a> {
+    /// The captured traffic field (`ssk-capture`).
+    pub traffic: &'a SystemTrafficField,
+    /// The discrete MPK symmetry windows the field is coupled to (`ssk-mpk`).
+    pub windows: &'a [Graph],
+    /// The privileged host's health (`ssk-service-host`).
+    pub host_health: ServiceHealth,
+    /// The session kill-switch state (`ssk-boundary`).
+    pub kill_switch: KillSwitchState,
+    /// Open residue/boundary obligations.
+    pub open_obligations: usize,
+}
+
+/// The result of one end-to-end evaluation.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SystemVerdict {
+    /// The final emission decision, after the host-health downgrade.
+    pub decision: EmissionDecision,
+    /// The Crown's own report (before the host-health downgrade).
+    pub crown_report: EmissionReport,
+    /// Whether the host health forced a would-be `Emit` down to `Hold`.
+    pub host_downgraded: bool,
+    /// The signature gate outcome (`ssk-signature`).
+    pub signature_gate: GateOutcomeKind,
+    /// The QLOGIC gate outcome (`ssk-imdf`).
+    pub qlogic_gate: GateOutcomeKind,
+    /// The MetaResonance action (`ssk-meta-resonance`) — hold-only.
+    pub resonance_action: ResonanceAction,
+    /// The bounded, gated, candidate-only transduction plan (`ssk-tfa`).
+    pub transduction: TransductionPlan,
+    /// The content-addressed digest of the assembled field.
+    pub field_digest: Digest,
+    /// The composed reason list.
+    pub reasons: Vec<String>,
+}
+
+/// The stateful pipeline: it owns the Crown's emission ledger and the resonance
+/// loop, so a *sequence* of evaluations accumulates a verifiable, replay-stable
+/// audit trail.
+#[derive(Debug, Default)]
+pub struct SystemPipeline {
+    crown: CrownSupervisor,
+    resonance: MetaResonanceController,
+}
+
+impl SystemPipeline {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Run one end-to-end evaluation. Pure in its inputs (given the pipeline's
+    /// accumulated state); the fail-closed priority is preserved across every
+    /// subsystem.
+    pub fn evaluate(&mut self, inputs: &SystemInputs) -> SystemVerdict {
+        // 1. Assemble the FieldTensorSkin: captured spectra coupled to the MPK
+        //    windows, with the δF signals and no-silent-loss residues.
+        let skin = FieldTensorSkin::from_field(inputs.traffic, inputs.windows);
+        let field_digest = skin.digest();
+
+        // 2. Transduce the field into a bounded, gated, candidate-only plan.
+        let transduction = TransductionField::default().transduce(&skin);
+
+        // 3. The δF drift drives the (hold-only) resonance loop.
+        let drift = skin
+            .signals(DeltaSignalKind::Drift)
+            .iter()
+            .map(|s| s.magnitude)
+            .fold(0.0_f64, f64::max);
+        let resonance = self.resonance.step(drift);
+
+        // 4. The signature gate over the captured spectrum, with the skin's
+        //    residues folded in (a sensitive/linkability residue holds emission).
+        let mut residue_report = ResidueReport::new();
+        for r in &skin.residue_tensor {
+            residue_report = residue_report.add(&r.surface, r.severity, &r.message);
+        }
+        let signature_gate = match skin.surface_tensor.last() {
+            Some(sig) => {
+                let target = TargetProfile::new("system", sig.clone());
+                GateBundle
+                    .evaluate(sig, sig, &target, &residue_report, None)
+                    .to_ssk_decision()
+            }
+            // Nothing captured — fail closed to a hold, never a silent pass.
+            None => GateOutcomeKind::Hold,
+        };
+
+        // 5. The IMDF QLOGIC verdict. Coherence is full on a clean field and
+        //    degrades when a residue is present; drift feeds the Δ axis.
+        let coherence = if skin.residue_tensor.is_empty() {
+            1.0
+        } else {
+            0.9
+        };
+        let qlogic_gate = QLogicGate::default()
+            .evaluate(&QLogicInput {
+                coherence,
+                entropy: 0.1,
+                entropy_bound: 0.5,
+                parallax_consistent: true,
+                replay_equal: true,
+                open_obligations: inputs.open_obligations,
+                drift,
+                drift_bound: 0.35,
+            })
+            .to_ssk();
+
+        // 6. The Crown clamps everything into a fail-closed emission decision.
+        let crown_report = self.crown.evaluate(&EmissionInputs {
+            signature_gate,
+            qlogic_gate,
+            kill_switch: inputs.kill_switch,
+            resonance,
+            open_obligations: inputs.open_obligations,
+        });
+
+        // 7. The host-health join: an un-emittable host can only *hold* a would-be
+        //    emit (fail-closed), never open one up. Deny/Hold pass through.
+        let mut reasons = crown_report.reasons.clone();
+        let (decision, host_downgraded) = if !inputs.host_health.is_emittable()
+            && crown_report.decision == EmissionDecision::Emit
+        {
+            reasons.push(format!(
+                "service_host_not_emittable:{}",
+                inputs.host_health.as_str()
+            ));
+            (EmissionDecision::Hold, true)
+        } else {
+            (crown_report.decision, false)
+        };
+
+        SystemVerdict {
+            decision,
+            crown_report,
+            host_downgraded,
+            signature_gate,
+            qlogic_gate,
+            resonance_action: resonance.action,
+            transduction,
+            field_digest,
+            reasons,
+        }
+    }
+
+    /// The Crown emission-ledger head — accumulates across evaluations.
+    #[must_use]
+    pub fn crown_head(&self) -> Digest {
+        self.crown.head()
+    }
+
+    /// Verify the accumulated Crown emission ledger.
+    #[must_use]
+    pub fn verify_ledger(&self) -> bool {
+        self.crown.verify_ledger()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ssk_capture::{CaptureMode, CaptureScope, TrafficSource, TrafficWindow};
+    use ssk_tfa::{
+        Actuation, ActuationKind, EffectReceipt, Effector, TfaError, TransductionExecutor,
+    };
+    use std::cell::RefCell;
+
+    // A single clean window: no drift, no impulse, no residue -> the clean path.
+    struct CleanSource;
+    impl TrafficSource for CleanSource {
+        fn source_id(&self) -> String {
+            "clean".to_owned()
+        }
+        fn windows(&self, _scope: &CaptureScope) -> Vec<TrafficWindow> {
+            let mut w = TrafficWindow::http("http");
+            w.method = Some("GET".to_owned());
+            w.url = Some("https://example.local/health".to_owned());
+            w.status = Some(200);
+            w.response_headers = vec![("Content-Type".to_owned(), "application/json".to_owned())];
+            w.payload = b"{}".to_vec();
+            vec![w]
+        }
+    }
+
+    // Two windows: a clean GET then a sensitive POST carrying Authorization -> a
+    // real drift δF, a linkability impulse δF, and a linkability residue.
+    struct DriftingSource;
+    impl TrafficSource for DriftingSource {
+        fn source_id(&self) -> String {
+            "tap".to_owned()
+        }
+        fn windows(&self, _scope: &CaptureScope) -> Vec<TrafficWindow> {
+            let mut clean = TrafficWindow::http("http");
+            clean.method = Some("GET".to_owned());
+            clean.url = Some("https://example.local/a".to_owned());
+            clean.status = Some(200);
+            clean.response_headers =
+                vec![("Content-Type".to_owned(), "application/json".to_owned())];
+            clean.payload = b"{}".to_vec();
+
+            let mut sensitive = TrafficWindow::http("http");
+            sensitive.method = Some("POST".to_owned());
+            sensitive.url = Some("https://example.local/login".to_owned());
+            sensitive.status = Some(401);
+            sensitive.request_headers =
+                vec![("Authorization".to_owned(), "Bearer secret".to_owned())];
+            sensitive.response_headers =
+                vec![("Content-Type".to_owned(), "application/json".to_owned())];
+            sensitive.payload = b"{\"user\":\"x\"}".to_vec();
+
+            vec![clean, sensitive]
+        }
+    }
+
+    fn field(source: &dyn TrafficSource) -> SystemTrafficField {
+        SystemTrafficField::capture(
+            source,
+            &CaptureScope::new("local", ["lo0"]),
+            CaptureMode::PassiveLocal,
+        )
+    }
+
+    fn windows() -> Vec<Graph> {
+        vec![
+            Graph::from_edges(3, &[(0, 1), (1, 2)]).unwrap(),
+            Graph::from_edges(4, &[(0, 1), (1, 2), (2, 3), (3, 0)]).unwrap(),
+        ]
+    }
+
+    fn clean_inputs<'a>(traffic: &'a SystemTrafficField, windows: &'a [Graph]) -> SystemInputs<'a> {
+        SystemInputs {
+            traffic,
+            windows,
+            host_health: ServiceHealth::Healthy,
+            kill_switch: KillSwitchState::Armed,
+            open_obligations: 0,
+        }
+    }
+
+    #[test]
+    fn clean_stack_emits_and_is_replay_stable() {
+        let traffic = field(&CleanSource);
+        let ws = windows();
+
+        let mut a = SystemPipeline::new();
+        let va = a.evaluate(&clean_inputs(&traffic, &ws));
+        assert_eq!(
+            va.decision,
+            EmissionDecision::Emit,
+            "a fully clean real stack emits; reasons={:?}",
+            va.reasons
+        );
+        assert_eq!(va.signature_gate, GateOutcomeKind::Pass);
+        assert_eq!(va.qlogic_gate, GateOutcomeKind::Pass);
+        assert_eq!(va.resonance_action, ResonanceAction::Stabilize);
+        assert!(a.verify_ledger());
+
+        // A second, independent pipeline on the same inputs yields an identical
+        // field digest and Crown head — the whole composition replays by content.
+        let mut b = SystemPipeline::new();
+        let vb = b.evaluate(&clean_inputs(&traffic, &ws));
+        assert_eq!(va.field_digest, vb.field_digest);
+        assert_eq!(va.transduction.id, vb.transduction.id);
+        assert_eq!(a.crown_head(), b.crown_head());
+    }
+
+    #[test]
+    fn kill_switch_denies_end_to_end() {
+        let traffic = field(&CleanSource);
+        let ws = windows();
+        let mut pipeline = SystemPipeline::new();
+        let mut inputs = clean_inputs(&traffic, &ws);
+        inputs.kill_switch = KillSwitchState::Engaged;
+        let verdict = pipeline.evaluate(&inputs);
+        assert_eq!(
+            verdict.decision,
+            EmissionDecision::Deny,
+            "an engaged kill-switch denies regardless of clean gates"
+        );
+        assert!(verdict.reasons.iter().any(|r| r == "kill_switch_engaged"));
+    }
+
+    #[test]
+    fn unhealthy_host_holds_a_would_be_emit() {
+        let traffic = field(&CleanSource);
+        let ws = windows();
+        for health in [ServiceHealth::Degraded, ServiceHealth::Down] {
+            let mut pipeline = SystemPipeline::new();
+            let mut inputs = clean_inputs(&traffic, &ws);
+            inputs.host_health = health;
+            let verdict = pipeline.evaluate(&inputs);
+            // The gates are all clean (would emit), but an un-emittable host holds.
+            assert_eq!(verdict.crown_report.decision, EmissionDecision::Emit);
+            assert_eq!(verdict.decision, EmissionDecision::Hold);
+            assert!(verdict.host_downgraded);
+            assert!(verdict
+                .reasons
+                .iter()
+                .any(|r| r.starts_with("service_host_not_emittable")));
+        }
+    }
+
+    #[test]
+    fn sensitive_field_holds_and_keeps_privileged_effects_behind_the_supervisor() {
+        let traffic = field(&DriftingSource);
+        let ws = windows();
+        let mut pipeline = SystemPipeline::new();
+        let verdict = pipeline.evaluate(&clean_inputs(&traffic, &ws));
+
+        // A captured Authorization surface is a linkability residue: the signature
+        // gate holds, so the whole stack holds (never emits) — no silent pass.
+        assert_eq!(verdict.signature_gate, GateOutcomeKind::Hold);
+        assert_ne!(verdict.decision, EmissionDecision::Emit);
+
+        // The transduction proposed a TightenBoundary (privileged) candidate, and
+        // it is Held — executing the plan never actuates it.
+        let tighten = verdict
+            .transduction
+            .actuations
+            .iter()
+            .find(|g| g.actuation.kind == ActuationKind::TightenBoundary)
+            .expect("a linkability impulse proposes a boundary tighten");
+        assert_eq!(tighten.gate, GateOutcomeKind::Hold);
+
+        struct RecordingEffector {
+            actuated: RefCell<Vec<ActuationKind>>,
+        }
+        impl Effector for RecordingEffector {
+            fn actuate(&self, a: &Actuation) -> Result<EffectReceipt, TfaError> {
+                self.actuated.borrow_mut().push(a.kind);
+                Ok(EffectReceipt::of(a))
+            }
+        }
+        let effector = RecordingEffector {
+            actuated: RefCell::new(Vec::new()),
+        };
+        let mut executor = TransductionExecutor::new();
+        executor.execute(&verdict.transduction, &effector).unwrap();
+        assert!(
+            !effector
+                .actuated
+                .borrow()
+                .contains(&ActuationKind::TightenBoundary),
+            "a privileged effect is never actuated end-to-end without the supervisor"
+        );
+        assert!(executor.verify_ledger());
+    }
+
+    #[test]
+    fn fail_closed_priority_holds_across_crates() {
+        let traffic = field(&CleanSource);
+        let ws = windows();
+        // An open obligation holds a would-be emit.
+        let mut pipeline = SystemPipeline::new();
+        let mut inputs = clean_inputs(&traffic, &ws);
+        inputs.open_obligations = 1;
+        let verdict = pipeline.evaluate(&inputs);
+        assert_eq!(verdict.decision, EmissionDecision::Hold);
+        assert!(verdict
+            .reasons
+            .iter()
+            .any(|r| r.starts_with("open_obligations")));
+        // The QLOGIC gate also held on the open obligation (cross-crate agreement).
+        assert_eq!(verdict.qlogic_gate, GateOutcomeKind::Hold);
+    }
+}

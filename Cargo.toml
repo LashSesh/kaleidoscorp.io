@@ -37,6 +37,7 @@ members = [
   "crates/ssk-tfa",
   "crates/ssk-service-host",
   "crates/ssk-delivery",
+  "crates/ssk-system",
   "crates/ssk-cli",
   "crates/ssk-ipc",
   "crates/ssk-daemon",
