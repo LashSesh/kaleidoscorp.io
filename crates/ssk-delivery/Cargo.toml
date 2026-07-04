@@ -1,0 +1,19 @@
+[package]
+name = "ssk-delivery"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# SSCL Crown: the DeliveryEnvelope — a content-addressed installable / upgradable
+# / removable unit, and the candidate-only, gated, reversible migration planner
+# that moves a Deployment between envelope states. A plan never mutates the live
+# deployment; it proposes an ordered migration with its exact inverse rollback and
+# a multi-dimensional gate. Reuses the Omega Digest / GateOutcomeKind primitives.
+
+[dependencies]
+ssk-types = { path = "../ssk-types", version = "0.1.0" }
+serde = { workspace = true }
+thiserror = { workspace = true }
+
+[lints]
+workspace = true
