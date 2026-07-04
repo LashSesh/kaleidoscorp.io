@@ -120,9 +120,16 @@ real 9-axis `Hypercube` plus the Gabriel Constraint Cells) both landed, tested, 
 **Update — Phase 4 partial:** the persistent Stitch Tensor itself (Section M — real
 `StitchTensor`/`apply_sorted`/`StorageBackend`/`StitchGraph`) is now real and tested in
 `ssk-tensor`; wiring it into `ssk-runtime`'s live pipeline and into
-`Connection<GatePassed>::materialize` is deferred to Phase 5, alongside the `RunOutcome`
-redesign that will also carry the real `BcikStitch` forward instead of discarding it. This
-document designs the closing architecture for SSKΩ-5 through SSKΩ-9 (remaining).
+`Connection<GatePassed>::materialize` remains deferred (see below). **Update — Phase 5 mostly
+complete:** SSKΩ-6's `FocusEngine`/`FocusReport` (Section N) and a genuinely re-executing
+`ReplayEngine` (Section Q, via a new shared `ssk_runtime::execute_pipeline`) both landed, tested,
+and verified — `LinkabilityEstimator`/`AdversaryModel`/`LinkabilityReport` (Section O) landed
+alongside as N's own dependency. `RunOutcome` (Section R) exists as a real, tested type but is
+deliberately **not wired** into any live call site: a genuine `Pass` variant needs real
+`Response` evidence from a `FiberExecution`/`ResponseCapture` pipeline stage, and neither stage
+exists anywhere in this workspace — fabricating that evidence to force the wiring would trade
+honesty for a checkbox, so this document declines to. This document designs the closing
+architecture for SSKΩ-7 through SSKΩ-9 (remaining), plus Section R's unfinished wiring.
 
 ---
 
@@ -158,12 +165,12 @@ earlier pass without recheck).
 | `CapabilityWitness` struct | **[1] Phase 2 done** | `crates/ssk-types/src/lib.rs` — real struct with all ch. 5.2 fields; `StitchCandidate`/`ConnectionIntent.capability_witness: bool` replaced by `capability: Option<CapabilityWitness>` | Ch. 5.2 |
 | `CapabilityWitnessProvider`/`KeyAgreementProvider` impls | **[1] Phase 2 done** | `crates/ssk-crypto/src/lib.rs` — `Ed25519CapabilityWitnessProvider` (`WitnessKind::Signature`, real issue/verify with scope+expiry checks, tested incl. tamper/expiry/scope-mismatch/wrong-issuer); `X25519KeyPair` real `KeyAgreementProvider` (zero new deps — `x25519-dalek` was already an unused optional dependency) | Ch. 5.1 |
 | `StitchTensor`/`apply_sorted`/`StorageBackend` | **[2] Phase 4 done (ssk-tensor)** | `crates/ssk-tensor/src/lib.rs` — real `StitchTensor{graph, head, backend}`, `apply_sorted` (deterministic `(epoch, StitchId)` ordering, hash-chained `StitchTensorEntry`s), `StorageBackend` (supertrait of `GenericLedgerBackend<StitchTensorEntry>`, blanket-implemented), real `StitchGraph`; `ssk-runtime`'s live pipeline still writes the older flat `TensorEntry` — wiring it to `StitchTensor` is deferred to Phase 5 alongside the `RunOutcome`/pipeline-stage rework (Section R), since that is where the gate witness starts carrying a real `BcikStitch` forward instead of discarding it | Ch. 12.1-12.2 |
-| `FocusEngine`/`FocusReport`/`CoreSessionClass` | [3] | `crates/ssk-focus/src/lib.rs:6-8` — `refocuses()` is one boolean expression | Ch. 13.1 |
-| `LinkabilityEstimator`/`AdversaryModel`/`LinkabilityReport` | [3] | `crates/ssk-privacy/src/lib.rs:6-12` — `linkability_score()` is one heuristic function | Ch. 15.3 |
-| Real re-executing `ReplayEngine` | [2] | `crates/ssk-replay/src/lib.rs:17-37` — pure field-equality diff of two pre-computed `RuntimeOutcome`s passed in by the caller; no re-execution happens inside this crate | Ch. 16.3 |
+| `FocusEngine`/`FocusReport`/`CoreSessionClass` | **[1] Phase 5 done** | `crates/ssk-focus/src/lib.rs` — real `FocusEngine::reanalyze` over `Response` evidence, `CoreSessionClass`/`FocusVerdict`/`FocusReport`; the original `refocuses()` boolean check is kept unchanged as `FocusGate`'s real backing check (a different, faster, gate-time concern than session reconstruction) | Ch. 13.1 |
+| `LinkabilityEstimator`/`AdversaryModel`/`LinkabilityReport` | **[1] Phase 5 done** | `crates/ssk-privacy/src/lib.rs` — real trait/enum/struct; `HeuristicLinkabilityEstimator` wraps the original heuristic, declaring `AdversaryModel::PartialNetworkObserver`; `linkability_score()` kept unchanged for `PrivacyGate`'s existing call site | Ch. 15.3 |
+| Real re-executing `ReplayEngine` | **[1] Phase 5 done** | `crates/ssk-replay/src/lib.rs` — `ReplayEngine::replay` now re-executes the decision core itself (via `ssk_runtime::execute_pipeline`, Section Q's shared-pipeline extraction) and diffs the fresh result against the manifest's `trace_head`/`expected_outcome_digest`, rather than being handed two pre-computed outcomes | Ch. 16.3 |
 | 18-variant `FaultKind` + `Faultscan` trait | [3] | `crates/ssk-faultscan/src/lib.rs:16-29` — actual enum has 6 chaos-injection variants (`SignatureCorruption, CapabilityWithdrawal, TtlExpiry, ReplayDrift, AttestationFailure, LocatorUntrust`), API is `inject_fault`/`run_drill`/`run_playbook`, structurally unrelated to the PDF's detection taxonomy | Ch. 17.1 |
-| 3-variant `RunOutcome` | [3] | `crates/ssk-types/src/lib.rs:356-362` — `RuntimeOutcome` is a flat struct (`run, gate_report, stitch, residues, traces`) | Ch. 14.2 |
-| Full runtime pipeline stages | [2] | `crates/ssk-runtime/src/lib.rs:103-109` — 5 traced steps (`Scheduler, Orbit, Locator, Bcik, Gates`); PDF's spine (Ch. 14.1) names 20 stages including `PchPlacement, GabrielEvaluation, CapabilityCheck, LinkabilityResidue` | Ch. 14.1 |
+| 3-variant `RunOutcome` | **[2] Phase 5 partial** | `crates/ssk-runtime/src/lib.rs` — real `RunOutcome{Pass, HoldRefine, DissolveRejectQuarantine}` and a tested `RunOutcome::resolve(gate_report, ...)` mapping all five `GateOutcomeKind` values correctly; lands in `ssk-runtime` rather than `ssk-types` (disclosed placement correction — `Pass.focus: FocusReport` means it can only live where both `ssk-focus` and `ssk-types` are already dependencies, and `ssk-types` cannot depend on `ssk-focus` without a cycle). **Not yet wired** into any live call site: a real `Pass` needs a genuine `FocusReport`, which needs real `Response` evidence from a `FiberExecution`/`ResponseCapture` stage that does not exist yet. `RuntimeOutcome` (the older flat struct) is unchanged and still what `Runtime::run_once_with_context` returns | Ch. 14.2 |
+| Full runtime pipeline stages | [2] | `crates/ssk-runtime/src/lib.rs` — still 5 traced steps (`Scheduler, Orbit, Locator, Bcik, Gates`) inside the newly-extracted `execute_pipeline`; PDF's spine (Ch. 14.1) names 20 stages including `PchPlacement, GabrielEvaluation, CapabilityCheck, LinkabilityResidue`. Not addressed this phase: splitting these out would require breaking `GateVector::evaluate` (currently one atomic call producing one `GateReport`) into separately-traceable per-check stages | Ch. 14.1 |
 | 12-section config schema | [2] | `crates/ssk-config/src/lib.rs:108-114` — `AppConfig{version, policy, runtime, interop}` covers roughly 4 of ~30 fields across the PDF's 12 sections | Ch. 21 |
 
 ---
@@ -208,7 +215,7 @@ if all tests for levels 0..*k* pass"):
 | SSKΩ-3 | BCIK `StitchCandidate` pipeline: every crossing carries seam, boundary, gate, trace, replay. | ⚠️ seam/boundary/trace/replay are real (Phase 2); `gate_report` is still always `None` — real per-gate evidence is Phase 3 |
 | SSKΩ-4 | Gate vector + boundary residues: twelve gates, fail-closed, typed residues, PCH projection checks. | ✅ met (Phase 3: twelve real gate structs, no early-break, typed `ResidueKind` on every fail path, `HypercubeGate` drives the real 9-axis PCH) |
 | SSKΩ-5 | Persistent Stitch Tensor + audit: hash-chained append, storage backends, tensor-preservation theorem tested. | ⚠️ `ssk-tensor`'s real `StitchTensor`/`apply_sorted`/`StorageBackend` landed (Phase 4), hash-chained and tested (including the empty-`Vec`-preserves-the-tensor case); not yet wired into `ssk-runtime`'s live pipeline (Phase 5), so the theorem is not yet provable end-to-end through the actual runtime driver |
-| SSKΩ-6 | Concave Reanalysis Focus + replay: class reconstruction, replay determinism harness green. | ❌ absent |
+| SSKΩ-6 | Concave Reanalysis Focus + replay: class reconstruction, replay determinism harness green. | ⚠️ real `FocusEngine`/`FocusReport` (Phase 5) and a genuinely re-executing `ReplayEngine` (Phase 5) both landed and tested; the 3-variant `RunOutcome` exists but is not wired into any live pipeline call site (needs a real `FiberExecution`/`ResponseCapture` stage that doesn't exist yet) |
 | SSKΩ-7 | Locator pool + relay-fabric adapters: real egress adapters behind the async edge, health probing. | ❌ absent |
 | SSKΩ-8 | Full simulation + conformance testbed: privacy metric tests, defensive adversary sim, all vectors. | ❌ absent |
 | SSKΩ-9 | Production-hardened runtime profile: dissolution/TTL sweeps, ledger verification, deployment audit, documented limits. | ❌ absent (TTL is a bare `==0` check, no sweeping) |
@@ -1067,13 +1074,22 @@ impl<'p> FocusEngine<'p> {
 > from response evidence. It does not prove payload truth, endpoint trustworthiness, or
 > absence of observation. This is a documented, tested limit, not a hidden assumption."
 
-**Current:** `refocuses()` (`crates/ssk-focus/src/lib.rs:6-8`) is one boolean expression:
-`candidate.focus_ready && candidate.facet.core_id == candidate.core.id`.
+**Current — Phase 5 done:** `crates/ssk-focus/src/lib.rs` now has real `Response`/
+`CoreSessionClass`/`FocusVerdict`/`FocusReport` and a real `FocusEngine::reanalyze`.
+Reconstruction is genuinely bounded, not guessed: a session reconstructs to
+`CoreSessionClass::Reconstructed(core.id)` only when every `Response` shares one `FacetId` and
+the core is canonically signed; an empty response set is `Ambiguous`; more than one distinct
+facet (no facet-to-core directory exists in this codebase to resolve that honestly) is
+`ClassMismatch`. `linkability` is computed for real via the new `HeuristicLinkabilityEstimator`
+(Section O) over a locator-reuse-derived `ObservedSurface` (reused locators raise risk — the
+only correlation signal a bare `Response` carries). `replay: ReplayReportRef` is a real digest
+of the session's response hashes via the `HashProvider` the engine holds, standing in for a
+replay-report registry that does not exist yet. The original `refocuses()` boolean is kept
+**unchanged** — it remains `FocusGate`'s real backing check (Section K), a different, faster,
+gate-time concern than this heavier session reconstruction.
 
-**Design: breaking rewrite.** Depends on Section O's `LinkabilityReport` and Section Q's
-`ReplayReportRef` — this is structurally the simplest object in the whole document (one
-function, one report struct) but must land *after* both its dependencies exist, so it sits
-later in the phase order (Section V, Phase 5) despite its simplicity.
+Tested: `empty_responses_are_ambiguous`, `single_facet_responses_reconstruct_cleanly` (also
+proves non-zero linkability risk from a reused locator), `mixed_facet_responses_are_a_class_mismatch`.
 
 ---
 
@@ -1102,17 +1118,19 @@ pub struct LinkabilityReport {
 }
 ```
 
-**Current:** `linkability_score()` (`crates/ssk-privacy/src/lib.rs:6-12`) is a single heuristic
-function (`risk_score/2` if trusted, else `risk_score`); no `LinkabilityEstimator` trait,
-`AdversaryModel` enum, or `LinkabilityReport` struct.
+**Current — Phase 5 done:** `crates/ssk-privacy/src/lib.rs` now has the real
+`LinkabilityEstimator` trait, `AdversaryModel{PartialNetworkObserver, GlobalPassiveObserver}`,
+`LinkRisk`, `SurfaceComponent`, `ObservedSurface`, `ThreatCtx` (a Phase-placeholder context
+parameter, same disclosed pattern as `ssk-gates::GateCtx`), and `LinkabilityReport`. The
+original `linkability_score()` heuristic is kept **unchanged** for `PrivacyGate`'s existing
+call site (Section K); the new `HeuristicLinkabilityEstimator` wraps the same spirit of
+heuristic behind the real trait, declaring `AdversaryModel::PartialNetworkObserver` — the
+honest posture a bounded, budget-checked estimate implies, not an anonymity claim. `report()`
+has a default trait-method body flagging any component with `risk_score > 70` into
+`high_risk_components`.
 
-**Design: additive.** Wrap the existing heuristic as a concrete
-`HeuristicLinkabilityEstimator` implementing the new trait, declaring
-`adversary_model() -> AdversaryModel::PartialNetworkObserver` — the honest posture already
-implied by the current one-line heuristic (a bounded, budget-checked estimate, not an
-anonymity claim). This satisfies the trait/struct shape literally without inventing false
-analytical rigor, and carries forward the Desktop doc's own L.2 framing ("`ssk-privacy` is a
-risk heuristic, not a correlation/anonymity engine") into a typed form.
+Tested: `heuristic_estimator_declares_partial_network_observer`,
+`report_flags_high_risk_components`, `report_omits_low_risk_components`.
 
 ---
 
@@ -1187,20 +1205,29 @@ pub enum ReplayVerdict {
 > gate reports, tensor updates and focus reports. All nondeterminism sources (time, randomness,
 > map iteration order, float arithmetic) are excluded from the decision core by construction.
 
-**Current:** `DeterministicReplayEngine::replay` (`crates/ssk-replay/src/lib.rs:17-37`) is a
-**pure field-equality diff of two pre-computed `RuntimeOutcome`s** passed in by the caller — no
-re-execution happens inside this crate at all; the "run twice" orchestration lives externally
-in `ssk-cli`'s `replay_verify_command`.
+**Current — Phase 5 done, with a disclosed placement correction:** the pure decision-core
+pipeline (scheduler tick → orbit derive → locator select → stitch candidate → gate evaluate →
+trace chain) is now extracted into `pub fn execute_pipeline(...) -> Result<PipelineExecution, RuntimeError>`
+in `crates/ssk-runtime/src/lib.rs` — **not** `ssk-core` as originally suggested. `ssk-core`
+cannot host it: the pipeline genuinely needs `ssk-identity` and `ssk-stitch`, and both of those
+crates already depend on `ssk-core` (for `MirrorOrbit`/`CoreObject`), so `ssk-core` adding a
+dependency on either would cycle — the same class of constraint discovered during Phase 3/4.
+`Runtime::run_once_with_context` now calls `execute_pipeline` and only adds tensor mutation on
+top. `ssk-replay` gained a normal dependency on `ssk-runtime` to call the same function; the
+reverse edge (`ssk-runtime` → `ssk-replay`, previously used only by one integration test) was
+moved to `[dev-dependencies]` in `ssk-runtime`'s `Cargo.toml` — Cargo permits a dev-dependency
+back-edge with no cycle error, since dev-dependencies aren't part of the graph a downstream
+crate depends on. `ReplayEngine::replay`'s signature changed to take the original
+`intent`/`pool`/`determinism`/`gate_vector` (a manifest is a compact commitment, not an archive
+of the original request — the PDF's `RuntimeState` parameter isn't detailed in the excerpted
+text, so this is this document's own disclosed elaboration of it) and now genuinely
+re-executes, diffing the fresh `trace_head`/gate-report digest against the manifest's stored
+values — no longer just comparing two outcomes the caller computed externally.
 
-**Design: breaking.** Extract the pure decision-core pipeline (scheduler tick → orbit derive →
-locator select → stitch candidate → gate evaluate → trace chain) out of `ssk-runtime` into a
-shared function callable by both `ssk-runtime` (adds tensor mutation) and `ssk-replay`
-(re-executes and diffs), without creating a dependency cycle — both sit above the foundation
-crates (`ssk-scheduler`, `ssk-identity`, `ssk-bcik`, `ssk-gates`, `ssk-stitch`) that the shared
-function depends on. Land this shared function in `ssk-core` (e.g.
-`ssk_core::pipeline::execute_once(...)`). This is the mechanism that prevents "replay drift
-from real logic" — without this extraction, replay can only ever prove two numbers were equal,
-never that determinism actually holds end-to-end.
+Tested: `genuinely_re_executed_run_matches_its_own_manifest`,
+`a_mismatched_manifest_is_reported_as_divergent` (in `ssk-replay`); the pre-existing
+`deterministic_replay_vector_matches` (`ssk-runtime`'s own integration test) and `ssk-cli`'s
+`replay-verify` command updated to the new call shape.
 
 ---
 
@@ -1231,20 +1258,28 @@ pub fn run_once(intent: ConnectionIntent, state: &mut RuntimeState,
 > **Contract — commit and dissolution:** "a connection event ends in exactly one of three
 > legitimate outcomes. Silent loss is not a legitimate outcome."
 
-**Current:** `Runtime::run_once_with_context` (`crates/ssk-runtime/src/lib.rs:78-180`) returns
-`Result<(RuntimeOutcome, ReplayManifest), RuntimeError>` where `RuntimeOutcome` is a flat
-struct; the pipeline traces only 5 of the 20 named stages (`Scheduler, Orbit, Locator, Bcik,
-Gates` — lines 103-109); missing `PchPlacement`, `GabrielEvaluation`, explicit
-`CapabilityCheck`, `LinkabilityResidue`.
+**Current — Phase 5 partial, with a disclosed placement correction:** `RunOutcome` (the real
+3-variant enum) and `RunOutcome::resolve(gate_report, stitches, focus, replay, audit) -> Self`
+now exist in `crates/ssk-runtime/src/lib.rs` — **not** `ssk-types` as originally suggested,
+for the same reason as Section Q's correction: `Pass.focus: FocusReport` means this type can
+only live somewhere that already depends on both `ssk-focus` and `ssk-types`, and `ssk-types`
+cannot depend on `ssk-focus` without a cycle. `resolve` correctly maps all five
+`GateOutcomeKind` values (`Pass` → `Pass`; `Hold`/`Refine` → `HoldRefine`; `Reject`/
+`Quarantine` → `DissolveRejectQuarantine`), tested against all three branches.
 
-**Design: breaking, with a disclosed, justified deviation.** Keep the ergonomic
-`Runtime<'a, L>::run_once` method (idiomatic Rust, avoids re-litigating the whole
-`RuntimeState`/`Policy`/`RunDescriptor` free-function threading), while **additionally** adding
-a module-level `pub fn run_once(intent, state, policy, rd) -> RunOutcome` free function matching
-the PDF's exact signature for literal-conformance tests, delegating internally to the method.
-`PipelineStep` gains `PchPlacement`, `GabrielEvaluation`, `CapabilityCheck`,
-`LinkabilityResidue` variants once Sections I/L/O land — necessarily the last item to close
-(Section V, Phase 5), since it references every other section's output.
+**Not yet done, disclosed:** `RunOutcome` is not wired into any live call site —
+`Runtime::run_once_with_context` still returns the older flat `RuntimeOutcome`/`ReplayManifest`
+pair unchanged. A genuine `Pass` variant needs a real `FocusReport`, which needs real
+`Response` evidence — and no `FiberExecution`/`ResponseCapture` pipeline stage exists anywhere
+in this workspace to produce that evidence (ch. 14.1's spine names both stages, but nothing
+implements them). Wiring `RunOutcome` in before those stages exist would mean fabricating
+`Response` data, which this document declines to do. The module-level
+`pub fn run_once(intent, state, policy, rd) -> RunOutcome` free function matching the PDF's
+exact signature, and the four new `PipelineStep` variants (`PchPlacement`, `GabrielEvaluation`,
+`CapabilityCheck`, `LinkabilityResidue`), remain unimplemented for the same reason plus one
+more: `GateVector::evaluate` is currently one atomic call producing one `GateReport` — exposing
+separately-traceable per-check pipeline stages needs that call broken apart, which was judged
+too large a change to land safely alongside this phase's other work.
 
 ---
 

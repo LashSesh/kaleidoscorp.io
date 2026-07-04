@@ -516,19 +516,27 @@ fn replay_verify_command(
                 vec!["Retry run with a valid fixture and strict config.".into()],
             )
         })?;
-    let (expected, _) = runtime
-        .run_once_with_context(sample_intent(valid_fixture), &pool, &determinism)
+
+    // The engine re-executes the pipeline from the original intent and
+    // diffs the result against the manifest itself — it is not handed two
+    // pre-computed outcomes to compare.
+    let engine = DeterministicReplayEngine;
+    let verdict = engine
+        .replay(
+            &manifest,
+            sample_intent(valid_fixture),
+            &pool,
+            &determinism,
+            &runtime.gate_vector,
+        )
         .map_err(|err| {
             AppError::new(
                 ErrorClass::Runtime,
-                "RUNTIME_REPLAY_EXPECTED_FAILED",
+                "RUNTIME_REPLAY_REEXEC_FAILED",
                 err.to_string(),
                 vec!["Inspect run setup and replay inputs.".into()],
             )
         })?;
-
-    let engine = DeterministicReplayEngine;
-    let verdict = engine.replay(&manifest, &actual, &expected);
 
     let mut metrics = load_metrics(&loaded.config.runtime.metrics_path)?;
     let event = runtime.runtime_event(&actual, &manifest, &determinism);

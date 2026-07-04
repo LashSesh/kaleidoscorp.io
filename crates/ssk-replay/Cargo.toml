@@ -6,7 +6,14 @@ license.workspace = true
 
 [dependencies]
 ssk-types = { path = "../ssk-types" }
+ssk-runtime = { path = "../ssk-runtime" }
+ssk-locator = { path = "../ssk-locator" }
+ssk-gates = { path = "../ssk-gates" }
 serde.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+ssk-tensor = { path = "../ssk-tensor" }
 
 [lints]
 workspace = true

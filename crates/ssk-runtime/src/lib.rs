@@ -1,7 +1,7 @@
 #![forbid(unsafe_code)]
 
 use ssk_audit::chain_trace;
-use ssk_focus::refocuses;
+use ssk_focus::{refocuses, FocusReport};
 use ssk_gates::GateVector;
 use ssk_identity::derive_identity_facet;
 use ssk_locator::StaticLocatorPool;
@@ -9,9 +9,70 @@ use ssk_scheduler::HypertoroidalScheduler;
 use ssk_stitch::from_intent;
 use ssk_tensor::{make_entry, LedgerBackend, TensorError};
 use ssk_types::{
-    digest_of, ConnectionIntent, FrequencyVector, GateOutcomeKind, HashAlg, PipelineStep,
-    ReplayManifest, RunDescriptor, RuntimeOutcome, TraceId, TraceRecord,
+    digest_of, AuditRef, ConnectionIntent, FrequencyVector, GateOutcomeKind, GateReport, HashAlg,
+    PipelineStep, ReplayManifest, ReplayReportRef, ResidueId, RunDescriptor, RuntimeOutcome,
+    SchedulerState, StitchCandidate, StitchId, TraceId, TraceRecord,
 };
+
+/// A connection event's terminal outcome (Master Spec Ω+1 ch. 14.2, verbatim
+/// three-variant shape) — "ends in exactly one of three legitimate
+/// outcomes. Silent loss is not a legitimate outcome." Lands here rather
+/// than in `ssk-types` (a disclosed placement correction from the spec's
+/// original suggestion): `Pass`'s `focus: FocusReport` field means this type
+/// can only live somewhere that already depends on both `ssk-focus` and
+/// `ssk-types`, and `ssk-types` cannot depend on `ssk-focus` without a
+/// cycle (`ssk-focus` already depends on `ssk-types`).
+///
+/// **Not yet wired into `Runtime::run_once_with_context`.** Building a real
+/// `Pass` variant needs a genuine `FocusReport`, which needs real
+/// `Response` evidence from a `FiberExecution`/`ResponseCapture` pipeline
+/// stage — neither exists yet (ch. 14.1's spine names them, but no fiber
+/// execution or response-capture subsystem is implemented anywhere in this
+/// workspace). `resolve` below is real and tested against `GateOutcomeKind`
+/// today; wiring a live call site is future work once those stages land.
+#[derive(Debug, Clone, PartialEq)]
+pub enum RunOutcome {
+    Pass {
+        stitches: Vec<StitchId>,
+        focus: FocusReport,
+        replay: ReplayReportRef,
+    },
+    HoldRefine {
+        residues: Vec<ResidueId>,
+    },
+    DissolveRejectQuarantine {
+        residues: Vec<ResidueId>,
+        audit: AuditRef,
+    },
+}
+
+impl RunOutcome {
+    /// Resolves a gate report into the PDF's three-way outcome taxonomy:
+    /// `Hold`/`Refine` are diagnosable and non-persistent (`HoldRefine`);
+    /// `Reject`/`Quarantine` dissolve with an audit trail
+    /// (`DissolveRejectQuarantine`); only `Pass` materializes.
+    #[must_use]
+    pub fn resolve(
+        gate_report: &GateReport,
+        stitches: Vec<StitchId>,
+        focus: FocusReport,
+        replay: ReplayReportRef,
+        audit: AuditRef,
+    ) -> Self {
+        let residues: Vec<ResidueId> = gate_report.residues.iter().map(|r| r.id.clone()).collect();
+        match gate_report.outcome {
+            GateOutcomeKind::Pass => RunOutcome::Pass {
+                stitches,
+                focus,
+                replay,
+            },
+            GateOutcomeKind::Hold | GateOutcomeKind::Refine => RunOutcome::HoldRefine { residues },
+            GateOutcomeKind::Reject | GateOutcomeKind::Quarantine => {
+                RunOutcome::DissolveRejectQuarantine { residues, audit }
+            }
+        }
+    }
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum RuntimeError {
@@ -21,6 +82,90 @@ pub enum RuntimeError {
     Tensor(#[from] TensorError),
     #[error("types error: {0}")]
     Types(#[from] ssk_types::TypeError),
+}
+
+/// The pure decision-core's output up to (but not including) tensor
+/// mutation: scheduler tick, orbit derivation, locator selection, stitch
+/// candidate construction, gate evaluation, and trace chaining (Master Spec
+/// Ω+1 ch. 14.1's spine, minus `TensorMaterialization`). Shared by
+/// `Runtime::run_once_with_context` (which additionally mutates the tensor)
+/// and `ssk-replay` (which re-executes this same pipeline and diffs against
+/// a `ReplayManifest` instead) — this is the extraction Section Q of
+/// `docs/OMEGA_CORE_CONFORMANCE_SPEC.md` calls for, landed here rather than
+/// in `ssk-core` because the pipeline genuinely needs `ssk-identity`/
+/// `ssk-stitch` (both of which already depend on `ssk-core`, so `ssk-core`
+/// itself cannot add a dependency on either without a cycle).
+#[derive(Debug, Clone)]
+pub struct PipelineExecution {
+    pub candidate: StitchCandidate,
+    pub gate_report: GateReport,
+    pub traces: Vec<TraceRecord>,
+    pub scheduler_state: SchedulerState,
+}
+
+/// Runs the pure decision core once: deterministic given identical `intent`,
+/// `pool`, `determinism`, and `gate_vector` (ch. 16.3's replay-determinism
+/// obligation) — no wall-clock time, no randomness outside `determinism`'s
+/// declared seed, no tensor mutation.
+pub fn execute_pipeline(
+    intent: &ConnectionIntent,
+    pool: &StaticLocatorPool,
+    determinism: &DeterminismContext,
+    gate_vector: &GateVector,
+) -> Result<PipelineExecution, RuntimeError> {
+    let mode = if determinism.seeded {
+        ssk_types::SchedulerMode::Seeded(ssk_types::SchedulerSeed(determinism.epoch))
+    } else {
+        ssk_types::SchedulerMode::Deterministic
+    };
+    let mut scheduler = HypertoroidalScheduler::new(
+        ssk_types::PhaseVector::zero(),
+        FrequencyVector::deterministic(),
+        mode,
+        determinism.epoch,
+    );
+    let _phase = scheduler.tick();
+
+    let facet = derive_identity_facet(&intent.core);
+    let locator = pool
+        .get(&intent.target_locator)
+        .or_else(|| pool.select_first_viable())
+        .ok_or(RuntimeError::LocatorNotFound)?;
+
+    let candidate = from_intent(intent.clone(), facet, locator);
+    let gate_report = gate_vector.evaluate(&candidate);
+
+    let mut traces = Vec::new();
+    let mut prev_hash = ssk_types::Digest::GENESIS;
+    for step in [
+        PipelineStep::Scheduler,
+        PipelineStep::Orbit,
+        PipelineStep::Locator,
+        PipelineStep::Bcik,
+        PipelineStep::Gates,
+    ] {
+        let trace = TraceRecord {
+            id: TraceId::new(format!("{}:{step:?}", intent.run.0 .0)),
+            run: intent.run.clone(),
+            step,
+            inputs: vec![digest_of(&candidate, HashAlg::Blake3)?],
+            outputs: vec![digest_of(&gate_report, HashAlg::Blake3)?],
+            gate_report: Some(gate_report.id.clone()),
+            residues: gate_report.residues.iter().map(|r| r.id.clone()).collect(),
+            prev_hash,
+            entry_hash: ssk_types::Digest::PENDING,
+        };
+        let trace = chain_trace(&prev_hash, trace)?;
+        prev_hash = trace.entry_hash;
+        traces.push(trace);
+    }
+
+    Ok(PipelineExecution {
+        candidate,
+        gate_report,
+        traces,
+        scheduler_state: scheduler.state(),
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -81,52 +226,13 @@ impl<'a, L: LedgerBackend> Runtime<'a, L> {
         pool: &StaticLocatorPool,
         determinism: &DeterminismContext,
     ) -> Result<(RuntimeOutcome, ReplayManifest), RuntimeError> {
-        let mode = if determinism.seeded {
-            ssk_types::SchedulerMode::Seeded(ssk_types::SchedulerSeed(determinism.epoch))
-        } else {
-            ssk_types::SchedulerMode::Deterministic
-        };
-        let mut scheduler = HypertoroidalScheduler::new(
-            ssk_types::PhaseVector::zero(),
-            FrequencyVector::deterministic(),
-            mode,
-            determinism.epoch,
-        );
-        let _phase = scheduler.tick();
-
-        let facet = derive_identity_facet(&intent.core);
-        let locator = pool
-            .get(&intent.target_locator)
-            .or_else(|| pool.select_first_viable())
-            .ok_or(RuntimeError::LocatorNotFound)?;
-
-        let candidate = from_intent(intent.clone(), facet, locator);
-        let gate_report = self.gate_vector.evaluate(&candidate);
-
-        let mut traces = Vec::new();
-        let mut prev_hash = ssk_types::Digest::GENESIS;
-        for step in [
-            PipelineStep::Scheduler,
-            PipelineStep::Orbit,
-            PipelineStep::Locator,
-            PipelineStep::Bcik,
-            PipelineStep::Gates,
-        ] {
-            let trace = TraceRecord {
-                id: TraceId::new(format!("{}:{step:?}", intent.run.0 .0)),
-                run: intent.run.clone(),
-                step,
-                inputs: vec![digest_of(&candidate, HashAlg::Blake3)?],
-                outputs: vec![digest_of(&gate_report, HashAlg::Blake3)?],
-                gate_report: Some(gate_report.id.clone()),
-                residues: gate_report.residues.iter().map(|r| r.id.clone()).collect(),
-                prev_hash,
-                entry_hash: ssk_types::Digest::PENDING,
-            };
-            let trace = chain_trace(&prev_hash, trace)?;
-            prev_hash = trace.entry_hash;
-            traces.push(trace);
-        }
+        let execution = execute_pipeline(&intent, pool, determinism, &self.gate_vector)?;
+        let PipelineExecution {
+            candidate,
+            gate_report,
+            traces,
+            scheduler_state,
+        } = execution;
 
         let stitch = if gate_report.outcome == GateOutcomeKind::Pass && refocuses(&candidate) {
             let prior_hash = self
@@ -147,8 +253,6 @@ impl<'a, L: LedgerBackend> Runtime<'a, L> {
         } else {
             None
         };
-
-        let scheduler_state = scheduler.state();
 
         let manifest = ReplayManifest {
             run: intent.run.clone(),
@@ -271,6 +375,98 @@ mod tests {
             trusted: true,
             risk_score: 10,
         }
+    }
+
+    fn sample_focus_report() -> FocusReport {
+        FocusReport {
+            reconstructed: ssk_focus::CoreSessionClass::Reconstructed(ssk_types::CoreId::new("c1")),
+            residues: Vec::new(),
+            replay: ReplayReportRef::new("focus-replay:c1"),
+            linkability: ssk_privacy::LinkabilityReport {
+                score: ssk_privacy::LinkRisk(0.0),
+                adversary_model: ssk_privacy::AdversaryModel::PartialNetworkObserver,
+                high_risk_components: Vec::new(),
+            },
+            verdict: ssk_focus::FocusVerdict::Pass,
+        }
+    }
+
+    #[test]
+    fn run_outcome_resolves_pass_from_a_passing_gate_report() {
+        let report = GateReport {
+            id: ssk_types::GateReportId::new("g1"),
+            outcome: GateOutcomeKind::Pass,
+            witnesses: Vec::new(),
+            residues: Vec::new(),
+        };
+        let outcome = RunOutcome::resolve(
+            &report,
+            vec![StitchId::new("s1")],
+            sample_focus_report(),
+            ReplayReportRef::new("r1"),
+            AuditRef::new("a1"),
+        );
+        assert!(matches!(outcome, RunOutcome::Pass { .. }));
+    }
+
+    #[test]
+    fn run_outcome_resolves_hold_refine_from_a_holding_gate_report() {
+        let residue = ssk_types::BoundaryResidue::new(
+            ssk_types::ResidueId::new("res1"),
+            ssk_types::ResidueKind::Timing,
+            ssk_types::GateId::Dissolution,
+            "held",
+            ssk_types::Severity::Low,
+            TraceId::new("t1"),
+            true,
+        );
+        let report = GateReport {
+            id: ssk_types::GateReportId::new("g1"),
+            outcome: GateOutcomeKind::Hold,
+            witnesses: Vec::new(),
+            residues: vec![residue],
+        };
+        let outcome = RunOutcome::resolve(
+            &report,
+            Vec::new(),
+            sample_focus_report(),
+            ReplayReportRef::new("r1"),
+            AuditRef::new("a1"),
+        );
+        assert!(matches!(
+            outcome,
+            RunOutcome::HoldRefine { residues } if residues.len() == 1
+        ));
+    }
+
+    #[test]
+    fn run_outcome_resolves_dissolve_from_a_rejecting_gate_report() {
+        let residue = ssk_types::BoundaryResidue::new(
+            ssk_types::ResidueId::new("res1"),
+            ssk_types::ResidueKind::Identity,
+            ssk_types::GateId::Core,
+            "rejected",
+            ssk_types::Severity::High,
+            TraceId::new("t1"),
+            true,
+        );
+        let report = GateReport {
+            id: ssk_types::GateReportId::new("g1"),
+            outcome: GateOutcomeKind::Reject,
+            witnesses: Vec::new(),
+            residues: vec![residue],
+        };
+        let outcome = RunOutcome::resolve(
+            &report,
+            Vec::new(),
+            sample_focus_report(),
+            ReplayReportRef::new("r1"),
+            AuditRef::new("a1"),
+        );
+        assert!(matches!(
+            outcome,
+            RunOutcome::DissolveRejectQuarantine { residues, .. } if residues.len() == 1
+        ));
     }
 
     #[test]

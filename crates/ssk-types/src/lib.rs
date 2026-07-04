@@ -425,6 +425,16 @@ content_id!(CapabilityId);
 
 id_type!(IssuerRef);
 id_type!(ReplayRef);
+// A per-run audit reference (ch. 14.2's `RunOutcome::DissolveRejectQuarantine.audit`)
+// — distinct from `AuditRoot` (a core's own audit chain root, ch. 4.1):
+// this points at one run's audit trail entry, not the whole chain.
+id_type!(AuditRef);
+// A reference to a stored replay report (ch. 13.1's `FocusReport.replay`,
+// ch. 14.2's `RunOutcome::Pass.replay`) — distinct from `ReplayRef` (a
+// stitch-level replay witness reference, ch. 4.1). No replay-report
+// registry exists yet; this id type lands ahead of that registry so
+// `FocusReport`/`RunOutcome` can carry the field the PDF specifies.
+id_type!(ReplayReportRef);
 
 /// A capability's declared claim, e.g. "may use locator class Relay in
 /// epoch E" (ch. 5.2). Phase 2 placeholder: an opaque string; a richer
