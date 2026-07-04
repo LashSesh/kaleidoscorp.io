@@ -1,0 +1,24 @@
+[package]
+name = "ssk-capture"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# The SSCL SystemTrafficField capture layer (SSCL-2): observe traffic from a
+# pluggable local source and canonicalize each window into a payload-neutral
+# CanonicalTrafficSurface (SSCL 5) with provenance and a replay-stable payload
+# digest. These surfaces feed ssk-signature (spectra) and ssk-imdf (the Dome).
+# Pure and deterministic; the concrete privileged OS capture binds a TrafficSource
+# at the integration layer. See SYSTEM_ARCHITECTURE_CORRESPONDENCE.md.
+
+[dependencies]
+ssk-types = { path = "../ssk-types", version = "0.1.0" }
+ssk-signature = { path = "../ssk-signature", version = "0.1.0" }
+serde = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }
+
+[lints]
+workspace = true
