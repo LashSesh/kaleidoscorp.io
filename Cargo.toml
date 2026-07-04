@@ -31,6 +31,7 @@ members = [
   "crates/ssk-meta-resonance",
   "crates/ssk-crown",
   "crates/ssk-host-cells",
+  "crates/ssk-funnel-dag",
   "crates/ssk-cli",
   "crates/ssk-ipc",
   "crates/ssk-daemon",

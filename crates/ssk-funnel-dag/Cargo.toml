@@ -1,0 +1,22 @@
+[package]
+name = "ssk-funnel-dag"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# FCHL-MPK Band B: the FunnelDAG (FCHL sense) — a host-relation work DAG whose
+# nodes are tasks bound to HostCells, with dependency ordering, a logical TTL,
+# explicit dissolution, and a hash-chained trace (temporal-window replay). This
+# is NOT the Omega locator funnel-DAG (ssk-locator's LocatorGraph) — a different
+# object over a different plane. See FCHL_MPK_INTEGRATION_STRATEGY.md.
+
+[dependencies]
+ssk-types = { path = "../ssk-types", version = "0.1.0" }
+ssk-host-cells = { path = "../ssk-host-cells", version = "0.1.0" }
+serde = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+
+[lints]
+workspace = true
