@@ -446,4 +446,22 @@ mod tests {
         );
         assert!(matches!(result, Err(FaultKind::LocatorUnavailable)));
     }
+
+    #[test]
+    fn a_stitch_edge_missing_a_required_field_fails_to_deserialize() {
+        // Section W / ch. 6.3 edge-explicitness: an edge missing any of its
+        // mandatory fields cannot enter the graph — enforced by serde, since
+        // StitchEdge has no Option/#[serde(default)] fields.
+        let complete = serde_json::to_string(&edge("e1", "l1", "l2", 100)).expect("serialize");
+        assert!(serde_json::from_str::<ssk_types::StitchEdge>(&complete).is_ok());
+
+        // Drop the mandatory `policy_reason` field.
+        let mut value: serde_json::Value = serde_json::from_str(&complete).expect("parse");
+        value
+            .as_object_mut()
+            .expect("object")
+            .remove("policy_reason");
+        let missing = value.to_string();
+        assert!(serde_json::from_str::<ssk_types::StitchEdge>(&missing).is_err());
+    }
 }

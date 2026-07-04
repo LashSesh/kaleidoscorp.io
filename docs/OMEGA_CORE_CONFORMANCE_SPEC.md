@@ -1595,6 +1595,16 @@ through SSKΩ-9, in dependency order:
 
 ## W. Test Matrix
 
+**Status — all obligations below are implemented and green** (hardening iteration E completed the
+cross-cutting ones). The per-phase criteria live in their owning crates' `#[cfg(test)]` modules;
+the cross-cutting property obligations (`facet_recovers_to_core`, `failed_gate_preserves_the_tensor`,
+`no_silent_loss`, `decision_core_is_deterministic`) live in `crates/ssk-runtime/tests/conformance.rs`
+and run end-to-end through the real `run_to_outcome` pipeline. `no_silent_loss` and
+`residue_visibility_completeness` (`ssk-privacy`) and the edge-explicitness deserialization check
+(`ssk-locator`) close Section W's remaining Phase-6/7 items. The whole matrix is gated on
+`cargo test --workspace` + `cargo clippy --workspace --all-targets -- -D warnings` green, verified
+every commit.
+
 Representative acceptance criteria per phase (mirroring `docs/DESKTOP_CLIENT_ARCHITECTURE.md`
 Section M's gate-command style):
 

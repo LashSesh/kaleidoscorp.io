@@ -102,6 +102,31 @@ pub struct LinkabilityReport {
     pub high_risk_components: Vec<SurfaceComponent>,
 }
 
+impl LinkabilityReport {
+    /// Emits one typed `Correlation` `BoundaryResidue` per high-risk surface
+    /// component (Master Spec Ω+1 ch. 15.3's "each must have a residue
+    /// entry"). This is the residue-visibility-completeness obligation made
+    /// executable: a high-risk component is never merely scored, it always
+    /// leaves a visible, open-obligation residue a policy can act on.
+    #[must_use]
+    pub fn residues(&self) -> Vec<ssk_types::BoundaryResidue> {
+        self.high_risk_components
+            .iter()
+            .map(|c| {
+                ssk_types::BoundaryResidue::new(
+                    ssk_types::ResidueId::new(format!("linkability:{}", c.locator.0 .0)),
+                    ssk_types::ResidueKind::Correlation,
+                    ssk_types::GateId::Privacy,
+                    format!("high-linkability locator (risk {})", c.risk_score),
+                    ssk_types::Severity::High,
+                    ssk_types::TraceId::new(format!("linkability-trace:{}", c.locator.0 .0)),
+                    true,
+                )
+            })
+            .collect()
+    }
+}
+
 /// Wraps the existing `linkability_score` heuristic in the real
 /// `LinkabilityEstimator` trait shape, declaring
 /// `AdversaryModel::PartialNetworkObserver` — the honest posture already
@@ -177,5 +202,60 @@ mod tests {
         let obs = ObservedSurface::of_locator(&facet(true, 10));
         let report = estimator.report(&obs, &ThreatCtx);
         assert!(report.high_risk_components.is_empty());
+    }
+
+    #[test]
+    fn residue_visibility_completeness_every_high_risk_component_has_a_residue() {
+        // Section W (ch. 15.3): every `high_risk_components` entry must have a
+        // matching residue — a high-linkability surface is never silently scored.
+        let obs = ObservedSurface {
+            components: vec![
+                SurfaceComponent {
+                    locator: LocatorId::new("l-hi-1"),
+                    risk_score: 90,
+                },
+                SurfaceComponent {
+                    locator: LocatorId::new("l-lo"),
+                    risk_score: 10,
+                },
+                SurfaceComponent {
+                    locator: LocatorId::new("l-hi-2"),
+                    risk_score: 80,
+                },
+            ],
+        };
+        let report = HeuristicLinkabilityEstimator.report(&obs, &ThreatCtx);
+        let residues = report.residues();
+        assert_eq!(report.high_risk_components.len(), 2);
+        assert_eq!(residues.len(), report.high_risk_components.len());
+        assert!(residues
+            .iter()
+            .all(|r| r.kind == ssk_types::ResidueKind::Correlation && r.open_obligation));
+    }
+
+    #[test]
+    fn locator_reuse_raises_the_linkability_score() {
+        // ch. 18.4 metric — locator reuse: an observable surface dominated by a
+        // higher-risk locator scores higher than an all-low-risk one.
+        let low = ObservedSurface {
+            components: vec![SurfaceComponent {
+                locator: LocatorId::new("a"),
+                risk_score: 10,
+            }],
+        };
+        let high = ObservedSurface {
+            components: vec![
+                SurfaceComponent {
+                    locator: LocatorId::new("a"),
+                    risk_score: 10,
+                },
+                SurfaceComponent {
+                    locator: LocatorId::new("a"),
+                    risk_score: 85,
+                },
+            ],
+        };
+        let est = HeuristicLinkabilityEstimator;
+        assert!(est.estimate(&high, &ThreatCtx).0 > est.estimate(&low, &ThreatCtx).0);
     }
 }
