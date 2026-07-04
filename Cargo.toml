@@ -35,6 +35,7 @@ members = [
   "crates/ssk-profile-manifold",
   "crates/ssk-topology-scalpel",
   "crates/ssk-tfa",
+  "crates/ssk-service-host",
   "crates/ssk-cli",
   "crates/ssk-ipc",
   "crates/ssk-daemon",
