@@ -37,8 +37,13 @@
 pub mod canonical;
 pub mod features;
 pub mod fingerprints;
+pub mod gate;
 pub mod object;
+pub mod operators;
+pub mod policy;
+pub mod residue;
 pub mod signature;
+pub mod target;
 pub mod url;
 pub mod value;
 
@@ -49,10 +54,18 @@ pub use fingerprints::{
     fingerprint_layer_specs, FingerprintBundle, FingerprintBundleComparison, FingerprintCoverage,
     FingerprintLayerSpec, ProtocolFingerprint,
 };
+pub use gate::{GateBundle, GateDecision, GateVector};
 pub use object::SurfaceObject;
+pub use operators::{
+    BucketTimingOperator, NormalizeTraceShapeOperator, RedactIdentifierFieldsOperator,
+    SortFieldsOperator, TransformOperator, TransformResult,
+};
+pub use policy::{AuthorizationManifest, ChameleonPolicy, PolicyDecision, PolicyOutcome};
+pub use residue::{surface_to_kind, Residue, ResidueDisposition, ResidueReport, ResidueSeverity};
 pub use signature::{
     Decision, SignatureComparisonReport, SignatureDimensionDelta, SpectralSignature,
 };
+pub use target::{OperationalMask, TargetProfile};
 pub use url::{urlparse, ParsedUrl};
 pub use value::{
     bucket, categorical_equal, round6, shannon_entropy, Dimension, Dimensions, FeatureValue,
