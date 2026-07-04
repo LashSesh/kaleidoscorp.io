@@ -1,0 +1,22 @@
+[package]
+name = "ssk-boundary"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# The SSCL BoundaryActuator / session-local system-wide kill-switch (SSCL-7):
+# an authorization-gated, audited, reversible switch that severs egress for a
+# session. Policy + hash-chained audit + rollback + authorized override. Pure and
+# deterministic; the concrete privileged enforcement binds a BoundaryEnforcer at
+# the integration layer. See SYSTEM_ARCHITECTURE_CORRESPONDENCE.md.
+
+[dependencies]
+ssk-types = { path = "../ssk-types", version = "0.1.0" }
+ssk-signature = { path = "../ssk-signature", version = "0.1.0" }
+serde = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+
+[lints]
+workspace = true
