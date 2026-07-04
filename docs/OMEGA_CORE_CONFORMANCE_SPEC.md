@@ -128,8 +128,13 @@ alongside as N's own dependency. `RunOutcome` (Section R) exists as a real, test
 deliberately **not wired** into any live call site: a genuine `Pass` variant needs real
 `Response` evidence from a `FiberExecution`/`ResponseCapture` pipeline stage, and neither stage
 exists anywhere in this workspace — fabricating that evidence to force the wiring would trade
-honesty for a checkbox, so this document declines to. This document designs the closing
-architecture for SSKΩ-7 through SSKΩ-9 (remaining), plus Section R's unfinished wiring.
+honesty for a checkbox, so this document declines to. **Update — Phase 6 done (funnel-DAG
+only):** SSKΩ-7's `StitchEdge`/`LocatorGraph`/`HyperEdge`/`select_path` (Section G.2) landed and
+tested in `ssk-locator`, generic over a new dependency-inverted `PathProjectionCheck` trait
+rather than the real `Hypercube` (same crate-cycle constraint as Phases 3-5, disclosed inline);
+real egress adapters and health probing remain out of scope per Section X. This document designs
+the closing architecture for SSKΩ-8/9 (remaining), plus Section R's unfinished wiring and G.2's
+undone `Hypercube` bridging.
 
 ---
 
@@ -151,7 +156,7 @@ earlier pass without recheck).
 | `birefract()`/`IdentityRay`/`LocatorRay` | **[1] Phase 1 done** | `crates/ssk-core/src/lib.rs` — real, tested function; the two ray types have no `From`/`Into` between them | Ch. 4.2 |
 | 9-variant `LocatorKind`/`LocatorFacet` | **[1] Phase 1 done** | `crates/ssk-types/src/lib.rs` — all 9 variants; `LocatorFacet` carries the full field list plus two disclosed Phase-1 bridge fields (`trusted`/`risk_score`) preserving today's gate checks until Phase 3 rewires them | Ch. 4.3 |
 | `LocatorAdapter`/`LocatorPool` trait + `claims_external_plurality()` | **[1] Phase 1 done** | `crates/ssk-locator/src/lib.rs` — real traits; `StaticLocatorPool` implements both, with `claims_external_plurality()` genuinely counting distinct live endpoints (tested false-for-one, false-for-shared-endpoint, false-for-non-live, true-for-two-distinct-live) | Ch. 6.2 |
-| `StitchEdge`/`LocatorGraph`/`HyperEdge`/`select_path` | [4] | not present anywhere | Ch. 6.3-6.4 |
+| `StitchEdge`/`LocatorGraph`/`HyperEdge`/`select_path` | **[2] Phase 6 done (funnel-DAG only)** | `crates/ssk-types/src/lib.rs` (data types) + `crates/ssk-locator/src/lib.rs` (`select_path`, BFS over edges/hyperedges) — real and tested; no `Hypercube` wiring (dependency-inversion trait `PathProjectionCheck` instead, disclosed) and no real network egress adapters (stays `ssk-netcore`'s job, Section X) | Ch. 6.3-6.4 |
 | `SchedulerMode`/`SchedulerSeed`/`visible()` | **[1] Phase 1 done** | `crates/ssk-scheduler/src/lib.rs` — renamed `HypertoroidalScheduler`; `Seeded` mode genuinely jitters phase advancement via a `rand_pcg`-seeded PRNG keyed by `(seed, tick count)`; `visible()` implements the literal toroidal-distance formula, tested including wraparound | Ch. 7.2 |
 | Projective Connection Hypercube | **[1] Phase 3 done** | `crates/ssk-gates/src/pch.rs` — real `Axis`/`Projection`/`Hypercube`; nine real per-axis projectors, `check()` returns `Pass`/`Hold`/`Fail` per the ch. 8.2 invariant (`OverBudget` holds, all else fails); `ProtocolProjector` honestly always-`Ok` (no fiber-invariant model yet) | Ch. 8 |
 | Gabriel Constraint Cells | **[1] Phase 3 done** | `crates/ssk-gates/src/gabriel.rs` — real `CellRole`/`CellVerdict`/`ConstraintCell`/`GabrielFilm`; nine real per-role cells, `evaluate_all()` tested (intact-candidate all-`Propose`, missing-capability `Reject`, high-risk `Quarantine`); `ProtocolCell` honestly always-`Propose` for the same reason | Ch. 10 |
@@ -216,7 +221,7 @@ if all tests for levels 0..*k* pass"):
 | SSKΩ-4 | Gate vector + boundary residues: twelve gates, fail-closed, typed residues, PCH projection checks. | ✅ met (Phase 3: twelve real gate structs, no early-break, typed `ResidueKind` on every fail path, `HypercubeGate` drives the real 9-axis PCH) |
 | SSKΩ-5 | Persistent Stitch Tensor + audit: hash-chained append, storage backends, tensor-preservation theorem tested. | ⚠️ `ssk-tensor`'s real `StitchTensor`/`apply_sorted`/`StorageBackend` landed (Phase 4), hash-chained and tested (including the empty-`Vec`-preserves-the-tensor case); not yet wired into `ssk-runtime`'s live pipeline (Phase 5), so the theorem is not yet provable end-to-end through the actual runtime driver |
 | SSKΩ-6 | Concave Reanalysis Focus + replay: class reconstruction, replay determinism harness green. | ⚠️ real `FocusEngine`/`FocusReport` (Phase 5) and a genuinely re-executing `ReplayEngine` (Phase 5) both landed and tested; the 3-variant `RunOutcome` exists but is not wired into any live pipeline call site (needs a real `FiberExecution`/`ResponseCapture` stage that doesn't exist yet) |
-| SSKΩ-7 | Locator pool + relay-fabric adapters: real egress adapters behind the async edge, health probing. | ❌ absent |
+| SSKΩ-7 | Locator pool + relay-fabric adapters: real egress adapters behind the async edge, health probing. | ⚠️ funnel-DAG (`StitchEdge`/`LocatorGraph`/`HyperEdge`/`select_path`, Phase 6) landed and tested; real egress adapters/health probing behind the `async-edge` feature remain out of scope (Section X — real network I/O stays the Desktop track's `ssk-netcore` responsibility) |
 | SSKΩ-8 | Full simulation + conformance testbed: privacy metric tests, defensive adversary sim, all vectors. | ❌ absent |
 | SSKΩ-9 | Production-hardened runtime profile: dissolution/TTL sweeps, ledger verification, deployment audit, documented limits. | ❌ absent (TTL is a bare `==0` check, no sweeping) |
 
@@ -597,8 +602,36 @@ pub fn select_path(theta: &PhaseVector, g: &LocatorGraph,
 > deserialization validation and cannot enter the graph. `EdgeTransform` is a closed enum;
 > there is no opaque tunnel variant.
 
-**Current:** absent entirely. **Design:** additive; `select_path` necessarily depends on
-`Hypercube` (Section I), so this lands after Section I in the phase order (Section V, Phase 6).
+**Current — Phase 6 done, with two disclosed elaborations:** `crates/ssk-types/src/lib.rs` now
+has real `EdgeId`/`EdgeTransform`/`PolicyReason`/`StitchEdge`/`HyperEdge`/`LocatorGraph`/
+`LocatorPath`; `crates/ssk-locator/src/lib.rs` has a real, tested `select_path` — a
+breadth-first search over both `StitchEdge`s and `HyperEdge`s (a hyperedge only unlocks once
+every one of its `requires` locators has already been reached), skipping any edge whose
+`lifetime.0 == 0` (the same "non-zero TTL" convention `DissolutionGate`/`TimingCell` already
+use elsewhere).
+
+Two disclosed elaborations, both necessary rather than optional:
+1. **No `Hypercube` parameter.** `ssk-locator` cannot depend on `ssk-gates::pch::Hypercube`
+   directly — `ssk-gates` already depends on `ssk-locator` transitively (via `ssk-bcik`), so
+   the reverse edge would cycle, the same constraint discovered in Phases 3-5. Even ignoring
+   the cycle, `Hypercube::check` needs a full `StitchCandidate`, which does not exist yet at
+   path-selection time (ch. 14.1's spine places `LocatorPath` *before* the second `PCH
+   Projection` stage). `select_path` is instead generic over a new, locally-defined
+   `PathProjectionCheck` trait; `ssk-gates` (or a caller above it) may implement it once a
+   facet-level PCH pre-check makes sense. No implementation is wired in yet — this codebase's
+   own call sites (tests) only ever pass the trivial `AlwaysPass`.
+2. **An explicit `start: &LocatorId` parameter.** The PDF's excerpted 4-parameter signature
+   names no origin or destination; a shortest-path search needs one. `select_path` returns the
+   nearest reachable locator that passes the injected check, which is the natural reading of
+   "select a path" absent a named target.
+
+Real egress adapters and health probing behind the pre-existing (already-scaffolded, unused)
+`async-edge` Cargo feature remain **out of scope** for this phase — the doc's own Section X
+already commits real network I/O exclusively to the Desktop track's `ssk-netcore`.
+
+Tested: `a_locator_already_passing_is_a_zero_hop_path`,
+`select_path_finds_the_shortest_edge_chain`, `expired_edges_are_never_traversed`,
+`a_hyperedge_unlocks_only_once_every_requirement_is_reached`, `unknown_start_locator_is_unavailable`.
 
 ---
 

@@ -368,6 +368,77 @@ pub struct LocatorFacet {
 }
 
 id_type!(SessionIntent);
+// One edge in the funnel-DAG (ch. 6.3's `EdgeId`).
+id_type!(EdgeId);
+
+/// How a `StitchEdge` transforms a crossing (ch. 6.3, verbatim variants) —
+/// a closed enum: "there is no opaque tunnel variant."
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum EdgeTransform {
+    Routing,
+    Framing,
+    TransportAdapt,
+    RelayHandoff,
+}
+
+/// Why an edge is present in the graph (ch. 6.3's `PolicyReason`). Phase 6
+/// placeholder — the excerpted PDF text names the field but not a closed
+/// variant set; a free-text reason stands in until a policy authoring
+/// surface needs a stricter taxonomy.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PolicyReason(pub String);
+
+/// One ordinary transition between two locators in the funnel-DAG (Master
+/// Spec Ω+1 ch. 6.3, verbatim field list). Every field is mandatory by
+/// construction — ch. 6.3's "edge explicitness" invariant ("an edge missing
+/// any of these fields fails deserialization validation") holds directly
+/// from this being a plain struct with no `Option`/`#[serde(default)]`
+/// fields: neither a struct literal nor `serde` deserialization can produce
+/// one with a field silently missing.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StitchEdge {
+    pub id: EdgeId,
+    pub src: LocatorId,
+    pub dst: LocatorId,
+    pub map: EdgeTransform,
+    pub lifetime: Ttl,
+    pub policy_reason: PolicyReason,
+    pub capability: Option<CapabilityId>,
+    pub boundary: BoundaryRef,
+    pub trace: TraceId,
+}
+
+/// A multi-dependency transition (ch. 6.3's `HyperEdge`) — this document's
+/// own minimal, disclosed elaboration: the excerpted PDF text names the
+/// type but does not enumerate its fields. Modeled as "all of `requires`
+/// must already be reachable before `produces` becomes reachable," the
+/// natural hypergraph generalization of `StitchEdge`'s single `src → dst`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HyperEdge {
+    pub id: EdgeId,
+    pub requires: Vec<LocatorId>,
+    pub produces: LocatorId,
+    pub lifetime: Ttl,
+    pub policy_reason: PolicyReason,
+    pub trace: TraceId,
+}
+
+/// The funnel-DAG itself (ch. 6.3, verbatim field list).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct LocatorGraph {
+    pub nodes: Vec<LocatorFacet>,
+    pub edges: Vec<StitchEdge>,
+    pub hyperedges: Vec<HyperEdge>,
+}
+
+/// The result of `select_path` (ch. 6.4) — this document's own disclosed
+/// elaboration: the ordered chain of edges actually selected, plus the
+/// final reachable locator.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LocatorPath {
+    pub edges: Vec<EdgeId>,
+    pub destination: LocatorId,
+}
 
 /// Whether a birefringent split's identity ray requires a replay witness
 /// (ch. 4.2). Phase 1 placeholder — the excerpted text names the field but
