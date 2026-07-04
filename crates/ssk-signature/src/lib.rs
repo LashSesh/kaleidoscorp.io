@@ -19,14 +19,16 @@
 //!
 //! ## Architectural role
 //!
-//! This is Tranche 1 of the port (surface → spectrum). It is the substrate the
-//! IMDF Mirror-Dome (`ssk-imdf` SignatureLab / SelfPerceptionAtlas) sits on, the
-//! payload-neutral surface the SSCL `CanonicalTrafficSurface` feeds, and an
-//! input to the FCHL-MPK field layer. Later tranches add the residue/gate,
-//! replay/reanalysis, target-profile/calibration, recursive iterator, profile
-//! corpus, and controlled-adapter layers, mapping the Chameleon gate/residue/
-//! replay onto the existing SSK `GateVector` / `ResidueRegister` /
-//! `DeterministicReplayEngine`.
+//! The crate ports the Chameleon kernel end to end: surface → spectrum
+//! (canonicalize/features/fingerprints/signature), the decision layer
+//! (residue/target/policy/operators/gate, bridged to `ssk_types`
+//! `ResidueRegister`/`GateOutcomeKind`), and the evaluation layer
+//! (replay/reanalysis and the [`ChameleonKernel`] that assembles a
+//! [`ChameleonEvent`]). It is the substrate the IMDF Mirror-Dome (`ssk-imdf`
+//! SignatureLab / SelfPerceptionAtlas) sits on, the payload-neutral surface the
+//! SSCL `CanonicalTrafficSurface` feeds, and an input to the FCHL-MPK field
+//! layer. Remaining tranches add target calibration, the recursive iterator,
+//! the profile corpus, and the controlled-adapter/observation layers.
 //!
 //! See `CHAMELEON_KERNEL_INTEGRATION_ASSESSMENT.md` for the full crosswalk and
 //! the digest-parity rationale (the kernel's own tests assert decisions,
@@ -38,9 +40,12 @@ pub mod canonical;
 pub mod features;
 pub mod fingerprints;
 pub mod gate;
+pub mod kernel;
 pub mod object;
 pub mod operators;
 pub mod policy;
+pub mod reanalysis;
+pub mod replay;
 pub mod residue;
 pub mod signature;
 pub mod target;
@@ -55,12 +60,17 @@ pub use fingerprints::{
     FingerprintLayerSpec, ProtocolFingerprint,
 };
 pub use gate::{GateBundle, GateDecision, GateVector};
+pub use kernel::{BatchAnalysisResult, ChameleonEvent, ChameleonKernel, DEFAULT_MODE};
 pub use object::SurfaceObject;
 pub use operators::{
     BucketTimingOperator, NormalizeTraceShapeOperator, RedactIdentifierFieldsOperator,
     SortFieldsOperator, TransformOperator, TransformResult,
 };
 pub use policy::{AuthorizationManifest, ChameleonPolicy, PolicyDecision, PolicyOutcome};
+pub use reanalysis::{reanalyze, ReanalysisResult, DEFAULT_MAX_SIGNATURE_DRIFT};
+pub use replay::{
+    build_replay_feedback, build_replay_manifest, ReplayFeedback, ReplayManifest, KERNEL_VERSION,
+};
 pub use residue::{surface_to_kind, Residue, ResidueDisposition, ResidueReport, ResidueSeverity};
 pub use signature::{
     Decision, SignatureComparisonReport, SignatureDimensionDelta, SpectralSignature,
