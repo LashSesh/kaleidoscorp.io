@@ -1281,7 +1281,7 @@ fn chaos_command(command: &ChaosCommand, json: bool) -> Result<(), AppError> {
             // Stub runner: mimics the gate heuristic used in faultscan tests.
             let run_intent =
                 |intent: ssk_types::ConnectionIntent| -> (GateOutcomeKind, Vec<ssk_types::BoundaryResidue>) {
-                    if !intent.core.signature_ok
+                    if !intent.core.signature.is_present()
                         || !intent.capability_witness
                         || intent.ttl_epoch == 0
                     {

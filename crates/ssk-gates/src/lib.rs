@@ -58,10 +58,10 @@ impl Gate for BasicGate {
 
     fn evaluate(&self, sc: &StitchCandidate) -> GateVerdict {
         match self.id {
-            GateId::Core if !sc.core.signature_ok => {
+            GateId::Core if !sc.core.signature.is_present() => {
                 reject(self.id, ResidueKind::Identity, "core signature invalid")
             }
-            GateId::Mirror if sc.facet.core_id != sc.core.id => {
+            GateId::Mirror if sc.facet.core != sc.core.id => {
                 reject(self.id, ResidueKind::Identity, "facet not recoverable")
             }
             GateId::Locator if !sc.locator.trusted || sc.locator.risk_score > 70 => {
@@ -186,15 +186,25 @@ mod tests {
             run: RunId::new("r1"),
             core: CoreNode {
                 id: CoreId::new("c1"),
-                canonical_name: "n".into(),
+                canonical: CanonicalForm("n".into()),
+                signature: CoreSignature(vec![1, 2, 3]),
                 policy_root: PolicyId::new("p1"),
-                signature_ok: true,
+                replay_root: ReplayRoot::new("rr"),
+                audit_root: AuditRoot::new("ar"),
+                closure: ClosureState::Closed,
             },
             facet: MirrorFacet {
-                facet_id: Id::new("f1"),
-                core_id: CoreId::new("c1"),
+                id: FacetId::of(&"f1", HashAlg::Blake3).expect("hash"),
+                core: CoreId::new("c1"),
+                phase: PhaseVector::zero(),
+                orientation: Orientation::Forward,
                 sector: Sector::Identity,
-                replay_root: ReplayRoot::new("rr"),
+                key_ctx: KeyContextRef::new("kc"),
+                session: SessionId::new("sess"),
+                policy: PolicyId::new("p1"),
+                trace: TraceId::new("tr"),
+                boundary: BoundaryRef::new("bd"),
+                residue: ResidueRef::new("rs"),
             },
             locator: Locator {
                 id: LocatorId::new("l1"),

@@ -204,16 +204,19 @@ pub fn sample_intent(valid: bool) -> ConnectionIntent {
         run: ssk_types::RunId::new(if valid { "run-valid" } else { "run-invalid" }),
         core: ssk_types::CoreNode {
             id: ssk_types::CoreId::new("core-1"),
-            canonical_name: "core".into(),
+            canonical: ssk_types::CanonicalForm("core".into()),
+            signature: ssk_types::CoreSignature(vec![1, 2, 3]),
             policy_root: ssk_types::PolicyId::new("policy-1"),
-            signature_ok: true,
+            replay_root: ssk_types::ReplayRoot::new("replay:core-1"),
+            audit_root: ssk_types::AuditRoot::new("audit:core-1"),
+            closure: ssk_types::ClosureState::Closed,
         },
         target_locator: ssk_types::LocatorId::new("local"),
         capability_witness: valid,
         ttl_epoch: if valid { 1 } else { 0 },
     };
     if !valid {
-        intent.core.signature_ok = false;
+        intent.core.signature = ssk_types::CoreSignature(vec![]);
     }
     intent
 }

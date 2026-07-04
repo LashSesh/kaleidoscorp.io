@@ -81,7 +81,7 @@ impl PlaybookReport {
 pub fn inject_fault(mut intent: ConnectionIntent, fault: FaultKind) -> ConnectionIntent {
     match fault {
         FaultKind::SignatureCorruption => {
-            intent.core.signature_ok = false;
+            intent.core.signature = ssk_types::CoreSignature(vec![]);
         }
         FaultKind::CapabilityWithdrawal => {
             intent.capability_witness = false;
@@ -95,13 +95,13 @@ pub fn inject_fault(mut intent: ConnectionIntent, fault: FaultKind) -> Connectio
         }
         FaultKind::AttestationFailure => {
             // Invalidate both signature and witness simultaneously.
-            intent.core.signature_ok = false;
+            intent.core.signature = ssk_types::CoreSignature(vec![]);
             intent.capability_witness = false;
         }
         FaultKind::LocatorUntrust => {
             // Nothing to mutate on the intent itself; the locator pool is controlled by the
             // drill runner.  Mark via signature corruption as a proxy.
-            intent.core.signature_ok = false;
+            intent.core.signature = ssk_types::CoreSignature(vec![]);
         }
     }
     intent
@@ -189,9 +189,12 @@ mod tests {
             run: RunId::new("drill-clean"),
             core: ssk_types::CoreNode {
                 id: ssk_types::CoreId::new("c1"),
-                canonical_name: "core".into(),
+                canonical: ssk_types::CanonicalForm("core".into()),
+                signature: ssk_types::CoreSignature(vec![1, 2, 3]),
                 policy_root: ssk_types::PolicyId::new("p1"),
-                signature_ok: true,
+                replay_root: ssk_types::ReplayRoot::new("replay:c1"),
+                audit_root: ssk_types::AuditRoot::new("audit:c1"),
+                closure: ssk_types::ClosureState::Closed,
             },
             target_locator: ssk_types::LocatorId::new("local"),
             capability_witness: true,
@@ -203,7 +206,7 @@ mod tests {
         // Simple heuristic matching the real gate logic.
         // ReplayDrift is detected by the "-drifted" marker injected by inject_fault.
         let replay_drift = intent.run.0 .0.ends_with("-drifted");
-        if !intent.core.signature_ok
+        if !intent.core.signature.is_present()
             || !intent.capability_witness
             || intent.ttl_epoch == 0
             || replay_drift

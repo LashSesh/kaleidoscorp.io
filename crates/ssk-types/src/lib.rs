@@ -40,6 +40,11 @@ id_type!(ResidueId);
 id_type!(ReplayRoot);
 id_type!(LocatorId);
 id_type!(PolicyId);
+id_type!(AuditRoot);
+id_type!(KeyContextRef);
+id_type!(SessionId);
+id_type!(BoundaryRef);
+id_type!(ResidueRef);
 
 /// Content-addressed hash value (Master Spec Ω+1 ch. 3.1). Backed by a real
 /// 32-byte digest rather than an opaque string, so `content_id!`-derived ids
@@ -131,20 +136,95 @@ pub enum HashAlg {
     Sha256,
 }
 
+// `FacetId` is the first id migrated onto `content_id!` (Master Spec Ω+1
+// ch. 3.1): `MirrorOrbit::derive` (ssk-core) now computes it from the
+// facet's canonical inputs rather than accepting a caller-chosen string.
+content_id!(FacetId);
+
+/// Seed distinguishing one `MirrorOrbit` from another derived from the same
+/// core (ch. 4.1). Feeds into `FacetId`'s content-addressed derivation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct OrbitSeed(pub u64);
+
+impl OrbitSeed {
+    /// Deterministic default seed for a core's orbit, derived from the
+    /// core's own id — so every orbit constructed for the same core (e.g. at
+    /// derive time and later at recovery time) uses the same seed without
+    /// the caller needing to persist and thread one through separately.
+    #[must_use]
+    pub fn for_core(core_id: &CoreId) -> Self {
+        let digest = digest_of(core_id, HashAlg::Blake3).expect("a CoreId always hashes");
+        let mut buf = [0u8; 8];
+        buf.copy_from_slice(&digest.0[..8]);
+        Self(u64::from_le_bytes(buf))
+    }
+}
+
+/// The core's canonical serialized form (ch. 4.1: `xc = Can(xc)` must hold).
+/// Phase 1 placeholder: stores the form as an opaque string (continuing the
+/// old `canonical_name` field's role under the spec's field name); the
+/// fixed-point canonicalization invariant itself is enforced once
+/// `Connection::canonicalize` (`ssk-core::connection`) gets a real body.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CanonicalForm(pub String);
+
+/// Placeholder for the real cryptographic signature over the canonical form
+/// (ch. 4.1). Phase 1 treats "non-empty bytes" as "signed" — a real check on
+/// real field content, not a bare bool — and defers verification against a
+/// `SignatureProvider` to the capability/gate work (Section L, Phase 3).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CoreSignature(pub Vec<u8>);
+
+impl CoreSignature {
+    #[must_use]
+    pub fn is_present(&self) -> bool {
+        !self.0.is_empty()
+    }
+}
+
+/// Whether this core's identity/locator crossing story is open or closed
+/// (ch. 4.1's `closure` field). Phase 1 placeholder — real semantics land
+/// once BCIK's real crossing kernel (Phase 2) can report closure per core.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ClosureState {
+    Open,
+    Closed,
+}
+
+/// A mirror facet's orientation relative to its core (ch. 4.1). Phase 1
+/// placeholder — the PDF names the field but does not give its variants in
+/// the excerpted text; `Forward`/`Reverse` is this document's own minimal,
+/// disclosed design choice pending a richer definition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Orientation {
+    Forward,
+    Reverse,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CoreNode {
     pub id: CoreId,
-    pub canonical_name: String,
+    pub canonical: CanonicalForm,
+    pub signature: CoreSignature,
     pub policy_root: PolicyId,
-    pub signature_ok: bool,
+    pub replay_root: ReplayRoot,
+    pub audit_root: AuditRoot,
+    pub closure: ClosureState,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MirrorFacet {
-    pub facet_id: Id,
-    pub core_id: CoreId,
+    pub id: FacetId,
+    pub core: CoreId,
+    pub phase: PhaseVector,
+    pub orientation: Orientation,
     pub sector: Sector,
-    pub replay_root: ReplayRoot,
+    pub key_ctx: KeyContextRef,
+    pub session: SessionId,
+    pub policy: PolicyId,
+    pub trace: TraceId,
+    pub boundary: BoundaryRef,
+    pub residue: ResidueRef,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -542,9 +622,12 @@ mod tests {
     fn canonical_hash_is_stable() {
         let c = CoreNode {
             id: CoreId::new("c1"),
-            canonical_name: "core".into(),
+            canonical: CanonicalForm("core".into()),
+            signature: CoreSignature(alloc::vec![1, 2, 3]),
             policy_root: PolicyId::new("p1"),
-            signature_ok: true,
+            replay_root: ReplayRoot::new("replay:c1"),
+            audit_root: AuditRoot::new("audit:c1"),
+            closure: ClosureState::Closed,
         };
         let d1 = digest_of(&c, HashAlg::Blake3).expect("hash must work");
         let d2 = digest_of(&c, HashAlg::Blake3).expect("hash must work");
