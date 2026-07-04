@@ -25,13 +25,19 @@
 //! build on this base.
 
 pub mod aperture;
+pub mod closure;
 pub mod error;
 pub mod observer;
+pub mod qlogic;
 pub mod self_anchor;
+pub mod wavefront;
 
 pub use aperture::{Aperture, ApertureSession, FocusResult, Reading};
+pub use closure::{ClosureState, FourPiClosure, OrientationPass};
 pub use error::ImdfError;
 pub use observer::{
     Blindspot, Lens, ObserverId, ObserverModel, TrustLevel, Vantage, SELF_OBSERVATION_USE,
 };
+pub use qlogic::{QAxis, QLogicGate, QLogicInput, QLogicThresholds, QLogicVector, QOutcome};
 pub use self_anchor::{BcikCrossing, DomeLocator, LocatorAddressId, SelfAnchor, SelfAnchorId};
+pub use wavefront::{BirefringentSplit, Parallax, Wavefront};
