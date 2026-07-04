@@ -107,12 +107,16 @@ BCIK crossing → twelve-gate vector → conditional tensor append → replay ma
 **Honest conformance ceiling at the time of writing: SSKΩ-2, bordering SSKΩ-3.** The typed model,
 deterministic core, and mirror-facet orbit with a locator pool existed (SSKΩ-0/1/2's
 requirements), but SSKΩ-2's own "locator-reality checks" were not real, and SSKΩ-3's requirement
-that "every crossing carries seam, boundary, gate, trace, replay" was not met. **Update — Phase 1
-complete:** SSKΩ-1/2 are now met to the letter (`HypertoroidalScheduler`'s real `SchedulerMode`/
-`visible()`; content-addressed `MirrorOrbit`; real `LocatorPool::claims_external_plurality()`).
-The remaining gap to SSKΩ-3 is now narrowly the BCIK crossing kernel itself (Section J, Phase 2)
-— the crossing still carries none of the PDF's `BcikStitch` fields. This document designs the
-closing architecture for SSKΩ-3 through SSKΩ-9.
+that "every crossing carries seam, boundary, gate, trace, replay" was not met. **Update — Phases 1
+and 2 complete:** SSKΩ-1/2 are now met to the letter (`HypertoroidalScheduler`'s real
+`SchedulerMode`/`visible()`; content-addressed `MirrorOrbit`; real
+`LocatorPool::claims_external_plurality()`). SSKΩ-3's crossing now genuinely carries seam
+(`SeamWitness`, `HashProvider`-backed), boundary (`BoundaryRecord`), trace, and replay
+(`BcikStitch`'s full field set, Section J) — the one field still not populated is `gate_report`
+(always `None` today), since real per-gate evidence generation is Phase 3's job (Section K). The
+remaining gap to full SSKΩ-3/4 is now the gate system overhaul and the Projective Connection
+Hypercube (Sections K and I), both Phase 3. This document designs the closing architecture for
+SSKΩ-3 through SSKΩ-9.
 
 ---
 
@@ -195,7 +199,7 @@ if all tests for levels 0..*k* pass"):
 | SSKΩ-0 | Typed model: `ssk-types`/`ssk-core` compile; Core, Identity Plane, Locator Plane exist and are separately typed. | ✅ met |
 | SSKΩ-1 | Deterministic core + scheduler: fixed-point phase, deterministic tick, replayable phase selection. | ✅ met |
 | SSKΩ-2 | Mirror-facet orbit + locator pool with real typing and locator-reality checks. | ✅ met (Phase 1: content-addressed `MirrorOrbit`, real `claims_external_plurality()`) |
-| SSKΩ-3 | BCIK `StitchCandidate` pipeline: every crossing carries seam, boundary, gate, trace, replay. | ❌ crossing carries none of these as real objects — two hardcoded booleans |
+| SSKΩ-3 | BCIK `StitchCandidate` pipeline: every crossing carries seam, boundary, gate, trace, replay. | ⚠️ seam/boundary/trace/replay are real (Phase 2); `gate_report` is still always `None` — real per-gate evidence is Phase 3 |
 | SSKΩ-4 | Gate vector + boundary residues: twelve gates, fail-closed, typed residues, PCH projection checks. | ❌ twelve gates exist but are thin; no PCH |
 | SSKΩ-5 | Persistent Stitch Tensor + audit: hash-chained append, storage backends, tensor-preservation theorem tested. | ⚠️ hash-chained append + storage backends are real; the theorem is provable only informally, not as a typestate guarantee |
 | SSKΩ-6 | Concave Reanalysis Focus + replay: class reconstruction, replay determinism harness green. | ❌ absent |
