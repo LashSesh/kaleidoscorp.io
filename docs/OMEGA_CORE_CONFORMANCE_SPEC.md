@@ -235,7 +235,7 @@ if all tests for levels 0..*k* pass"):
 | SSKΩ-6 | Concave Reanalysis Focus + replay: class reconstruction, replay determinism harness green. | ✅ met — real `FocusEngine`/`FocusReport` and a genuinely re-executing `ReplayEngine` (Phase 5), and `run_to_outcome` now drives the full pipeline (BCIK crossing → `StitchTensor` materialization → `FiberExecutor` response capture → `FocusEngine`) to a real 3-variant `RunOutcome`, tested deterministic and fail-closed (hardening iteration A) |
 | SSKΩ-7 | Locator pool + relay-fabric adapters: real egress adapters behind the async edge, health probing. | ⚠️ funnel-DAG (`StitchEdge`/`LocatorGraph`/`HyperEdge`/`select_path`, Phase 6) landed and tested; real egress adapters/health probing behind the `async-edge` feature remain out of scope (Section X — real network I/O stays the Desktop track's `ssk-netcore` responsibility) |
 | SSKΩ-8 | Full simulation + conformance testbed: privacy metric tests, defensive adversary sim, all vectors. | ⚠️ the `FaultKind`/`Faultscan` detection taxonomy (Section P) landed and is tested (Phase 7); concrete `LinkabilityEstimator` metric tests (locator reuse, timing concentration, cross-facet correlation, residue-visibility completeness — PDF ch. 18.4) and the full deterministic test-vector/property-obligation suite (Section W) remain undone |
-| SSKΩ-9 | Production-hardened runtime profile: dissolution/TTL sweeps, ledger verification, deployment audit, documented limits. | ⚠️ real `DissolutionManager::{is_expired, sweep}` (Phase 8) and the full 12-section config schema (Phase 8) both landed and tested; not yet done: wiring `sweep`'s output into real residue finalization, and a second real `LedgerBackend`-style hardening pass beyond the existing hash-chain `verify()` |
+| SSKΩ-9 | Production-hardened runtime profile: dissolution/TTL sweeps, ledger verification, deployment audit, documented limits. | ✅ met — `DissolutionManager::{is_expired, sweep, finalize_expired}` (real TTL sweep + typed residue finalization, hardening iter. D), the full 12-section validated config schema (Phase 8), and the existing hash-chained ledger `verify()`, all tested |
 
 **Target of this document: close SSKΩ-3 through SSKΩ-9**, in the phase order of Section V.
 
@@ -1118,11 +1118,13 @@ computes genuine epoch arithmetic (`current_epoch - entry.epoch >= entry.ttl`) r
 bare `ttl_epoch != 0` presence check `DissolutionGate` still uses elsewhere (a different,
 narrower, gate-time concern), and `sweep` scans a real `StorageBackend`'s entries for every
 expired one. Tested: `is_expired_true_once_current_epoch_reaches_accepted_epoch_plus_ttl`,
-`sweep_returns_only_expired_entries`, `sweep_over_an_empty_backend_finds_nothing`. **Not yet
-done:** actually finalizing residues for swept entries (`finalize_residues_on_expiry`) — `sweep`
-returns the expired ids; emitting a `BoundaryResidue` per expired entry into a `ResidueRegister`
-is straightforward future work once a caller owns both the tensor and a register instance at
-the same call site (today nothing in this workspace does).
+`sweep_returns_only_expired_entries`, `sweep_over_an_empty_backend_finds_nothing`. **Update —
+hardening iteration D: residue finalization done.** `DissolutionManager::finalize_expired` sweeps
+and emits a typed `Timing` `BoundaryResidue` (carrying an open obligation) per expired entry into
+a `ResidueRegister` — so an expiry is a visible, hash-chained, auditable event, never a silent
+drop; the append-only tensor itself is not mutated, dissolution is *recorded*. Tested:
+`finalize_expired_emits_a_timing_residue_per_expired_entry` (one `Timing` residue with a live open
+obligation for a stale entry, none for a fresh one).
 
 ---
 

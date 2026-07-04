@@ -3,8 +3,9 @@
 use parking_lot::RwLock;
 use serde::{de::DeserializeOwned, Serialize};
 use ssk_types::{
-    digest_of, Accepted, BcikStitch, Digest, EpochId, FaultKind, GateReport, HashAlg, RunId,
-    StitchId, StitchTensorEntry, TensorEntry,
+    digest_of, Accepted, BcikStitch, BoundaryResidue, Digest, EpochId, FaultKind, GateId,
+    GateReport, HashAlg, ResidueId, ResidueKind, ResidueRegister, RunId, Severity, StitchId,
+    StitchTensorEntry, TensorEntry,
 };
 use std::collections::HashMap;
 use std::marker::PhantomData;
@@ -219,6 +220,40 @@ impl DissolutionManager {
             .filter(|e| Self::is_expired(e, current_epoch))
             .map(|e| e.id)
             .collect())
+    }
+
+    /// Sweeps expired entries and **finalizes** each into a
+    /// `ResidueRegister` (ch. 21's `dissolution.finalize_residues_on_expiry`)
+    /// — every dissolved stitch leaves a typed, hash-chained `Timing` residue
+    /// carrying an open obligation, so an expiry is a visible, auditable event
+    /// rather than a silent drop (the tensor itself is append-only and is not
+    /// mutated; dissolution is recorded, not erased). Returns the emitted
+    /// residue ids, parallel to the swept stitch ids.
+    pub fn finalize_expired(
+        backend: &impl StorageBackend,
+        current_epoch: EpochId,
+        register: &mut ResidueRegister,
+    ) -> Result<Vec<ResidueId>, TensorError> {
+        let mut emitted = Vec::new();
+        for entry in backend.entries()? {
+            if !Self::is_expired(&entry, current_epoch) {
+                continue;
+            }
+            let residue = BoundaryResidue::new(
+                ResidueId::new(format!("dissolution:{}", entry.id.0 .0)),
+                ResidueKind::Timing,
+                GateId::Dissolution,
+                format!(
+                    "stitch {} expired at epoch {} (accepted epoch {}, ttl {})",
+                    entry.id.0 .0, current_epoch.0, entry.epoch.0, entry.ttl.0
+                ),
+                Severity::Low,
+                entry.stitch.trace.clone(),
+                true,
+            );
+            emitted.push(register.emit(residue));
+        }
+        Ok(emitted)
     }
 }
 
@@ -480,6 +515,24 @@ mod tests {
         let backend: StitchMemoryBackend = GenericMemoryBackend::new();
         let expired = DissolutionManager::sweep(&backend, EpochId(1000)).expect("sweep");
         assert!(expired.is_empty());
+    }
+
+    #[test]
+    fn finalize_expired_emits_a_timing_residue_per_expired_entry() {
+        let backend: StitchMemoryBackend = GenericMemoryBackend::new();
+        backend
+            .append(entry_with("fresh", 10, 100))
+            .expect("append");
+        backend.append(entry_with("stale", 0, 5)).expect("append");
+
+        let mut register = ResidueRegister::new();
+        let emitted = DissolutionManager::finalize_expired(&backend, EpochId(10), &mut register)
+            .expect("finalize");
+
+        assert_eq!(emitted.len(), 1);
+        assert_eq!(register.entries().len(), 1);
+        assert_eq!(register.entries()[0].kind, ResidueKind::Timing);
+        assert_eq!(register.open_obligations().count(), 1);
     }
 
     #[test]
