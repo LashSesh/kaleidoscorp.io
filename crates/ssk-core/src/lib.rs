@@ -203,7 +203,7 @@ mod tests {
             run: ssk_types::RunId::new("run-1"),
             core: core.clone(),
             target_locator: ssk_types::LocatorId::new("local"),
-            capability_witness: true,
+            capability: None,
             ttl_epoch: 1,
         };
         let (identity, locator) =

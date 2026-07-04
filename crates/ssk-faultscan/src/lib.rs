@@ -84,7 +84,7 @@ pub fn inject_fault(mut intent: ConnectionIntent, fault: FaultKind) -> Connectio
             intent.core.signature = ssk_types::CoreSignature(vec![]);
         }
         FaultKind::CapabilityWithdrawal => {
-            intent.capability_witness = false;
+            intent.capability = None;
         }
         FaultKind::TtlExpiry => {
             intent.ttl_epoch = 0;
@@ -96,7 +96,7 @@ pub fn inject_fault(mut intent: ConnectionIntent, fault: FaultKind) -> Connectio
         FaultKind::AttestationFailure => {
             // Invalidate both signature and witness simultaneously.
             intent.core.signature = ssk_types::CoreSignature(vec![]);
-            intent.capability_witness = false;
+            intent.capability = None;
         }
         FaultKind::LocatorUntrust => {
             // Nothing to mutate on the intent itself; the locator pool is controlled by the
@@ -197,7 +197,21 @@ mod tests {
                 closure: ssk_types::ClosureState::Closed,
             },
             target_locator: ssk_types::LocatorId::new("local"),
-            capability_witness: true,
+            capability: Some(ssk_types::CapabilityWitness {
+                id: ssk_types::CapabilityId::of(&"drill-capability", ssk_types::HashAlg::Blake3)
+                    .expect("hash"),
+                claim: ssk_types::CapabilityClaim("use-local-overlay".into()),
+                scope: ssk_types::Scope {
+                    action: "connect".into(),
+                    facet_class: ssk_types::ObjectKind::Core,
+                },
+                issuer: ssk_types::IssuerRef::new("issuer-1"),
+                subject_class: ssk_types::SubjectClass::Core,
+                epoch: ssk_types::EpochId(0),
+                expiry: ssk_types::Ttl(100),
+                proof: ssk_types::ProofBytes(vec![1, 2, 3]),
+                trace: ssk_types::TraceId::new("cap-trace"),
+            }),
             ttl_epoch: 1,
         }
     }
@@ -207,7 +221,7 @@ mod tests {
         // ReplayDrift is detected by the "-drifted" marker injected by inject_fault.
         let replay_drift = intent.run.0 .0.ends_with("-drifted");
         if !intent.core.signature.is_present()
-            || !intent.capability_witness
+            || intent.capability.is_none()
             || intent.ttl_epoch == 0
             || replay_drift
         {

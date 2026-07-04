@@ -204,6 +204,25 @@ impl<'a, L: LedgerBackend> Runtime<'a, L> {
     }
 }
 
+#[must_use]
+pub fn sample_capability_witness() -> ssk_types::CapabilityWitness {
+    ssk_types::CapabilityWitness {
+        id: ssk_types::CapabilityId::of(&"sample-capability", ssk_types::HashAlg::Blake3)
+            .expect("hash"),
+        claim: ssk_types::CapabilityClaim("use-local-overlay".into()),
+        scope: ssk_types::Scope {
+            action: "connect".into(),
+            facet_class: ssk_types::ObjectKind::Core,
+        },
+        issuer: ssk_types::IssuerRef::new("issuer-1"),
+        subject_class: ssk_types::SubjectClass::Core,
+        epoch: ssk_types::EpochId(0),
+        expiry: ssk_types::Ttl(100),
+        proof: ssk_types::ProofBytes(vec![1, 2, 3]),
+        trace: ssk_types::TraceId::new("cap-trace"),
+    }
+}
+
 pub fn sample_intent(valid: bool) -> ConnectionIntent {
     let mut intent = ConnectionIntent {
         run: ssk_types::RunId::new(if valid { "run-valid" } else { "run-invalid" }),
@@ -217,7 +236,7 @@ pub fn sample_intent(valid: bool) -> ConnectionIntent {
             closure: ssk_types::ClosureState::Closed,
         },
         target_locator: ssk_types::LocatorId::new("local"),
-        capability_witness: valid,
+        capability: valid.then(sample_capability_witness),
         ttl_epoch: if valid { 1 } else { 0 },
     };
     if !valid {

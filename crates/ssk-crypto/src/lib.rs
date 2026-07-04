@@ -45,20 +45,73 @@ pub trait AeadProvider {
     fn open(&self, ciphertext: &[u8], aad: &[u8]) -> Result<Vec<u8>, String>;
 }
 
-pub trait CapabilityWitnessProvider {
-    fn issue(&self, subject: &[u8]) -> Result<Vec<u8>, String>;
-    fn validate(&self, witness: &[u8]) -> bool;
+/// Which capability-witness scheme a `CapabilityWitnessProvider` implements
+/// (Master Spec Ω+1 ch. 5.1's `WitnessKind`: "Signature | Token | ZkStyle |
+/// PolicyCert"). Only `Signature` gets a real implementation in this phase —
+/// see `docs/OMEGA_CORE_CONFORMANCE_SPEC.md` Section X for why the other
+/// three stay deliberately unimplemented.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WitnessKind {
+    Signature,
+    Token,
+    ZkStyle,
+    PolicyCert,
 }
 
-/// Real ed25519 `SignatureProvider` and ChaCha20-Poly1305 `AeadProvider`
-/// implementations, gated behind the `crypto` feature. `KeyAgreementProvider`
-/// (x25519) and `CapabilityWitnessProvider` are intentionally not implemented
-/// here yet — no acceptance criterion in the current implementation phases
-/// requires them.
+/// Everything a caller must supply beyond the claim itself to issue a
+/// witness (ch. 5.2's `CapabilityWitness` fields not derivable from the
+/// claim alone). The PDF's own `issue(&self, claim, subject)` signature is
+/// underspecified for a real implementation — bundling the rest into a
+/// request struct is this document's own necessary elaboration.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CapabilityRequest {
+    pub claim: ssk_types::CapabilityClaim,
+    pub scope: ssk_types::Scope,
+    pub subject_class: ssk_types::SubjectClass,
+    pub epoch: ssk_types::EpochId,
+    pub expiry: ssk_types::Ttl,
+}
+
+/// Context a verifier checks a witness against: the current epoch (for
+/// expiry) and the scope the caller actually needs (ch. 5.2's proof-scope
+/// axiom — a witness proves only its declared claim, nothing outside its
+/// scope/epoch).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifyCtx {
+    pub epoch: ssk_types::EpochId,
+    pub expected_scope: ssk_types::Scope,
+}
+
+/// Outcome of verifying a `CapabilityWitness` (ch. 5.2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CapabilityVerdict {
+    Valid,
+    Expired,
+    ScopeMismatch,
+    InvalidProof,
+}
+
+/// Attests that an action/stitch is admissible under policy WITHOUT
+/// exposing the core identity as a locator address (Master Spec Ω+1 ch. 5.1,
+/// verbatim doc comment).
+pub trait CapabilityWitnessProvider: Send + Sync {
+    fn issue(&self, req: &CapabilityRequest) -> Result<ssk_types::CapabilityWitness, String>;
+    fn verify(&self, w: &ssk_types::CapabilityWitness, ctx: &VerifyCtx) -> CapabilityVerdict;
+    fn kind(&self) -> WitnessKind;
+}
+
+/// Real ed25519 `SignatureProvider`, ChaCha20-Poly1305 `AeadProvider`, x25519
+/// `KeyAgreementProvider`, and ed25519-backed `CapabilityWitnessProvider`
+/// implementations, gated behind the `crypto` feature. `WitnessKind::Token`/
+/// `ZkStyle`/`PolicyCert` remain deliberately unimplemented (spec Section X).
 #[cfg(feature = "crypto")]
 mod ed25519_impl {
-    use super::SignatureProvider;
+    use super::{
+        CapabilityRequest, CapabilityVerdict, CapabilityWitnessProvider, SignatureProvider,
+        VerifyCtx, WitnessKind,
+    };
     use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
+    use ssk_types::{CapabilityId, CapabilityWitness, HashAlg, ProofBytes, TraceId};
 
     /// An ed25519 keypair capable of both signing and verifying.
     pub struct Ed25519KeyPair {
@@ -136,10 +189,110 @@ mod ed25519_impl {
                 .is_ok()
         }
     }
+
+    /// `CapabilityWitnessProvider::WitnessKind::Signature` built directly on
+    /// `Ed25519KeyPair` — issuing signs the claim's canonical bytes; verifying
+    /// checks the signature plus scope/epoch/expiry locally (ch. 5.2's proof
+    /// scope: a witness proves only its declared claim, nothing more).
+    pub struct Ed25519CapabilityWitnessProvider {
+        keypair: Ed25519KeyPair,
+        issuer: ssk_types::IssuerRef,
+    }
+
+    impl Ed25519CapabilityWitnessProvider {
+        #[must_use]
+        pub fn new(keypair: Ed25519KeyPair, issuer: ssk_types::IssuerRef) -> Self {
+            Self { keypair, issuer }
+        }
+    }
+
+    impl CapabilityWitnessProvider for Ed25519CapabilityWitnessProvider {
+        fn issue(&self, req: &CapabilityRequest) -> Result<CapabilityWitness, String> {
+            let claim_bytes = ssk_types::canonical_bytes(&req.claim).map_err(|e| e.to_string())?;
+            let proof = self.keypair.sign(&claim_bytes)?;
+            let id = CapabilityId::of(&(req.claim.clone(), req.epoch), HashAlg::Blake3)
+                .map_err(|e| e.to_string())?;
+            Ok(CapabilityWitness {
+                id,
+                claim: req.claim.clone(),
+                scope: req.scope.clone(),
+                issuer: self.issuer.clone(),
+                subject_class: req.subject_class,
+                epoch: req.epoch,
+                expiry: req.expiry,
+                proof: ProofBytes(proof),
+                trace: TraceId::new(format!("capability-issue:{}", req.epoch.0)),
+            })
+        }
+
+        fn verify(&self, w: &CapabilityWitness, ctx: &VerifyCtx) -> CapabilityVerdict {
+            if w.scope != ctx.expected_scope {
+                return CapabilityVerdict::ScopeMismatch;
+            }
+            if ctx.epoch.0 > w.epoch.0 + w.expiry.0 {
+                return CapabilityVerdict::Expired;
+            }
+            let Ok(claim_bytes) = ssk_types::canonical_bytes(&w.claim) else {
+                return CapabilityVerdict::InvalidProof;
+            };
+            if self.keypair.verify(&claim_bytes, &w.proof.0) {
+                CapabilityVerdict::Valid
+            } else {
+                CapabilityVerdict::InvalidProof
+            }
+        }
+
+        fn kind(&self) -> WitnessKind {
+            WitnessKind::Signature
+        }
+    }
 }
 
 #[cfg(feature = "crypto")]
-pub use ed25519_impl::{Ed25519KeyPair, Ed25519Verifier};
+pub use ed25519_impl::{Ed25519CapabilityWitnessProvider, Ed25519KeyPair, Ed25519Verifier};
+
+#[cfg(feature = "crypto")]
+mod x25519_impl {
+    use super::KeyAgreementProvider;
+    use x25519_dalek::{PublicKey, StaticSecret};
+
+    /// x25519 `KeyAgreementProvider`. Uses a `StaticSecret` (reusable across
+    /// calls) rather than `EphemeralSecret` (which consumes itself on first
+    /// use), since a real keypair needs to derive shared keys with more than
+    /// one peer over its lifetime.
+    pub struct X25519KeyPair {
+        secret: StaticSecret,
+    }
+
+    impl X25519KeyPair {
+        /// Generate a fresh keypair from OS randomness.
+        #[must_use]
+        pub fn generate() -> Self {
+            Self {
+                secret: StaticSecret::random_from_rng(rand::rngs::OsRng),
+            }
+        }
+
+        /// The 32-byte public key, safe to share with a peer for key agreement.
+        #[must_use]
+        pub fn public_key_bytes(&self) -> [u8; 32] {
+            PublicKey::from(&self.secret).to_bytes()
+        }
+    }
+
+    impl KeyAgreementProvider for X25519KeyPair {
+        fn derive_shared_key(&self, peer: &[u8]) -> Result<Vec<u8>, String> {
+            let peer_bytes: [u8; 32] = peer
+                .try_into()
+                .map_err(|_| "peer public key must be 32 bytes".to_string())?;
+            let peer_public = PublicKey::from(peer_bytes);
+            Ok(self.secret.diffie_hellman(&peer_public).as_bytes().to_vec())
+        }
+    }
+}
+
+#[cfg(feature = "crypto")]
+pub use x25519_impl::X25519KeyPair;
 
 #[cfg(feature = "crypto")]
 mod chacha_impl {

@@ -13,7 +13,7 @@ pub fn from_intent(
         core: intent.core,
         facet,
         locator,
-        capability_witness: intent.capability_witness,
+        capability: intent.capability,
         seam_ok: true,
         boundary_complete: true,
         replay_ready: true,

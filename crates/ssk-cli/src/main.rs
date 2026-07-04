@@ -1282,7 +1282,7 @@ fn chaos_command(command: &ChaosCommand, json: bool) -> Result<(), AppError> {
             let run_intent =
                 |intent: ssk_types::ConnectionIntent| -> (GateOutcomeKind, Vec<ssk_types::BoundaryResidue>) {
                     if !intent.core.signature.is_present()
-                        || !intent.capability_witness
+                        || intent.capability.is_none()
                         || intent.ttl_epoch == 0
                     {
                         let residue = ssk_types::BoundaryResidue {

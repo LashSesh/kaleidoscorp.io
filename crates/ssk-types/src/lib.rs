@@ -412,12 +412,88 @@ pub struct LocatorRay {
     pub cost_budget: CostBudget,
 }
 
+// `CapabilityId` is content-addressed (Master Spec Ω+1 ch. 3.1/5.2): a
+// capability witness has real canonical content (claim/scope/issuer/...) to
+// derive an id from, unlike the still-opaque ids left untouched in Phase 1.
+content_id!(CapabilityId);
+
+id_type!(IssuerRef);
+id_type!(ReplayRef);
+
+/// A capability's declared claim, e.g. "may use locator class Relay in
+/// epoch E" (ch. 5.2). Phase 2 placeholder: an opaque string; a richer
+/// structured claim grammar is not required by any current acceptance
+/// criterion.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CapabilityClaim(pub String);
+
+/// Action + facet-class binding a capability witness is scoped to (ch. 5.2).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Scope {
+    pub action: String,
+    pub facet_class: ObjectKind,
+}
+
+/// Which kind of subject a capability witness is bound to (ch. 5.2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SubjectClass {
+    Core,
+    Facet,
+    Locator,
+}
+
+/// Opaque proof bytes, validated only by the issuing provider (ch. 5.2).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProofBytes(pub Vec<u8>);
+
+/// Scoped evidence that a facet, action, locator use or stitch event is
+/// admissible — not identity, and proves only its declared claim
+/// (Master Spec Ω+1 ch. 5.2, verbatim field list).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CapabilityWitness {
+    pub id: CapabilityId,
+    pub claim: CapabilityClaim,
+    pub scope: Scope,
+    pub issuer: IssuerRef,
+    pub subject_class: SubjectClass,
+    pub epoch: EpochId,
+    pub expiry: Ttl,
+    pub proof: ProofBytes,
+    pub trace: TraceId,
+}
+
+/// A typed transport operation carrying a valid payload or control frame
+/// (ch. 4.4). Phase 2 placeholder — the excerpted PDF text names
+/// `ProtocolFiber::Frame` generically; this closed enum is this document's
+/// own minimal, disclosed classification pending a richer fiber model.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum FiberType {
+    Control,
+    Data,
+}
+
+/// Evidence that a BCIK seam is closed (ch. 9.1's `Sigma`). Content-addressed
+/// over the crossing's inputs so it is genuinely tamper-evident, not a bare
+/// flag.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SeamWitness(pub Digest);
+
+/// The boundary operator's record of one crossing (ch. 9.1's `partial-d`).
+/// Phase 2 placeholder — a closed/open flag plus detail; the residual
+/// projector's exact numeric tolerance (`epsilon_stitch`, ch. 9.1's closure
+/// definition) is not modeled yet.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BoundaryRecord {
+    pub closed: bool,
+    pub detail: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConnectionIntent {
     pub run: RunId,
     pub core: CoreNode,
     pub target_locator: LocatorId,
-    pub capability_witness: bool,
+    pub capability: Option<CapabilityWitness>,
     pub ttl_epoch: u64,
 }
 
@@ -429,7 +505,7 @@ pub struct StitchCandidate {
     pub core: CoreNode,
     pub facet: MirrorFacet,
     pub locator: LocatorFacet,
-    pub capability_witness: bool,
+    pub capability: Option<CapabilityWitness>,
     pub seam_ok: bool,
     pub boundary_complete: bool,
     pub replay_ready: bool,

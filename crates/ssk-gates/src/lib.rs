@@ -81,7 +81,7 @@ impl Gate for BasicGate {
                 ResidueKind::Boundary,
                 "hypercube seam integrity failed",
             ),
-            GateId::Capability if !sc.capability_witness => reject(
+            GateId::Capability if sc.capability.is_none() => reject(
                 self.id,
                 ResidueKind::Capability,
                 "missing capability witness",
@@ -222,7 +222,7 @@ mod tests {
                 trusted: true,
                 risk_score: 1,
             },
-            capability_witness: true,
+            capability: Some(sample_capability_witness()),
             seam_ok: true,
             boundary_complete: true,
             replay_ready: true,
@@ -231,10 +231,27 @@ mod tests {
         }
     }
 
+    fn sample_capability_witness() -> CapabilityWitness {
+        CapabilityWitness {
+            id: CapabilityId::of(&"gate-test-capability", HashAlg::Blake3).expect("hash"),
+            claim: CapabilityClaim("use-local-overlay".into()),
+            scope: Scope {
+                action: "connect".into(),
+                facet_class: ObjectKind::Core,
+            },
+            issuer: IssuerRef::new("issuer-1"),
+            subject_class: SubjectClass::Core,
+            epoch: EpochId(0),
+            expiry: Ttl(100),
+            proof: ProofBytes(vec![1, 2, 3]),
+            trace: TraceId::new("cap-trace"),
+        }
+    }
+
     #[test]
     fn gate_vector_fail_closed() {
         let mut sc = candidate();
-        sc.capability_witness = false;
+        sc.capability = None;
         let report = GateVector::with_all_default().evaluate(&sc);
         assert_eq!(report.outcome, GateOutcomeKind::Reject);
     }
