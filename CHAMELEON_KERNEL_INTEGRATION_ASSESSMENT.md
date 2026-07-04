@@ -1,5 +1,27 @@
 # Chameleon Signature Kernel ("AlignAlign") — Integration Assessment
 
+> **IMPLEMENTATION STATUS (port complete).** The recommendation below was executed:
+> the kernel is ported end-to-end into the leaf crate **`crates/ssk-signature`**, in
+> five tranches, each built + tested green before the next:
+> 1. surface → spectrum (objects, canonicalize, features, fingerprints, signature);
+> 2. residue / target / policy / operators / gate, bridged to `ssk_types`
+>    `ResidueRegister` / `GateOutcomeKind`;
+> 3. replay / reanalysis / `ChameleonKernel` → `ChameleonEvent`;
+> 4. calibration presets, `RecursiveSignatureIterator` (5D-Cube monotone
+>    Bündigkeitsindex), `ProfileCorpus` (IMDF SelfPerceptionAtlas substrate);
+> 5. audit ledger, trace adapter, Controlled Adapter Framework, network adapter
+>    (pluggable transport; the real `ssk-netcore` transport binds at the async
+>    daemon layer), and the headless `ChameleonGuiModel`.
+>
+> Identity is taken through the SSK content-address path (`digest_of`/`Digest`,
+> Blake3) — flush with replay/audit — because the kernel's own suite asserts
+> decisions/distances/feature values, never digest hex (§4). **73 Rust tests pass**
+> (the 44 Python phase tests transliterated + unit tests); `clippy -D warnings`
+> clean; `cargo fmt` clean; the workspace builds and `ssk-core --no-default-features`
+> (no_std) still holds. The one uncovered Python method (`fetch_urls`, §2) was
+> dropped in favour of iterating `fetch`; the three version strings were unified to
+> one constant (§5).
+
 **Artifact:** `chameleon_signature_kernel_v0_5.zip`, uploaded to `origin/main` (commit `35fa9fa`,
 "Add files via upload"). Extracted, verified, and vendored source-only into
 `reference/chameleon_signature_kernel_v0_5/` on this branch for auditable diffing.

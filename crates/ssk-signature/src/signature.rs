@@ -16,7 +16,7 @@ use crate::value::{categorical_equal, round6, Dimension, Dimensions, FeatureValu
 
 /// Per-dimension comparison decision (signature level). The gate layer maps
 /// these onto `ssk_types::GateOutcomeKind` (`Pass`/`Hold`) in a later tranche.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Decision {
     Pass,
     Optimize,

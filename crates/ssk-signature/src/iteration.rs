@@ -32,7 +32,7 @@ pub enum IterationError {
 }
 
 /// One candidate transform considered in a round.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize)]
 pub struct IterationCandidate {
     pub round_index: usize,
     pub object_index: usize,
@@ -51,7 +51,7 @@ pub struct IterationCandidate {
 }
 
 /// One round of the iteration.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize)]
 pub struct IterationRound {
     pub round_index: usize,
     pub candidates: Vec<IterationCandidate>,
@@ -64,7 +64,7 @@ pub struct IterationRound {
 }
 
 /// The full iteration outcome.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize)]
 pub struct RecursiveIterationResult {
     pub iteration_id: String,
     pub target_name: String,

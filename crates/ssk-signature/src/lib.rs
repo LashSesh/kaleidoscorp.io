@@ -44,8 +44,10 @@ pub mod corpus;
 pub mod features;
 pub mod fingerprints;
 pub mod gate;
+pub mod gui;
 pub mod iteration;
 pub mod kernel;
+pub mod network_adapter;
 pub mod object;
 pub mod operators;
 pub mod policy;
@@ -79,11 +81,18 @@ pub use fingerprints::{
     FingerprintLayerSpec, ProtocolFingerprint,
 };
 pub use gate::{GateBundle, GateDecision, GateVector};
+pub use gui::{
+    ActionInputs, ChameleonGuiModel, GuiActionState, GuiError, GuiSnapshot, TargetCalibrationResult,
+};
 pub use iteration::{
     surface_ref, IterationCandidate, IterationError, IterationParams, IterationRound,
     RecursiveIterationResult, RecursiveSignatureIterator,
 };
 pub use kernel::{BatchAnalysisResult, ChameleonEvent, ChameleonKernel, DEFAULT_MODE};
+pub use network_adapter::{
+    NetworkAdapter, NetworkAdapterConfig, NetworkAdapterError, NetworkRequest, NetworkResponse,
+    NetworkTransport,
+};
 pub use object::SurfaceObject;
 pub use operators::{
     BucketTimingOperator, NormalizeTraceShapeOperator, RedactIdentifierFieldsOperator,
