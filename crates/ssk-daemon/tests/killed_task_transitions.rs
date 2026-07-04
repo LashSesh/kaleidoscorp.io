@@ -6,17 +6,18 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use ssk_daemon::mock_dataplane::AlwaysUpMockDataPlane;
 use ssk_daemon::supervisor::Supervisor;
 use ssk_ipc::{CommandHandler, DaemonState, Event};
+use ssk_netcore::{AdapterRegistry, NetcoreDataPlane, RouteExecutor};
+use tokio::net::TcpListener;
 
 fn supervisor() -> (Arc<Supervisor>, tempfile::TempDir) {
     let dir = tempfile::tempdir().expect("tempdir");
     let audit_path = dir.path().join("audit.json");
-    (
-        Arc::new(Supervisor::new(audit_path, Box::new(AlwaysUpMockDataPlane))),
-        dir,
-    )
+    let data_plane = Box::new(NetcoreDataPlane::new(Arc::new(RouteExecutor::new(
+        AdapterRegistry::new(),
+    ))));
+    (Arc::new(Supervisor::new(audit_path, data_plane)), dir)
 }
 
 async fn wait_for_state_changed_to(
@@ -56,16 +57,22 @@ async fn killed_task_transitions_to_fail_closed_when_inactive() {
 async fn killed_task_transitions_to_degraded_when_a_profile_is_active() {
     let (sup, _dir) = supervisor();
 
-    // Bring the daemon to Protected with an active profile first.
+    // Bring the daemon to Protected with a real, active egress first.
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    let accept = tokio::spawn(async move { listener.accept().await });
     let token = ssk_ipc::SessionToken::generate();
     sup.handle(
         ssk_ipc::Request::ActivateProfile(ssk_ipc::ActivateProfileRequest {
             profile_id: "default".into(),
+            dest_host: Some("127.0.0.1".into()),
+            dest_port: Some(addr.port()),
         }),
         &token,
     )
     .await;
     assert_eq!(sup.current_state().await, DaemonState::Protected);
+    accept.await.expect("join").expect("accept");
 
     let mut events = sup.subscribe_events().await;
     let abort_handle = sup.spawn_supervised("test-worker", async {

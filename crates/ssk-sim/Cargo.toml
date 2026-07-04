@@ -9,7 +9,7 @@ default = []
 sim = []
 
 [dependencies]
-ssk-types = { path = "../ssk-types" }
+ssk-types = { path = "../ssk-types", version = "0.1.0" }
 
 [lints]
 workspace = true

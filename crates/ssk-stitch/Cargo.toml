@@ -5,10 +5,10 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
-ssk-types = { path = "../ssk-types" }
-ssk-core = { path = "../ssk-core" }
-ssk-locator = { path = "../ssk-locator" }
-ssk-bcik = { path = "../ssk-bcik" }
+ssk-types = { path = "../ssk-types", version = "0.1.0" }
+ssk-core = { path = "../ssk-core", version = "0.1.0" }
+ssk-locator = { path = "../ssk-locator", version = "0.1.0" }
+ssk-bcik = { path = "../ssk-bcik", version = "0.1.0" }
 
 [lints]
 workspace = true

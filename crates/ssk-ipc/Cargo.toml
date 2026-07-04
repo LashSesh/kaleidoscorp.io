@@ -5,9 +5,9 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
-ssk-types = { path = "../ssk-types" }
-ssk-netadmin = { path = "../ssk-netadmin" }
-ssk-config = { path = "../ssk-config" }
+ssk-types = { path = "../ssk-types", version = "0.1.0" }
+ssk-netadmin = { path = "../ssk-netadmin", version = "0.1.0" }
+ssk-config = { path = "../ssk-config", version = "0.1.0" }
 serde.workspace = true
 serde_json.workspace = true
 ciborium.workspace = true

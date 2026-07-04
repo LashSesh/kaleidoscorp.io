@@ -5,9 +5,9 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
-ssk-types = { path = "../ssk-types" }
-ssk-crypto = { path = "../ssk-crypto" }
-ssk-privacy = { path = "../ssk-privacy" }
+ssk-types = { path = "../ssk-types", version = "0.1.0" }
+ssk-crypto = { path = "../ssk-crypto", version = "0.1.0" }
+ssk-privacy = { path = "../ssk-privacy", version = "0.1.0" }
 serde.workspace = true
 
 [lints]

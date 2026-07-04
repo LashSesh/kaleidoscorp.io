@@ -95,10 +95,17 @@ enum Command {
     },
     /// Daemon-backed commands (talk to `sskd` over `ssk-ipc`).
     Status,
-    /// Activate a profile via the daemon.
+    /// Activate a profile via the daemon: establishes real, policy-decided,
+    /// audited egress to `--dest`. Reaching `Protected` requires the daemon
+    /// to really connect — there is no destination-less success path.
     Activate {
         #[arg(long)]
         profile: String,
+        /// Real destination to protect, `host:port`. Required: with no
+        /// destination there is nothing to protect, so the daemon fails
+        /// closed rather than reporting a fabricated `Protected` status.
+        #[arg(long)]
+        dest: String,
     },
     /// Deactivate protection via the daemon.
     Deactivate {
@@ -343,7 +350,7 @@ fn run(cli: &Cli) -> Result<(), AppError> {
         Command::Chaos { command } => chaos_command(command, cli.json),
         Command::NetAdmin { command } => net_admin_command(command, cli.json),
         Command::Status => status_command(cli.json),
-        Command::Activate { profile } => activate_command(profile, cli.json),
+        Command::Activate { profile, dest } => activate_command(profile, dest, cli.json),
         Command::Deactivate {
             release_kill_switch,
         } => deactivate_command(*release_kill_switch, cli.json),
@@ -359,10 +366,37 @@ fn status_command(json: bool) -> Result<(), AppError> {
     }
 }
 
-fn activate_command(profile: &str, json: bool) -> Result<(), AppError> {
+/// Parses a `host:port` destination. Splits on the last `:` so a bracketed
+/// IPv6 literal like `[::1]:443` still yields `::1` (brackets stripped) —
+/// full IPv6 zone-id support is not attempted here.
+fn parse_dest(dest: &str) -> Result<(String, u16), AppError> {
+    let (host, port) = dest.rsplit_once(':').ok_or_else(|| {
+        AppError::new(
+            ErrorClass::Usage,
+            "INVALID_DEST",
+            format!("`{dest}` is not a valid host:port destination"),
+            vec!["Pass --dest in the form host:port, e.g. --dest 93.184.216.34:443".into()],
+        )
+    })?;
+    let port: u16 = port.parse().map_err(|_| {
+        AppError::new(
+            ErrorClass::Usage,
+            "INVALID_DEST",
+            format!("`{port}` is not a valid port number"),
+            vec![],
+        )
+    })?;
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    Ok((host.to_string(), port))
+}
+
+fn activate_command(profile: &str, dest: &str, json: bool) -> Result<(), AppError> {
+    let (dest_host, dest_port) = parse_dest(dest)?;
     match call_daemon(ssk_ipc::Request::ActivateProfile(
         ssk_ipc::ActivateProfileRequest {
             profile_id: profile.to_string(),
+            dest_host: Some(dest_host),
+            dest_port: Some(dest_port),
         },
     ))? {
         ssk_ipc::Response::Status(status) => print_status(&status, json),
@@ -1836,6 +1870,19 @@ fn default_policy_engine() -> PolicyEngine {
             action: PolicyAction::Redirect {
                 adapter_id: "socks5-exit".into(),
             },
+        },
+        PolicyRule {
+            rule_id: "allow-low-risk-direct".into(),
+            description: "default profile: allow low-risk traffic direct".into(),
+            priority: 30,
+            criteria: MatchCriteria {
+                app_prefix: None,
+                dest_suffix: None,
+                protocol: None,
+                min_risk: None,
+                max_risk: Some(RiskLevel::Low),
+            },
+            action: PolicyAction::Allow,
         },
     ])
 }

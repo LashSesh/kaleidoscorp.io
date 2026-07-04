@@ -68,11 +68,24 @@ async fn cli_drives_the_real_daemon_over_ipc() {
         other => panic!("unexpected response: {other:?}"),
     }
 
-    // activate_profile
+    // activate_profile — a real destination the daemon (a genuinely
+    // separate process) must really connect to over a real socket for this
+    // to reach `Protected`. The listener lives in *this* test process, so
+    // `Protected` can only happen if the spawned `sskd` child actually
+    // dialed out over the network to reach it — the literal system-level
+    // proof that `sskd`'s data plane is real, not a mock.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind real listener");
+    let dest_port = listener.local_addr().expect("addr").port();
+    let accept = tokio::spawn(async move { listener.accept().await });
+
     let status = match client
         .call(ssk_ipc::Request::ActivateProfile(
             ssk_ipc::ActivateProfileRequest {
                 profile_id: "default".into(),
+                dest_host: Some("127.0.0.1".into()),
+                dest_port: Some(dest_port),
             },
         ))
         .await
@@ -83,6 +96,19 @@ async fn cli_drives_the_real_daemon_over_ipc() {
     };
     assert_eq!(status.state, ssk_ipc::DaemonState::Protected);
     assert_eq!(status.active_profile.as_deref(), Some("default"));
+    assert!(
+        status.dns_protected,
+        "127.0.0.1 is a literal IP: no DNS lookup should have occurred"
+    );
+    assert_eq!(
+        status.adapters.len(),
+        1,
+        "must report the one real Direct adapter actually traversed"
+    );
+    accept
+        .await
+        .expect("join")
+        .expect("the real sskd child process must have really connected to this listener");
 
     // deactivate
     let status = match client
@@ -97,13 +123,18 @@ async fn cli_drives_the_real_daemon_over_ipc() {
     };
     assert_eq!(status.state, ssk_ipc::DaemonState::Inactive);
 
-    // verify_audit_chain — real, persisted, across the real process
+    // verify_audit_chain — real, persisted, across the real process, and
+    // genuinely non-empty: the real activation above must have appended a
+    // real entry, not merely verified a vacuous zero-entry chain.
     match client
         .call(ssk_ipc::Request::VerifyAuditChain)
         .await
         .expect("call")
     {
-        ssk_ipc::Response::AuditVerify(v) => assert!(v.ok),
+        ssk_ipc::Response::AuditVerify(v) => {
+            assert!(v.ok);
+            assert!(v.head.is_some(), "audit chain must not be vacuously empty");
+        }
         other => panic!("unexpected response: {other:?}"),
     }
 }

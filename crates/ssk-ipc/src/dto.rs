@@ -29,9 +29,20 @@ pub struct StatusDto {
 }
 
 /// Request for `activate_profile` (command 2).
+///
+/// `dest_host`/`dest_port` name the real destination the daemon should
+/// establish protected egress to. This is required for the daemon to enter
+/// `Active`/`Protected` for real: with no destination there is nothing to
+/// protect, so activation without one fails closed rather than reporting a
+/// fabricated `Protected` status (see `Supervisor::handle`'s
+/// `ActivateProfile` arm).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ActivateProfileRequest {
     pub profile_id: String,
+    #[serde(default)]
+    pub dest_host: Option<String>,
+    #[serde(default)]
+    pub dest_port: Option<u16>,
 }
 
 /// Request for `deactivate` (command 3).

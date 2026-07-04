@@ -5,10 +5,10 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
-ssk-types = { path = "../ssk-types" }
-ssk-gates = { path = "../ssk-gates" }
-ssk-crypto = { path = "../ssk-crypto" }
-ssk-privacy = { path = "../ssk-privacy" }
+ssk-types = { path = "../ssk-types", version = "0.1.0" }
+ssk-gates = { path = "../ssk-gates", version = "0.1.0" }
+ssk-crypto = { path = "../ssk-crypto", version = "0.1.0" }
+ssk-privacy = { path = "../ssk-privacy", version = "0.1.0" }
 serde.workspace = true
 serde_yaml.workspace = true
 toml.workspace = true

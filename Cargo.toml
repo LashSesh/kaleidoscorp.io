@@ -21,6 +21,7 @@ members = [
   "crates/ssk-runtime",
   "crates/ssk-sim",
   "crates/ssk-netadmin",
+  "crates/ssk-netcore",
   "crates/ssk-cli",
   "crates/ssk-ipc",
   "crates/ssk-daemon",

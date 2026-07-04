@@ -13,22 +13,22 @@ anyhow.workspace = true
 clap.workspace = true
 serde_json.workspace = true
 serde.workspace = true
-ssk-types = { path = "../ssk-types" }
-ssk-runtime = { path = "../ssk-runtime" }
-ssk-locator = { path = "../ssk-locator" }
-ssk-gates = { path = "../ssk-gates" }
-ssk-config = { path = "../ssk-config" }
-ssk-replay = { path = "../ssk-replay" }
-ssk-tensor = { path = "../ssk-tensor", features = ["storage"] }
+ssk-types = { path = "../ssk-types", version = "0.1.0" }
+ssk-runtime = { path = "../ssk-runtime", version = "0.1.0" }
+ssk-locator = { path = "../ssk-locator", version = "0.1.0" }
+ssk-gates = { path = "../ssk-gates", version = "0.1.0" }
+ssk-config = { path = "../ssk-config", version = "0.1.0" }
+ssk-replay = { path = "../ssk-replay", version = "0.1.0" }
+ssk-tensor = { path = "../ssk-tensor", version = "0.1.0", features = ["storage"] }
 # `insecure-test-keys` is enabled here deliberately: `ssk interop conformance`
 # runs a protocol self-test against golden vectors using the fixed reference
 # key, not a peer-trust decision (see main.rs's `interop_command`). This is
 # the one production exception; `ssk-netadmin`'s `AttestationBinder` (real
 # flow attestation, below) has no such opt-in anywhere.
-ssk-interop = { path = "../ssk-interop", features = ["insecure-test-keys"] }
-ssk-netadmin = { path = "../ssk-netadmin" }
-ssk-faultscan = { path = "../ssk-faultscan" }
-ssk-ipc = { path = "../ssk-ipc" }
+ssk-interop = { path = "../ssk-interop", version = "0.1.0", features = ["insecure-test-keys"] }
+ssk-netadmin = { path = "../ssk-netadmin", version = "0.1.0" }
+ssk-faultscan = { path = "../ssk-faultscan", version = "0.1.0" }
+ssk-ipc = { path = "../ssk-ipc", version = "0.1.0" }
 # Only "rt" + "net" + "macros": one-shot current-thread runtime for the new
 # daemon-backed commands (status/activate/deactivate/list-profiles). `run` /
 # `replay-verify` / `doctor` / etc. remain fully synchronous and local.

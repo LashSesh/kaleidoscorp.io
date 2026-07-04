@@ -9,11 +9,12 @@ name = "sskd"
 path = "src/main.rs"
 
 [dependencies]
-ssk-types = { path = "../ssk-types" }
-ssk-config = { path = "../ssk-config" }
-ssk-netadmin = { path = "../ssk-netadmin" }
-ssk-tensor = { path = "../ssk-tensor" }
-ssk-ipc = { path = "../ssk-ipc" }
+ssk-types = { path = "../ssk-types", version = "0.1.0" }
+ssk-config = { path = "../ssk-config", version = "0.1.0" }
+ssk-netadmin = { path = "../ssk-netadmin", version = "0.1.0" }
+ssk-netcore = { path = "../ssk-netcore", version = "0.1.0" }
+ssk-tensor = { path = "../ssk-tensor", version = "0.1.0" }
+ssk-ipc = { path = "../ssk-ipc", version = "0.1.0" }
 serde.workspace = true
 thiserror.workspace = true
 tracing.workspace = true

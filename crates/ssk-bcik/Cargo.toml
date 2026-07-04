@@ -5,9 +5,9 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
-ssk-types = { path = "../ssk-types" }
-ssk-locator = { path = "../ssk-locator" }
-ssk-crypto = { path = "../ssk-crypto" }
+ssk-types = { path = "../ssk-types", version = "0.1.0" }
+ssk-locator = { path = "../ssk-locator", version = "0.1.0" }
+ssk-crypto = { path = "../ssk-crypto", version = "0.1.0" }
 
 [lints]
 workspace = true

@@ -5,15 +5,15 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
-ssk-types = { path = "../ssk-types" }
-ssk-runtime = { path = "../ssk-runtime" }
-ssk-locator = { path = "../ssk-locator" }
-ssk-gates = { path = "../ssk-gates" }
+ssk-types = { path = "../ssk-types", version = "0.1.0" }
+ssk-runtime = { path = "../ssk-runtime", version = "0.1.0" }
+ssk-locator = { path = "../ssk-locator", version = "0.1.0" }
+ssk-gates = { path = "../ssk-gates", version = "0.1.0" }
 serde.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
-ssk-tensor = { path = "../ssk-tensor" }
+ssk-tensor = { path = "../ssk-tensor", version = "0.1.0" }
 
 [lints]
 workspace = true

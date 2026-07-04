@@ -13,9 +13,9 @@ default = []
 insecure-test-keys = []
 
 [dependencies]
-ssk-types  = { path = "../ssk-types" }
-ssk-crypto = { path = "../ssk-crypto" }
-ssk-tensor = { path = "../ssk-tensor" }
+ssk-types  = { path = "../ssk-types", version = "0.1.0" }
+ssk-crypto = { path = "../ssk-crypto", version = "0.1.0" }
+ssk-tensor = { path = "../ssk-tensor", version = "0.1.0" }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

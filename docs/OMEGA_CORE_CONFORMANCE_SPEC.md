@@ -36,20 +36,33 @@ Reused from `docs/DESKTOP_CLIENT_ARCHITECTURE.md` for consistency:
 
 ## A. Executive Diagnosis
 
-> **STATUS (final) — SSKΩ-0 through SSKΩ-9 are all met.** The narrative below is the *original*
-> diagnosis (the codebase's starting point, ~SSKΩ-2/3); it is preserved as the historical record
-> that motivated the phased plan. Every gap it names has since been closed across Phases 0-8 plus
-> hardening iterations A-F — see the per-row **[1] done** tags in Section B's inventory, the
-> all-`✅`/`met` column in Section D's ladder, and the green Section W matrix. The system now runs
-> a genuine end-to-end pipeline (compile-time-enforced `Connection<S>` typestate → real BCIK
-> crossing → persistent `StitchTensor` materialization → fiber execution → concave focus → 3-variant
-> `RunOutcome`), reachable from the CLI (`ssk connect`), with every honesty non-claim from Section
-> U held: no fabricated network liveness, no `GlobalPassiveObserver` anonymity claim, no silent
-> loss. The handful of items left undone are recorded explicitly (not silently) at the end of each
-> section — chiefly real network egress adapters (deliberately `ssk-netcore`'s / the Desktop
-> track's job, Section X) and per-check pipeline-trace granularity (a diagnostic refinement with no
-> conformance payoff). The verification gate (`cargo test --workspace` + `cargo clippy --workspace
-> --all-targets -- -D warnings` + `cargo deny` + `cargo audit`) is green on every commit.
+> **STATUS (superseded) — the "SSKΩ-0 through SSKΩ-9 are all met" line below was false when
+> written and is retained only as historical record, not as a current claim.** An independent
+> re-audit (`AUDIT_PREVIOUS_FINAL_CLAIMS.md`, `SSKΩ_CONFORMANCE_REEVALUATION.md`, both at the
+> repo root) found this document's own SSKΩ-7 row (Section D, below) self-contradicted the "all
+> met" line at the time: SSKΩ-7 was marked ⚠️ and its real egress adapters did not exist as a
+> crate. **Since that audit, `ssk-netcore` has been built**: real `TcpStream` Direct connect, a
+> real SOCKS5 (RFC 1928/1929) client handshake, a real HTTP CONNECT handshake, a real `rustls`
+> TLS handshake against the OS trust store, and a real DNS query — dispatched by a real
+> `RouteExecutor`, reachable end-to-end via `ssk activate --profile <p> --dest <host:port>`
+> (`ssk-cli` → real Unix-socket IPC → `sskd` → real policy/route decision → real socket), with
+> `Protected` reported only after a real handshake succeeds and `ssk deactivate` really tearing
+> the session down. `ssk-daemon`'s audit ledger now records real decisions (previously vacuous).
+> `cargo deny check` and the `no_std` build, both previously broken in ways this document did not
+> disclose, are now genuinely green — see `RELEASE_BLOCKER_REGISTER.md` and
+> `NEXT_IMPLEMENTATION_RUN_SPEC.md` for the full, evidence-based account. **Still not built**:
+> `ssk-capture` (arbitrary local traffic classification — a separate, higher-privilege layer),
+> a desktop GUI, OS-level service integration, a system-wide (not per-session) kill switch, and a
+> config-driven multi-profile model. Do not read this update as "100% done" either — it is a
+> concrete, re-verifiable improvement over the state the re-audit examined, nothing more. The
+> narrative below is the *original* diagnosis (the codebase's starting point, ~SSKΩ-2/3); it is
+> preserved as the historical record that motivated the phased plan, plus the equally historical
+> (and, per the above, inaccurate) "all met" claim that followed it. The system runs a genuine
+> end-to-end **decision-core** pipeline (compile-time-enforced `Connection<S>` typestate → real
+> BCIK crossing → persistent `StitchTensor` materialization → fiber execution → concave focus →
+> 3-variant `RunOutcome`), reachable from the CLI (`ssk connect`) — this remains a deterministic,
+> adapter-free simulation of the pipeline shape, separate from the real egress path above, and it
+> was never meant to fabricate network liveness itself.
 
 The repository's decision-modeling core is a real, tested, deterministic MVP that implements
 the *shape* of the PDF's pipeline (scheduler tick → identity orbit → locator selection →
@@ -147,7 +160,10 @@ honesty for a checkbox, so this document declines to. **Update — Phase 6 done 
 only):** SSKΩ-7's `StitchEdge`/`LocatorGraph`/`HyperEdge`/`select_path` (Section G.2) landed and
 tested in `ssk-locator`, generic over a new dependency-inverted `PathProjectionCheck` trait
 rather than the real `Hypercube` (same crate-cycle constraint as Phases 3-5, disclosed inline);
-real egress adapters and health probing remain out of scope per Section X. **Update — Phase 7
+real egress adapters and health probing remain out of scope per Section X at the time this line
+was written. **This is no longer current** — see the Section A status note at the top of this
+document and `crates/ssk-netcore/`: real adapter execution and health probing were built in a
+later pass and are reachable via `ssk activate --dest`. **Update — Phase 7
 partial:** SSKΩ-8's detection-taxonomy half (Section P — `Faultscan`/`FaultEvent`/
 `DetectionSource`/`RuntimeSignalScan`, `ChaosFaultKind` rename) landed and is tested; the
 simulation/conformance-testbed half (concrete `LinkabilityEstimator` metric tests, the full
@@ -253,7 +269,7 @@ if all tests for levels 0..*k* pass"):
 | SSKΩ-4 | Gate vector + boundary residues: twelve gates, fail-closed, typed residues, PCH projection checks. | ✅ met (Phase 3: twelve real gate structs, no early-break, typed `ResidueKind` on every fail path, `HypercubeGate` drives the real 9-axis PCH) |
 | SSKΩ-5 | Persistent Stitch Tensor + audit: hash-chained append, storage backends, tensor-preservation theorem tested. | ✅ met — `ssk-tensor`'s real `StitchTensor`/`apply_sorted`/`StorageBackend` (Phase 4), now wired into the live pipeline (`run_to_outcome` materializes via `apply_sorted`, hardening iter. A) and into `Connection<GatePassed>::materialize` (hardening iter. C); the preservation theorem is proven end-to-end (`failed_gate_preserves_the_tensor` in `tests/conformance.rs`) |
 | SSKΩ-6 | Concave Reanalysis Focus + replay: class reconstruction, replay determinism harness green. | ✅ met — real `FocusEngine`/`FocusReport` and a genuinely re-executing `ReplayEngine` (Phase 5), and `run_to_outcome` now drives the full pipeline (BCIK crossing → `StitchTensor` materialization → `FiberExecutor` response capture → `FocusEngine`) to a real 3-variant `RunOutcome`, tested deterministic and fail-closed (hardening iteration A) |
-| SSKΩ-7 | Locator pool + relay-fabric adapters: real egress adapters behind the async edge, health probing. | ⚠️ funnel-DAG (`StitchEdge`/`LocatorGraph`/`HyperEdge`/`select_path`, Phase 6) landed and tested; real egress adapters/health probing behind the `async-edge` feature remain out of scope (Section X — real network I/O stays the Desktop track's `ssk-netcore` responsibility) |
+| SSKΩ-7 | Locator pool + relay-fabric adapters: real egress adapters behind the async edge, health probing. | ✅ met for the adapter/health-probing half — `ssk-netcore` now provides a real `RouteExecutor` (real Direct/SOCKS5/HTTP-CONNECT/TLS handshakes + real DNS query, real `ProbeReport` health probing), reachable end-to-end via `ssk activate --dest`; see `crates/ssk-netcore/`, `AUDIT_PREVIOUS_FINAL_CLAIMS.md`, `SSKΩ_CONFORMANCE_REEVALUATION.md`. The funnel-DAG (`StitchEdge`/`LocatorGraph`/`HyperEdge`/`select_path`, Phase 6) remains a tested in-memory algorithm not yet wired to a production path — real multi-hop routing beyond two explicit hops and the funnel-DAG's own dynamic path selection are still open. |
 | SSKΩ-8 | Full simulation + conformance testbed: privacy metric tests, defensive adversary sim, all vectors. | ✅ met — `FaultKind`/`Faultscan` detection taxonomy (Phase 7); `LinkabilityEstimator` metric + residue-visibility-completeness tests (`ssk-privacy`, hardening iter. E); and the cross-cutting property-obligation suite (`facet_recovers_to_core`, `no_silent_loss`, `failed_gate_preserves_the_tensor`, `decision_core_is_deterministic` — `tests/conformance.rs`) all green (Section W) |
 | SSKΩ-9 | Production-hardened runtime profile: dissolution/TTL sweeps, ledger verification, deployment audit, documented limits. | ✅ met — `DissolutionManager::{is_expired, sweep, finalize_expired}` (real TTL sweep + typed residue finalization, hardening iter. D), the full 12-section validated config schema (Phase 8), and the existing hash-chained ledger `verify()`, all tested |
 
