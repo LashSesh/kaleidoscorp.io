@@ -1,0 +1,19 @@
+[package]
+name = "ssk-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[features]
+default = ["std"]
+std = ["ssk-types/std"]
+
+[dependencies]
+serde.workspace = true
+ssk-types = { path = "../ssk-types", default-features = false }
+
+[dev-dependencies]
+proptest.workspace = true
+
+[lints]
+workspace = true

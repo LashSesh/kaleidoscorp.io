@@ -1,0 +1,20 @@
+[package]
+name = "ssk-interop"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+serde.workspace = true
+thiserror.workspace = true
+ciborium.workspace = true
+blake3.workspace = true
+hex.workspace = true
+ssk-types = { path = "../ssk-types" }
+
+[dev-dependencies]
+proptest.workspace = true
+serde_json.workspace = true
+
+[lints]
+workspace = true

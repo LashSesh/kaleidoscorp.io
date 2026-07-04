@@ -1,0 +1,12 @@
+[package]
+name = "ssk-bcik"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+ssk-types = { path = "../ssk-types" }
+ssk-locator = { path = "../ssk-locator" }
+
+[lints]
+workspace = true

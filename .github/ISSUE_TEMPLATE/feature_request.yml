@@ -1,0 +1,11 @@
+name: Feature request
+description: Propose runtime enhancements
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution

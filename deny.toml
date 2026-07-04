@@ -1,0 +1,40 @@
+# cargo-deny configuration — Adamant-Grade dependency policy
+# Run: cargo deny check
+
+[advisories]
+# Deny crates with known security advisories.
+version = 2
+deny = []
+ignore = []
+
+[licenses]
+# Allow OSI-approved permissive and copyleft-compatible licenses only.
+version = 2
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "CC0-1.0",
+    "Zlib",
+]
+# Confidence threshold for license detection (0.0–1.0).
+confidence-threshold = 0.8
+
+[bans]
+# Deny multiple versions of the same crate to avoid supply-chain confusion.
+multiple-versions = "warn"
+# Deny wildcard dependencies.
+wildcards = "deny"
+# Deny crates known to introduce risk.
+deny = []
+
+[sources]
+# Only allow dependencies sourced from crates.io.
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

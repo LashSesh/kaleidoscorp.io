@@ -1,0 +1,19 @@
+[package]
+name = "ssk-crypto"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[features]
+default = []
+crypto = ["dep:ed25519-dalek", "dep:x25519-dalek", "dep:chacha20poly1305"]
+
+[dependencies]
+ssk-types = { path = "../ssk-types" }
+thiserror.workspace = true
+ed25519-dalek = { version = "2", optional = true }
+x25519-dalek = { version = "2", optional = true }
+chacha20poly1305 = { version = "0.10", optional = true }
+
+[lints]
+workspace = true
