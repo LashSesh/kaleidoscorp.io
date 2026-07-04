@@ -136,9 +136,17 @@ real egress adapters and health probing remain out of scope per Section X. **Upd
 partial:** SSKΩ-8's detection-taxonomy half (Section P — `Faultscan`/`FaultEvent`/
 `DetectionSource`/`RuntimeSignalScan`, `ChaosFaultKind` rename) landed and is tested; the
 simulation/conformance-testbed half (concrete `LinkabilityEstimator` metric tests, the full
-deterministic test-vector + property-obligation suite of Section W) remains undone. This
-document designs the closing architecture for the remainder of SSKΩ-8 and all of SSKΩ-9, plus
-Section R's unfinished `RunOutcome` wiring and G.2's undone `Hypercube` bridging.
+deterministic test-vector + property-obligation suite of Section W) remains undone. **Update —
+Phase 8 done (Section S + dissolution sweep):** the full 12-section config schema landed in
+`ssk-config` (all eleven PDF sections real and validated, `gates:` folded into the enriched
+`policy.gate_profile`, two-step v2/v1 migration tested), and `ssk-tensor` gained a real
+`DissolutionManager` computing genuine TTL/epoch expiry instead of a bare presence check. This
+closes the great majority of this document's own scope. What remains, all explicitly disclosed
+in place rather than silently dropped: the rest of SSKΩ-8's simulation/testbed half; `RunOutcome`
+wiring (Section R, blocked on a `FiberExecution`/`ResponseCapture` stage that doesn't exist);
+`select_path`'s `Hypercube` bridging (Section G.2, blocked on the same crate-cycle constraint
+discovered repeatedly across Phases 3-6); `Connection<S>`'s `place`/`gate` real bodies (Section
+E.3, same constraint); and residue finalization on TTL sweep (Section M).
 
 ---
 
@@ -180,7 +188,7 @@ earlier pass without recheck).
 | 18-variant `FaultKind` + `Faultscan` trait | **[1] Phase 7 done** | `FaultKind` (18-variant, `ssk-types`, Phase 0) + real `Faultscan`/`FaultEvent`/`DetectionSource`/`RuntimeSignalScan` (`crates/ssk-faultscan/src/lib.rs`); the old 6-variant chaos-injection enum is renamed `ChaosFaultKind`, API (`inject_fault`/`run_drill`/`run_playbook`) unchanged | Ch. 17.1 |
 | 3-variant `RunOutcome` | **[2] Phase 5 partial** | `crates/ssk-runtime/src/lib.rs` — real `RunOutcome{Pass, HoldRefine, DissolveRejectQuarantine}` and a tested `RunOutcome::resolve(gate_report, ...)` mapping all five `GateOutcomeKind` values correctly; lands in `ssk-runtime` rather than `ssk-types` (disclosed placement correction — `Pass.focus: FocusReport` means it can only live where both `ssk-focus` and `ssk-types` are already dependencies, and `ssk-types` cannot depend on `ssk-focus` without a cycle). **Not yet wired** into any live call site: a real `Pass` needs a genuine `FocusReport`, which needs real `Response` evidence from a `FiberExecution`/`ResponseCapture` stage that does not exist yet. `RuntimeOutcome` (the older flat struct) is unchanged and still what `Runtime::run_once_with_context` returns | Ch. 14.2 |
 | Full runtime pipeline stages | [2] | `crates/ssk-runtime/src/lib.rs` — still 5 traced steps (`Scheduler, Orbit, Locator, Bcik, Gates`) inside the newly-extracted `execute_pipeline`; PDF's spine (Ch. 14.1) names 20 stages including `PchPlacement, GabrielEvaluation, CapabilityCheck, LinkabilityResidue`. Not addressed this phase: splitting these out would require breaking `GateVector::evaluate` (currently one atomic call producing one `GateReport`) into separately-traceable per-check stages | Ch. 14.1 |
-| 12-section config schema | [2] | `crates/ssk-config/src/lib.rs:108-114` — `AppConfig{version, policy, runtime, interop}` covers roughly 4 of ~30 fields across the PDF's 12 sections | Ch. 21 |
+| 12-section config schema | **[1] Phase 8 done** | `crates/ssk-config/src/lib.rs` — `AppConfig` now carries all 11 PDF sections as real, validated fields (`gates:` folds into the enriched `policy.gate_profile` rather than duplicating, a disclosed placement choice); `CURRENT_CONFIG_VERSION` bumped 2→3; two-step migration (v2 and implicit-v1) both tested | Ch. 21 |
 
 ---
 
@@ -227,7 +235,7 @@ if all tests for levels 0..*k* pass"):
 | SSKΩ-6 | Concave Reanalysis Focus + replay: class reconstruction, replay determinism harness green. | ⚠️ real `FocusEngine`/`FocusReport` (Phase 5) and a genuinely re-executing `ReplayEngine` (Phase 5) both landed and tested; the 3-variant `RunOutcome` exists but is not wired into any live pipeline call site (needs a real `FiberExecution`/`ResponseCapture` stage that doesn't exist yet) |
 | SSKΩ-7 | Locator pool + relay-fabric adapters: real egress adapters behind the async edge, health probing. | ⚠️ funnel-DAG (`StitchEdge`/`LocatorGraph`/`HyperEdge`/`select_path`, Phase 6) landed and tested; real egress adapters/health probing behind the `async-edge` feature remain out of scope (Section X — real network I/O stays the Desktop track's `ssk-netcore` responsibility) |
 | SSKΩ-8 | Full simulation + conformance testbed: privacy metric tests, defensive adversary sim, all vectors. | ⚠️ the `FaultKind`/`Faultscan` detection taxonomy (Section P) landed and is tested (Phase 7); concrete `LinkabilityEstimator` metric tests (locator reuse, timing concentration, cross-facet correlation, residue-visibility completeness — PDF ch. 18.4) and the full deterministic test-vector/property-obligation suite (Section W) remain undone |
-| SSKΩ-9 | Production-hardened runtime profile: dissolution/TTL sweeps, ledger verification, deployment audit, documented limits. | ❌ absent (TTL is a bare `==0` check, no sweeping) |
+| SSKΩ-9 | Production-hardened runtime profile: dissolution/TTL sweeps, ledger verification, deployment audit, documented limits. | ⚠️ real `DissolutionManager::{is_expired, sweep}` (Phase 8) and the full 12-section config schema (Phase 8) both landed and tested; not yet done: wiring `sweep`'s output into real residue finalization, and a second real `LedgerBackend`-style hardening pass beyond the existing hash-chain `verify()` |
 
 **Target of this document: close SSKΩ-3 through SSKΩ-9**, in the phase order of Section V.
 
@@ -1079,6 +1087,18 @@ rework (Section R). Wiring `materialize` today would need the gate vector to han
 gate resolves to `Pass` — rather than recomputing it a second time; that plumbing change is
 Section R's job, done once for both `RunOutcome`'s redesign and this wiring together.
 
+**Update — Phase 8 done:** `crates/ssk-tensor/src/lib.rs` now has a real `DissolutionManager`
+(ch. 21's `dissolution.ttl_required`/`finalize_residues_on_expiry`, SSKΩ-9) — `is_expired`
+computes genuine epoch arithmetic (`current_epoch - entry.epoch >= entry.ttl`) rather than the
+bare `ttl_epoch != 0` presence check `DissolutionGate` still uses elsewhere (a different,
+narrower, gate-time concern), and `sweep` scans a real `StorageBackend`'s entries for every
+expired one. Tested: `is_expired_true_once_current_epoch_reaches_accepted_epoch_plus_ttl`,
+`sweep_returns_only_expired_entries`, `sweep_over_an_empty_backend_finds_nothing`. **Not yet
+done:** actually finalizing residues for swept entries (`finalize_residues_on_expiry`) — `sweep`
+returns the expired ids; emitting a `BoundaryResidue` per expired entry into a `ResidueRegister`
+is straightforward future work once a caller owns both the tensor and a register instance at
+the same call site (today nothing in this workspace does).
+
 ---
 
 ## N. Concave Reanalysis Focus
@@ -1383,23 +1403,60 @@ dissolution:
   finalize_residues_on_expiry: true
 ```
 
-**Current:** `AppConfig{version, policy, runtime, interop}` (`crates/ssk-config/src/lib.rs:108-114`)
-covers roughly 4 of the ~30 fields above, across none of the PDF's dedicated
-`locator_plane`/`projective_connection_hypercube`/`hypertorus`/`bcik`/`capabilities`/`privacy`/
-`gates`/`replay`/`ledger`/`dissolution` sections (the closest analog, `policy.gate_profile`,
-only carries `order`+`fail_closed`).
+**Current — Phase 8 done:** `AppConfig` now carries all eleven of the PDF's `ch. 21` sections as
+real, typed, validated fields — `system`/`core`/`locator_plane`/
+`projective_connection_hypercube`/`hypertorus`/`bcik`/`capabilities`/`privacy`/`replay`/`ledger`/
+`dissolution` — alongside this codebase's own pre-existing `policy`/`runtime`/`interop`.
+`CURRENT_CONFIG_VERSION` is bumped `2` → `3`, exactly as this document's own naming decision
+(below) called for.
 
-**Design: breaking, full schema extension** via the existing migration pattern
-(`parse_with_migration_yaml`/`toml`, `LoadedConfig.migrated_from`,
-`crates/ssk-config/src/lib.rs:189-235`). **Naming decision (must be made once, here, not
-discovered mid-implementation):** this schema is a distinct type from the Desktop track's
-planned `AppConfigV3` product/profile schema (Section C). Recommend this document's schema stay
-under the existing `AppConfig` type name, bumping `CURRENT_CONFIG_VERSION` from `2` to `3` for
-*this* schema's purposes — and recommend the Desktop doc's product schema, when it lands,
-either pick a different version number track or a wholly distinct type
-(e.g. `ProductProfileConfig`) rather than colliding on the name `AppConfigV3`. This document
-does not implement the Desktop doc's schema and takes no further position on its naming beyond
-flagging the collision risk explicitly.
+**One disclosed placement deviation from the PDF's literal YAML:** the PDF's example shows
+`gates:` as its own top-level section (`order`/`failure_policy`/`hold_policy`). This document
+instead enriches the *existing* `policy.gate_profile` in place — adding `thresholds`,
+`required_evidence`, `failure_policy`, `hold_policy`, `pass_policy` — rather than introducing a
+second, competing gate-order field. This was already the plan recorded in Section K.3 during
+Phase 3 ("lands alongside Section S's schema work"); this phase is where it lands. `pass_policy`
+and `thresholds`/`required_evidence` are this document's own disclosed elaborations — the
+excerpted PDF text names `thresholds`/`required_evidence` (ch. 11.3) without a worked example,
+and does not give `pass_policy` an example value at all, so both default to the minimal shape
+that keeps every existing `GateProfile` construction site compiling (`thresholds`/
+`required_evidence` are `#[serde(default)]`-empty; `pass_policy` is a single
+`MaterializeOnly` variant).
+
+**Reuses existing types rather than duplicating them:** `HypercubeConfig.axes` reuses
+`ssk_gates::pch::Axis` (gained `Serialize`/`Deserialize` derives this phase),
+`CapabilitiesConfig.allowed_witnesses` reuses `ssk_crypto::WitnessKind` (same), and
+`PrivacyConfig.adversary_model` reuses `ssk_privacy::AdversaryModel` (already had them, Phase 5)
+— rather than each config section inventing its own copy of an enum a domain crate already
+owns. `PhaseAxis` (hypertorus's 7 phase-axis names) is a new, disclosed elaboration: no existing
+enum enumerates them (`PhaseVector` has them as named struct fields, not variants).
+
+**Real validation invariants, not just structural parsing** — each new section's `validate()`
+enforces the PDF's own stated non-negotiables: `locator_plane.single_ip_external_privacy_claim`
+must be `Forbidden`; `projective_connection_hypercube.require_all_axis_projection` and
+`hypertorus.deterministic_replay` must be `true`; `hypertorus.dimension` must equal
+`phase_axes.len()`; `bcik.closure_threshold` must be within `[0.0, 1.0]`;
+`capabilities.witness_required`/`require_scope_and_expiry` must both hold;
+`privacy.adversary_model` may never be `GlobalPassiveObserver` (ch. 15.2's axiom, now a
+config-load-time check, not merely a runtime convention); `ledger.store_payload` must be
+`false`; `gates.failure_policy` must be `NoMaterialization`.
+
+**Real two-step migration, not a single legacy fallback:** `parse_with_migration_yaml`/`toml`
+now try, in order, (1) the current `version: 3` shape, (2) a `version: 2` shape
+(`AppConfigV2`/`PolicyV1`/`GateProfileV1` — this codebase's own pre-Phase-8 shape, kept
+verbatim so existing config files upgrade instead of erroring) with every new Section-S field
+filled from `AppConfig::default()`, (3) the implicit "v1" shape (no `version` field at all,
+already handled before this phase). **Naming decision (already made, reaffirmed here):** this
+schema stays under the existing `AppConfig` type name; the Desktop track's product/profile
+schema, when it lands, must pick a distinct type name (e.g. `ProductProfileConfig`) rather than
+colliding on `AppConfigV3` (Section C).
+
+Tested: `default_config_validates`, `v1_legacy_yaml_migrates_to_current`,
+`v2_yaml_migrates_to_current`, `schema_snapshot_stable` (now asserts the v3 schema id and new
+section names appear), plus one targeted rejection test per non-negotiable invariant
+(`single_ip_privacy_claim_must_stay_forbidden`, `global_passive_observer_adversary_model_is_rejected`,
+`gate_failure_policy_must_be_no_materialization`, `ledger_must_not_store_payload`,
+`hypertorus_dimension_must_match_phase_axes_length`).
 
 ---
 

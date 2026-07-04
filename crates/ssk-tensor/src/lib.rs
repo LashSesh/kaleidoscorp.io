@@ -3,8 +3,8 @@
 use parking_lot::RwLock;
 use serde::{de::DeserializeOwned, Serialize};
 use ssk_types::{
-    digest_of, Accepted, BcikStitch, Digest, FaultKind, GateReport, HashAlg, RunId, StitchId,
-    StitchTensorEntry, TensorEntry,
+    digest_of, Accepted, BcikStitch, Digest, EpochId, FaultKind, GateReport, HashAlg, RunId,
+    StitchId, StitchTensorEntry, TensorEntry,
 };
 use std::collections::HashMap;
 use std::marker::PhantomData;
@@ -185,6 +185,40 @@ impl StitchTensor {
     #[must_use]
     pub fn graph(&self) -> &StitchGraph {
         &self.graph
+    }
+}
+
+/// Real TTL/epoch sweep over the persistent tensor (Master Spec Ω+1
+/// ch. 21's `dissolution.ttl_required`/`finalize_residues_on_expiry`) —
+/// replaces the bare `ttl_epoch != 0` presence check used elsewhere in this
+/// workspace (e.g. `DissolutionGate`) with a genuine "has this entry's
+/// lifetime actually elapsed" computation over real epoch arithmetic.
+#[derive(Debug, Default)]
+pub struct DissolutionManager;
+
+impl DissolutionManager {
+    /// An entry is expired once `current_epoch` has advanced at least
+    /// `ttl` epochs past the entry's own accepted `epoch` — the literal
+    /// reading of `StitchTensorEntry`'s `epoch`+`ttl` fields as "TTL
+    /// counted in epochs."
+    #[must_use]
+    pub fn is_expired(entry: &StitchTensorEntry, current_epoch: EpochId) -> bool {
+        current_epoch.0.saturating_sub(entry.epoch.0) >= entry.ttl.0
+    }
+
+    /// Sweeps every entry a `StorageBackend` holds, returning the ids of
+    /// every one whose TTL has elapsed as of `current_epoch` — a real scan
+    /// over real entries, not a per-candidate flag check.
+    pub fn sweep(
+        backend: &impl StorageBackend,
+        current_epoch: EpochId,
+    ) -> Result<Vec<StitchId>, TensorError> {
+        Ok(backend
+            .entries()?
+            .into_iter()
+            .filter(|e| Self::is_expired(e, current_epoch))
+            .map(|e| e.id)
+            .collect())
     }
 }
 
@@ -405,6 +439,47 @@ mod tests {
         assert_eq!(reopened.graph().len(), 1);
         assert!(reopened.graph().contains(&StitchId::new("x")));
         assert_ne!(reopened.head(), Digest::GENESIS);
+    }
+
+    fn entry_with(id: &str, epoch: u64, ttl: u64) -> StitchTensorEntry {
+        let stitch = sample_stitch(id);
+        StitchTensorEntry {
+            id: stitch.id.clone(),
+            stitch,
+            gate_report: GateReportId::new(format!("gr-{id}")),
+            accepted_at: ssk_types::Tick(0),
+            epoch: EpochId(epoch),
+            ttl: Ttl(ttl),
+            prev_hash: Digest::GENESIS,
+            entry_hash: digest_of(&format!("seed-{id}"), HashAlg::Blake3).expect("hash"),
+        }
+    }
+
+    #[test]
+    fn is_expired_true_once_current_epoch_reaches_accepted_epoch_plus_ttl() {
+        let entry = entry_with("x", 10, 5);
+        assert!(!DissolutionManager::is_expired(&entry, EpochId(14)));
+        assert!(DissolutionManager::is_expired(&entry, EpochId(15)));
+        assert!(DissolutionManager::is_expired(&entry, EpochId(20)));
+    }
+
+    #[test]
+    fn sweep_returns_only_expired_entries() {
+        let backend: StitchMemoryBackend = GenericMemoryBackend::new();
+        backend
+            .append(entry_with("fresh", 10, 100))
+            .expect("append");
+        backend.append(entry_with("stale", 0, 5)).expect("append");
+
+        let expired = DissolutionManager::sweep(&backend, EpochId(10)).expect("sweep");
+        assert_eq!(expired, vec![StitchId::new("stale")]);
+    }
+
+    #[test]
+    fn sweep_over_an_empty_backend_finds_nothing() {
+        let backend: StitchMemoryBackend = GenericMemoryBackend::new();
+        let expired = DissolutionManager::sweep(&backend, EpochId(1000)).expect("sweep");
+        assert!(expired.is_empty());
     }
 
     #[test]

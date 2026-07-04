@@ -65,8 +65,11 @@ pub trait AeadProvider {
 /// (Master Spec Ω+1 ch. 5.1's `WitnessKind`: "Signature | Token | ZkStyle |
 /// PolicyCert"). Only `Signature` gets a real implementation in this phase —
 /// see `docs/OMEGA_CORE_CONFORMANCE_SPEC.md` Section X for why the other
-/// three stay deliberately unimplemented.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// three stay deliberately unimplemented. Serde derives added in Phase 8 so
+/// `ssk-config`'s `capabilities.allowed_witnesses` list (Section S) can
+/// reuse this type directly instead of duplicating it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum WitnessKind {
     Signature,
     Token,

@@ -7,8 +7,11 @@
 
 use ssk_types::{BoundaryRef, ResidueRef, StitchCandidate, TraceId, TrustClass};
 
-/// The nine axes of the hypercube (ch. 8.1, verbatim).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// The nine axes of the hypercube (ch. 8.1, verbatim). Serde derives added
+/// in Phase 8 so `ssk-config`'s `projective_connection_hypercube.axes` list
+/// (Section S) can reuse this type directly instead of duplicating it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Axis {
     Identity,
     Locator,
