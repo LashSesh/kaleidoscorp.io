@@ -1,0 +1,21 @@
+[package]
+name = "ssk-profile-manifold"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# The SSCL ProfileManifold (SSCL-3): versioned privacy/routing posture profiles
+# with gated, audited transitions. A transition is content-addressed, gated on an
+# authorization (a privacy downgrade requires an elevated authorization), and
+# appended to a hash-chained audit ledger. See SYSTEM_ARCHITECTURE_CORRESPONDENCE.md.
+
+[dependencies]
+ssk-types = { path = "../ssk-types", version = "0.1.0" }
+ssk-signature = { path = "../ssk-signature", version = "0.1.0" }
+serde = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+
+[lints]
+workspace = true

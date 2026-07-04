@@ -32,6 +32,7 @@ members = [
   "crates/ssk-crown",
   "crates/ssk-host-cells",
   "crates/ssk-funnel-dag",
+  "crates/ssk-profile-manifold",
   "crates/ssk-cli",
   "crates/ssk-ipc",
   "crates/ssk-daemon",
