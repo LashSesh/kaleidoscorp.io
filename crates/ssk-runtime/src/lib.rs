@@ -310,6 +310,52 @@ pub fn run_to_outcome(
     })
 }
 
+/// The real `PathProjectionCheck` (`ssk-locator`'s dependency-inverted trait)
+/// backed by the PCH's own facet-level axis predicates
+/// (`ssk_gates::pch::locator_axes_consistent`). This is the concrete bridge
+/// that lets `ssk_locator::select_path` consult the real Projective
+/// Connection Hypercube without `ssk-locator` depending on `ssk-gates` (which
+/// would cycle, since `ssk-gates` already depends on `ssk-locator` via
+/// `ssk-bcik`): the trait lives in the low crate, the implementation lives
+/// here in `ssk-runtime` where both crates are visible.
+#[derive(Debug, Default)]
+pub struct HypercubePathCheck;
+
+impl ssk_locator::PathProjectionCheck for HypercubePathCheck {
+    fn passes(&self, facet: &ssk_types::LocatorFacet, _theta: &ssk_types::PhaseVector) -> bool {
+        ssk_gates::pch::locator_axes_consistent(facet)
+    }
+}
+
+/// Selects the nearest PCH-consistent egress locator from a pool's funnel-DAG
+/// view, driving the real `HypercubePathCheck` (above) — the production entry
+/// point that ties `ssk_locator::select_path` (Section G.2) to the real
+/// hypercube (Section I). With a flat pool (no relay `StitchEdge`s configured),
+/// the reachable set is exactly the pool's own directly-usable locators; real
+/// multi-hop edges come from a routing policy not yet modeled.
+///
+/// # Errors
+/// Returns `FaultKind::LocatorUnavailable` if `start` is not in the pool or no
+/// reachable locator is PCH-consistent.
+pub fn select_egress(
+    pool: &StaticLocatorPool,
+    start: &ssk_types::LocatorId,
+    theta: &ssk_types::PhaseVector,
+) -> Result<ssk_types::LocatorPath, ssk_types::FaultKind> {
+    let graph = ssk_types::LocatorGraph {
+        nodes: pool.locators.clone(),
+        edges: Vec::new(),
+        hyperedges: Vec::new(),
+    };
+    ssk_locator::select_path(
+        theta,
+        &graph,
+        &HypercubePathCheck,
+        start,
+        &ssk_locator::Policy,
+    )
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct DeterminismContext {
     pub seeded: bool,
@@ -714,6 +760,51 @@ mod tests {
         // Fail-closed: no crossing, no materialization.
         assert_eq!(tensor.head(), head_before);
         assert!(tensor.graph().is_empty());
+    }
+
+    #[test]
+    fn select_egress_returns_a_trusted_low_risk_locator() {
+        let pool = StaticLocatorPool::new(vec![mk_locator_facet()]);
+        let path = select_egress(
+            &pool,
+            &ssk_types::LocatorId::new("local"),
+            &ssk_types::PhaseVector::zero(),
+        )
+        .expect("egress");
+        assert_eq!(path.destination, ssk_types::LocatorId::new("local"));
+    }
+
+    #[test]
+    fn select_egress_rejects_an_untrusted_locator() {
+        let mut facet = mk_locator_facet();
+        facet.trusted = false;
+        facet.trust = TrustClass::Untrusted;
+        let pool = StaticLocatorPool::new(vec![facet]);
+        let result = select_egress(
+            &pool,
+            &ssk_types::LocatorId::new("local"),
+            &ssk_types::PhaseVector::zero(),
+        );
+        assert!(matches!(
+            result,
+            Err(ssk_types::FaultKind::LocatorUnavailable)
+        ));
+    }
+
+    #[test]
+    fn select_egress_rejects_a_high_risk_locator() {
+        let mut facet = mk_locator_facet();
+        facet.risk_score = 90;
+        let pool = StaticLocatorPool::new(vec![facet]);
+        let result = select_egress(
+            &pool,
+            &ssk_types::LocatorId::new("local"),
+            &ssk_types::PhaseVector::zero(),
+        );
+        assert!(matches!(
+            result,
+            Err(ssk_types::FaultKind::LocatorUnavailable)
+        ));
     }
 
     #[test]

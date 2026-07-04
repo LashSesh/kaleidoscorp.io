@@ -5,7 +5,12 @@
 //! (this module) is a deliberate, disclosed choice: `HypercubeGate` is its
 //! sole consumer (see `docs/OMEGA_CORE_CONFORMANCE_SPEC.md` Section I).
 
-use ssk_types::{BoundaryRef, ResidueRef, StitchCandidate, TraceId, TrustClass};
+use ssk_types::{BoundaryRef, LocatorFacet, ResidueRef, StitchCandidate, TraceId, TrustClass};
+
+/// Risk-score ceiling for the `Risk` axis projection (ch. 8.1). Shared by
+/// `RiskProjector` and the facet-level `locator_axes_consistent` pre-check
+/// so the two never drift apart.
+pub const LOCATOR_RISK_CEILING: u8 = 70;
 
 /// The nine axes of the hypercube (ch. 8.1, verbatim). Serde derives added
 /// in Phase 8 so `ssk-config`'s `projective_connection_hypercube.axes` list
@@ -152,8 +157,8 @@ simple_projector!(
 simple_projector!(
     RiskProjector,
     Axis::Risk,
-    |sc: &StitchCandidate| sc.locator.risk_score <= 70,
-    Projection::OverBudget(Reason("locator risk score exceeds 70".into()))
+    |sc: &StitchCandidate| sc.locator.risk_score <= LOCATOR_RISK_CEILING,
+    Projection::OverBudget(Reason("locator risk score exceeds ceiling".into()))
 );
 simple_projector!(
     CapabilityProjector,
@@ -173,6 +178,23 @@ simple_projector!(
     |sc: &StitchCandidate| sc.boundary_complete && sc.seam_ok,
     Projection::Inconsistent(Reason("boundary/seam not closed".into()))
 );
+
+/// Facet-level PCH pre-check: the subset of axis projections that depend
+/// only on a `LocatorFacet` — `Locator` (trusted), `Trust` (trust class not
+/// `Untrusted`), and `Risk` (score within `LOCATOR_RISK_CEILING`). These are
+/// exactly the three projectors above that read solely `sc.locator`, so this
+/// is not a re-implementation but the same predicates hoisted to run before a
+/// full `StitchCandidate` exists. Master Spec Ω+1 ch. 14.1 places
+/// `LocatorPath` *before* the full `PCH Projection` stage, so path selection
+/// (`ssk_locator::select_path`) can only consult these facet-derivable axes;
+/// the remaining six axes are still enforced later by `HypercubeGate` over the
+/// complete candidate. This is the concrete backing for the dependency-
+/// inverted `PathProjectionCheck` trait (`ssk-locator`), implemented in
+/// `ssk-runtime` where both crates are visible without a dependency cycle.
+#[must_use]
+pub fn locator_axes_consistent(loc: &LocatorFacet) -> bool {
+    loc.trusted && loc.trust != TrustClass::Untrusted && loc.risk_score <= LOCATOR_RISK_CEILING
+}
 
 /// `Hypercube { projectors: [Box<dyn AxisProjector>; 9] }` (ch. 8.2, verbatim).
 pub struct Hypercube {

@@ -168,7 +168,7 @@ earlier pass without recheck).
 | `birefract()`/`IdentityRay`/`LocatorRay` | **[1] Phase 1 done** | `crates/ssk-core/src/lib.rs` — real, tested function; the two ray types have no `From`/`Into` between them | Ch. 4.2 |
 | 9-variant `LocatorKind`/`LocatorFacet` | **[1] Phase 1 done** | `crates/ssk-types/src/lib.rs` — all 9 variants; `LocatorFacet` carries the full field list plus two disclosed Phase-1 bridge fields (`trusted`/`risk_score`) preserving today's gate checks until Phase 3 rewires them | Ch. 4.3 |
 | `LocatorAdapter`/`LocatorPool` trait + `claims_external_plurality()` | **[1] Phase 1 done** | `crates/ssk-locator/src/lib.rs` — real traits; `StaticLocatorPool` implements both, with `claims_external_plurality()` genuinely counting distinct live endpoints (tested false-for-one, false-for-shared-endpoint, false-for-non-live, true-for-two-distinct-live) | Ch. 6.2 |
-| `StitchEdge`/`LocatorGraph`/`HyperEdge`/`select_path` | **[2] Phase 6 done (funnel-DAG only)** | `crates/ssk-types/src/lib.rs` (data types) + `crates/ssk-locator/src/lib.rs` (`select_path`, BFS over edges/hyperedges) — real and tested; no `Hypercube` wiring (dependency-inversion trait `PathProjectionCheck` instead, disclosed) and no real network egress adapters (stays `ssk-netcore`'s job, Section X) | Ch. 6.3-6.4 |
+| `StitchEdge`/`LocatorGraph`/`HyperEdge`/`select_path` | **[1] done (Phase 6 + hardening iter. B)** | `ssk-types` (data types) + `ssk-locator::select_path` (BFS, tested); the `PathProjectionCheck` bridge is now real — `ssk_gates::pch::locator_axes_consistent` + `ssk_runtime::{HypercubePathCheck, select_egress}` wire `select_path` to the real hypercube (dependency-inverted, no cycle), tested trusted/untrusted/high-risk. Real network egress adapters stay `ssk-netcore`'s job (Section X) | Ch. 6.3-6.4 |
 | `SchedulerMode`/`SchedulerSeed`/`visible()` | **[1] Phase 1 done** | `crates/ssk-scheduler/src/lib.rs` — renamed `HypertoroidalScheduler`; `Seeded` mode genuinely jitters phase advancement via a `rand_pcg`-seeded PRNG keyed by `(seed, tick count)`; `visible()` implements the literal toroidal-distance formula, tested including wraparound | Ch. 7.2 |
 | Projective Connection Hypercube | **[1] Phase 3 done** | `crates/ssk-gates/src/pch.rs` — real `Axis`/`Projection`/`Hypercube`; nine real per-axis projectors, `check()` returns `Pass`/`Hold`/`Fail` per the ch. 8.2 invariant (`OverBudget` holds, all else fails); `ProtocolProjector` honestly always-`Ok` (no fiber-invariant model yet) | Ch. 8 |
 | Gabriel Constraint Cells | **[1] Phase 3 done** | `crates/ssk-gates/src/gabriel.rs` — real `CellRole`/`CellVerdict`/`ConstraintCell`/`GabrielFilm`; nine real per-role cells, `evaluate_all()` tested (intact-candidate all-`Propose`, missing-capability `Reject`, high-risk `Quarantine`); `ProtocolCell` honestly always-`Propose` for the same reason | Ch. 10 |
@@ -623,15 +623,21 @@ every one of its `requires` locators has already been reached), skipping any edg
 use elsewhere).
 
 Two disclosed elaborations, both necessary rather than optional:
-1. **No `Hypercube` parameter.** `ssk-locator` cannot depend on `ssk-gates::pch::Hypercube`
-   directly — `ssk-gates` already depends on `ssk-locator` transitively (via `ssk-bcik`), so
-   the reverse edge would cycle, the same constraint discovered in Phases 3-5. Even ignoring
-   the cycle, `Hypercube::check` needs a full `StitchCandidate`, which does not exist yet at
-   path-selection time (ch. 14.1's spine places `LocatorPath` *before* the second `PCH
-   Projection` stage). `select_path` is instead generic over a new, locally-defined
-   `PathProjectionCheck` trait; `ssk-gates` (or a caller above it) may implement it once a
-   facet-level PCH pre-check makes sense. No implementation is wired in yet — this codebase's
-   own call sites (tests) only ever pass the trivial `AlwaysPass`.
+1. **No `Hypercube` parameter — resolved by dependency inversion (hardening iteration B).**
+   `ssk-locator` cannot depend on `ssk-gates::pch::Hypercube` directly — `ssk-gates` already
+   depends on `ssk-locator` transitively (via `ssk-bcik`), so the reverse edge would cycle, the
+   same constraint discovered in Phases 3-5. Even ignoring the cycle, `Hypercube::check` needs a
+   full `StitchCandidate`, which does not exist yet at path-selection time (ch. 14.1's spine
+   places `LocatorPath` *before* the second `PCH Projection` stage). `select_path` is therefore
+   generic over the locally-defined `PathProjectionCheck` trait — and the real implementation
+   now exists: `ssk_gates::pch::locator_axes_consistent` exposes exactly the three facet-derivable
+   axis predicates (`Locator`/`Trust`/`Risk`, hoisted from the identical projectors, sharing the
+   `LOCATOR_RISK_CEILING` constant so they never drift), and `ssk_runtime::HypercubePathCheck`
+   implements `PathProjectionCheck` by calling it. `ssk_runtime::select_egress` is the production
+   entry point tying `select_path` to the real hypercube. Tested: a trusted low-risk locator is
+   selected; an untrusted or high-risk one is `LocatorUnavailable`. The remaining six axes are
+   still enforced later by `HypercubeGate` over the complete candidate — path selection only
+   consults what a `LocatorFacet` alone can decide.
 2. **An explicit `start: &LocatorId` parameter.** The PDF's excerpted 4-parameter signature
    names no origin or destination; a shortest-path search needs one. `select_path` returns the
    nearest reachable locator that passes the injected check, which is the natural reading of
