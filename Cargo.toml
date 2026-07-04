@@ -33,6 +33,7 @@ members = [
   "crates/ssk-host-cells",
   "crates/ssk-funnel-dag",
   "crates/ssk-profile-manifold",
+  "crates/ssk-topology-scalpel",
   "crates/ssk-cli",
   "crates/ssk-ipc",
   "crates/ssk-daemon",

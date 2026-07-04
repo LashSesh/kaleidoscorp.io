@@ -1,0 +1,20 @@
+[package]
+name = "ssk-topology-scalpel"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# FCHL-MPK Band B: the TopologyScalpel. It PROPOSES gated, reversible topology
+# edit plans (candidates) — it never applies them itself. Each plan carries its
+# own inverse (rollback) and a gate verdict; application is a separate, gated
+# step performed by the caller. See FCHL_MPK_INTEGRATION_STRATEGY.md.
+
+[dependencies]
+ssk-types = { path = "../ssk-types", version = "0.1.0" }
+serde = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+
+[lints]
+workspace = true
