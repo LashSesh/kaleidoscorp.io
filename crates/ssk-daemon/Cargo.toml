@@ -1,0 +1,36 @@
+[package]
+name = "ssk-daemon"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "sskd"
+path = "src/main.rs"
+
+[dependencies]
+ssk-types = { path = "../ssk-types" }
+ssk-config = { path = "../ssk-config" }
+ssk-netadmin = { path = "../ssk-netadmin" }
+ssk-tensor = { path = "../ssk-tensor" }
+ssk-ipc = { path = "../ssk-ipc" }
+serde.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+tokio = { version = "1", features = [
+    "rt-multi-thread",
+    "sync",
+    "net",
+    "signal",
+    "time",
+    "macros",
+    "io-util",
+] }
+
+[dev-dependencies]
+tempfile.workspace = true
+serde_yaml.workspace = true
+
+[lints]
+workspace = true

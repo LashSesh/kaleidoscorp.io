@@ -43,15 +43,21 @@ API/DTOs, the state model, and the security guarantees.
 6. Every new capability ships with tests as specified in section N. Do not mark a phase done until
    its acceptance criteria (section M) pass.
 
-### Do Phase 1 first — Core completion & honesty pass
+### Phase 1 — Core completion & honesty pass — **done**
 
-- Persist `ssk-netadmin` `AuditLedger`/`SessionLedger` by delegating to
-  `ssk-tensor::FileLedgerBackend`; add real transport `AuditOutcome` variants.
-- Create crate `ssk-signing` (ed25519 via `ed25519-dalek`) implementing `ssk-crypto::SignatureProvider`.
-- Feature-gate zero/test keys so a **release** build cannot use them; then correct `SECURITY.md:47`.
-- Correct `NETADMIN_SPEC.md:176` (`connect()` claim) and the "signed"/"Proxifier replacement" wording.
-- **AC:** audit chain verifies across a restart; release build rejects a zero attestation key;
-  ed25519 sign/verify vectors pass; no forbidden claim remains in docs.
+- Persisted `ssk-netadmin` `AuditLedger`/`SessionLedger` via a generalized `ssk-tensor` storage layer
+  (`GenericLedgerBackend<E>`); added reserved `AuditOutcome` variants for Phase 3.
+- Implemented ed25519 (`Ed25519KeyPair`/`Ed25519Verifier`) + ChaCha20-Poly1305 directly in
+  `ssk-crypto` behind its existing `crypto` feature — no new `ssk-signing` crate was needed, since the
+  optional `ed25519-dalek`/`chacha20poly1305` dependencies already sat unused there.
+- Feature-gated zero/test keys so a **release** build cannot use them (verified: a plain
+  `cargo build --release -p ssk-netadmin` rejects `AttestationBinder::new([0u8;32])`); corrected
+  `SECURITY.md:47`.
+- Corrected `NETADMIN_SPEC.md`'s `connect()` claim and the architecture doc's "signed"/"Proxifier
+  replacement" wording (Section L.3).
+- **AC verified:** audit/session chains verify across a real process restart; release build rejects
+  a zero attestation key; `ed25519_vectors.rs` (9 tests) passes; `cargo test --workspace` and
+  `cargo clippy --workspace --all-targets -- -D warnings` are green; no forbidden claim remains.
 
 ### Then Phase 2 — Daemon + IPC
 

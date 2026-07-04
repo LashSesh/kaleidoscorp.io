@@ -221,6 +221,7 @@ pub fn sample_intent(valid: bool) -> ConnectionIntent {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ssk_tensor::GenericLedgerBackend;
     use ssk_types::{Locator, LocatorType};
 
     #[test]

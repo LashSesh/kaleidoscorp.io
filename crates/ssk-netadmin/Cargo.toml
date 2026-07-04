@@ -4,14 +4,29 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+default = []
+# Enables `AttestationBinder::new_test_key()`, which supplies the fixed
+# all-zero reference key used by this crate's own tests. No shipped binary
+# enables this feature — `AttestationBinder` (real flow attestation) has a
+# zero-exception guarantee.
+insecure-test-keys = []
+
 [dependencies]
 ssk-types  = { path = "../ssk-types" }
 ssk-crypto = { path = "../ssk-crypto" }
+ssk-tensor = { path = "../ssk-tensor" }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 blake3.workspace = true
 hex.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+# Self-dependency: unifies `insecure-test-keys` on for `cargo test -p ssk-netadmin`
+# without enabling it by default for real consumers.
+ssk-netadmin = { path = ".", features = ["insecure-test-keys"] }
 
 [lints]
 workspace = true

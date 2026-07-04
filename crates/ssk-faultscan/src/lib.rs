@@ -133,18 +133,13 @@ pub fn fault_residue(fault: FaultKind) -> BoundaryResidue {
 /// `run_intent` is a callback that accepts a `ConnectionIntent` and returns
 /// `(gate_outcome, residues)`.  This keeps the drill runner decoupled from
 /// the runtime (avoids circular crate dependencies while still being testable).
-pub fn run_drill<F>(
-    clean_intent: ConnectionIntent,
-    fault: FaultKind,
-    run_intent: &F,
-) -> DrillReport
+pub fn run_drill<F>(clean_intent: ConnectionIntent, fault: FaultKind, run_intent: &F) -> DrillReport
 where
     F: Fn(ConnectionIntent) -> (GateOutcomeKind, Vec<BoundaryResidue>),
 {
     let faulted = inject_fault(clean_intent.clone(), fault);
     let (faulted_outcome, faulted_residues) = run_intent(faulted);
-    let fault_detected =
-        faulted_outcome != GateOutcomeKind::Pass || !faulted_residues.is_empty();
+    let fault_detected = faulted_outcome != GateOutcomeKind::Pass || !faulted_residues.is_empty();
 
     let (recovery_outcome, _) = run_intent(clean_intent);
     let recovery_succeeded = recovery_outcome == GateOutcomeKind::Pass;
@@ -227,17 +222,26 @@ mod tests {
 
     #[test]
     fn signature_corruption_detected_and_recovered() {
-        let drill =
-            run_drill(sample_clean_intent(), FaultKind::SignatureCorruption, &stub_run);
-        assert!(drill.fault_detected, "signature corruption must be detected");
+        let drill = run_drill(
+            sample_clean_intent(),
+            FaultKind::SignatureCorruption,
+            &stub_run,
+        );
+        assert!(
+            drill.fault_detected,
+            "signature corruption must be detected"
+        );
         assert!(drill.recovery_succeeded, "clean run must recover");
         assert!(drill.passed());
     }
 
     #[test]
     fn capability_withdrawal_detected() {
-        let drill =
-            run_drill(sample_clean_intent(), FaultKind::CapabilityWithdrawal, &stub_run);
+        let drill = run_drill(
+            sample_clean_intent(),
+            FaultKind::CapabilityWithdrawal,
+            &stub_run,
+        );
         assert!(drill.fault_detected);
         assert!(drill.passed());
     }
@@ -253,15 +257,20 @@ mod tests {
     fn replay_drift_detected() {
         let drill = run_drill(sample_clean_intent(), FaultKind::ReplayDrift, &stub_run);
         assert!(drill.fault_detected, "replay drift must be detected");
-        assert!(drill.recovery_succeeded, "clean run must recover after drift");
+        assert!(
+            drill.recovery_succeeded,
+            "clean run must recover after drift"
+        );
         assert!(drill.passed());
     }
 
     #[test]
     fn locator_untrust_detected() {
-        let drill =
-            run_drill(sample_clean_intent(), FaultKind::LocatorUntrust, &stub_run);
-        assert!(drill.fault_detected, "locator untrust must be detected via proxy");
+        let drill = run_drill(sample_clean_intent(), FaultKind::LocatorUntrust, &stub_run);
+        assert!(
+            drill.fault_detected,
+            "locator untrust must be detected via proxy"
+        );
         assert!(drill.passed());
     }
 

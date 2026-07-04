@@ -60,9 +60,10 @@ Concretely, the "network administration layer" `ssk-netadmin`:
 - **Flows are hand-built, not captured.** `FlowRecord`/`FlowDescriptor` constructors
   (`crates/ssk-netadmin/src/flow.rs:44-81`) are filled in by callers; there is no packet capture,
   pcap, eBPF, or listener.
-- **Ledgers are in-memory only.** `AuditLedger` and `SessionLedger` are `Vec<...>` with real
-  BLAKE3 hash-chaining and `verify()` (`crates/ssk-netadmin/src/audit.rs:86-144`,
-  `crates/ssk-netadmin/src/session.rs:51-105`) but **no disk persistence** — no `File`, no `fsync`.
+- **Ledgers were in-memory only** at the time of this diagnosis. `AuditLedger` and `SessionLedger`
+  had real BLAKE3 hash-chaining and `verify()` but no disk persistence.
+  **Fixed in Phase 1:** both are now generic over an `ssk_tensor::GenericLedgerBackend<E>` storage
+  backend, with a `::persisted(path)` constructor that survives a process restart (see M-Phase 1).
 
 ### A.2 What it *can* do (genuinely)
 
@@ -99,12 +100,14 @@ did not move) on the wire", plus everything a desktop product needs around it:
 7. **Persistent, versioned product config** (profiles, adapters, chains, app rules, DNS rules,
    kill-switch, update channel, GUI prefs) **with a save path** — the current config crate is
    read-only and has no product-profile model. *([2]/[4].)*
-8. **Audit persistence** to disk (the tensor backend exists; the netadmin ledgers are not wired
-   to it). *([2]→[5].)*
-9. **Real asymmetric signing** for attestation, signed config changes, and update verification —
-   today attestation is a **symmetric** BLAKE3 keyed-MAC (`crates/ssk-interop/src/lib.rs:53-71`,
-   `crates/ssk-netadmin/src/attestation.rs:67-113`) and `ssk-crypto` is **traits-only, no impls**
-   (`crates/ssk-crypto/src/lib.rs`). *([2]/[3]→[5].)*
+8. **Audit persistence** to disk. **Done (Phase 1):** the netadmin ledgers now delegate to a
+   generalized `ssk-tensor` storage backend via `::persisted(path)`. *([1] done.)*
+9. **Real asymmetric signing** for attestation, signed config changes, and update verification.
+   **Done (Phase 1):** `ssk-crypto`'s `crypto` feature now implements `Ed25519KeyPair`/`Ed25519Verifier`
+   (`SignatureProvider`) and `ChaCha20Poly1305Provider` (`AeadProvider`). Attestation itself
+   (`ssk-netadmin::AttestationBinder`, `ssk-interop::Blake3KeyedVerifier`) still *defaults* to the
+   symmetric BLAKE3 keyed-MAC — wiring the new ed25519 impls into `AttestationBinder` as an
+   alternative scheme is not yet done. *([1] crypto primitives done / [4] attestation wiring remains.)*
 10. A **secret store**, a **permission model**, a **secure updater with rollback**, and a
     **Tauri bridge** over the IPC. *([3]/[4]/[5].)*
 
@@ -143,8 +146,8 @@ Status tags per the legend. Evidence is file:line.
 | `route` | **[1]** plan / **[4]** execute | `RouteOrchestrator::plan` → `RouteCandidate`. `Fallback` variant defined but never produced. No executor. Unknown adapter → `Err(UnknownAdapter)` (fail-closed). | `crates/ssk-netadmin/src/route.rs:48-184` |
 | `adapter` | **[2]** descriptor-only | 5 adapters (`Direct/Socks5/HttpConnect/TlsTunnel/DnsOverride`); only `describe()`. No `connect()`. | `crates/ssk-netadmin/src/adapter.rs:14-270` |
 | `attestation` | **[1]** crypto / **[2]** as "signing" | Real BLAKE3 keyed-MAC sign/verify; symmetric, not asymmetric. | `crates/ssk-netadmin/src/attestation.rs:67-113` |
-| `session` | **[1]** chain / **[2]** persistence | Real in-memory BLAKE3 hash chain + `verify`; not persisted. | `crates/ssk-netadmin/src/session.rs:51-105` |
-| `audit` | **[1]** chain / **[2]** persistence | `AuditOutcome`, `ForensicEntry`, `AuditLedger` hash chain + `verify`; **in-memory `Vec`, not persisted**. | `crates/ssk-netadmin/src/audit.rs:86-144` |
+| `session` | **[1]** chain, **[1]** persistence | Real BLAKE3 hash chain + `verify`. **Phase 1:** generic over `ssk_tensor::GenericLedgerBackend<E>`; `SessionLedger::persisted(path)` survives a process restart. | `crates/ssk-netadmin/src/session.rs` |
+| `audit` | **[1]** chain, **[1]** persistence | `AuditOutcome`, `ForensicEntry`, `AuditLedger` hash chain + `verify`. **Phase 1:** `AuditLedger::persisted(path)` gives real, tested disk persistence via the generalized `ssk-tensor` backend. | `crates/ssk-netadmin/src/audit.rs` |
 | `control` | **[1]** model | `RolloutMode` (Strict/Shadow/Audit/Emergency), `OperatorProfile`, `TenantContext`, adapter/risk checks over `Vec`s. | `crates/ssk-netadmin/src/control.rs:12-169` |
 | `error` | **[1]** | `NetAdminError` — 9 logical variants, **no `std::io::Error` variant** (confirms no I/O). | `crates/ssk-netadmin/src/error.rs:6-25` |
 
@@ -160,7 +163,7 @@ Status tags per the legend. Evidence is file:line.
 | `ssk-replay` | **[1]** shallow | Exact-equality diff of two runs; not independent re-exec. | `crates/ssk-replay/src/lib.rs` |
 | `ssk-faultscan` | **[2]** | Real chaos harness; decoupled from real gate vector via caller closure; `LocatorUntrust` is a signature-corruption proxy. | `crates/ssk-faultscan/src/lib.rs:101-105` |
 | `ssk-privacy` | **[2]** | `linkability_score = risk` (untrusted) or `risk/2` (trusted); wired into Privacy gate (threshold 50) but is a one-line heuristic, not anonymity analysis. | `crates/ssk-privacy/src/lib.rs` |
-| `ssk-crypto` | **[3]** stub | **Traits only, zero implementations** (`HashProvider`, `SignatureProvider`, `KeyAgreementProvider`, `AeadProvider`, `CapabilityWitnessProvider`). | `crates/ssk-crypto/src/lib.rs` |
+| `ssk-crypto` | **[1]** (was [3] stub) | **Phase 1:** `SignatureProvider` (`Ed25519KeyPair`/`Ed25519Verifier`) and `AeadProvider` (`ChaCha20Poly1305Provider`) now implemented behind the `crypto` feature. `KeyAgreementProvider`/`CapabilityWitnessProvider` remain unimplemented (not required yet). | `crates/ssk-crypto/src/lib.rs` |
 | `ssk-audit` | **[2]** misnamed | 12-line single-record trace-hash helper; **not** a ledger. Real ledgers are in `ssk-tensor` + `ssk-netadmin`. | `crates/ssk-audit/src/lib.rs` |
 | `ssk-sim` | **[2]** stub-level | `evaluate()` returns a summary. | `crates/ssk-sim/src/lib.rs` |
 
@@ -271,10 +274,12 @@ shared verbatim by GUI and CLI. → **Sections J, F.5**, crate `ssk-ipc`.
 ### D.5 Persistence, secrets, signing, updates — **[2]/[3]→[5]**
 
 Needed: persisted product config with a save path and product-profile model (`ssk-config` v3);
-persisted audit chains (wire netadmin ledgers to `ssk-tensor` `FileLedgerBackend`); OS-keychain
-secret store (`ssk-secrets`); real ed25519 signing (`ssk-signing`, implementing the empty
-`ssk-crypto` traits); secure updater with mandatory signatures + rollback (`ssk-updater`).
-→ **Sections I, F.9, L**.
+persisted audit chains (wire netadmin ledgers to `ssk-tensor` `FileLedgerBackend` — **done**, see B.6);
+OS-keychain secret store (`ssk-secrets`); secure updater with mandatory signatures + rollback
+(`ssk-updater`). Real ed25519 signing is **done**: `ssk-crypto`'s `crypto` feature now implements
+`SignatureProvider`/`AeadProvider` (`Ed25519KeyPair`, `Ed25519Verifier`, `ChaCha20Poly1305Provider`) —
+no separate `ssk-signing` crate was needed, since the optional `ed25519-dalek`/`chacha20poly1305`
+dependencies already sat unused in `ssk-crypto`. → **Sections I, F.9, L**.
 
 ---
 
@@ -303,10 +308,9 @@ except where an OS FFI boundary genuinely requires `unsafe` — there it is conf
    │ route exec·   │ │ TUN· app-   │ │ zeroize    │ │ rollback    │
    │ DNS· breaker  │ │ rules       │ └──────┬─────┘ └──────┬──────┘
    └───────┬───────┘ └──────┬──────┘        │              │
-           │                │           ┌───┴──────────────┴───┐
-           │                │           │      ssk-signing      │ (ed25519 impls of ssk-crypto)
-           │                │           └──────────┬────────────┘
-   ┌───────┴────────────────┴──────────────────────┴──────── control plane (existing, reused) ──┐
+           │                │            (ed25519 via ssk-crypto's `crypto` feature — done)
+           │                │                              │
+   ┌───────┴────────────────┴──────────────────────────────┴─── control plane (existing, reused) ──┐
    │ ssk-netadmin (policy·route-planner·attestation·control·audit-model)                          │
    │ ssk-runtime · ssk-gates · ssk-tensor(persistence) · ssk-interop · ssk-config · ssk-types …   │
    └──────────────────────────────────────────────────────────────────────────────────────────────┘
@@ -404,17 +408,21 @@ in-memory `zeroize`, and redaction helpers used everywhere secrets could be logg
 Never returns a secret across IPC in plaintext except to the local, authenticated GUI on explicit,
 audited request.
 
-#### `ssk-signing` — real asymmetric signing (**[5]**)
+#### `ssk-crypto`'s `crypto` feature — real asymmetric signing (**[1] done**)
 
-ed25519 (via `ed25519-dalek`) implementing the currently-empty `ssk-crypto::SignatureProvider`.
-Used for: signed config changes, attestation upgrade (replacing/wrapping the symmetric MAC), and
-update-artifact verification. Provides key generation, keystore integration (`ssk-secrets`), sign,
-verify.
+ed25519 (via `ed25519-dalek`), implemented directly inside `ssk-crypto` behind its existing
+`crypto` feature rather than a separate crate — `ed25519-dalek`/`x25519-dalek`/`chacha20poly1305`
+were already declared as unused optional dependencies there. `Ed25519KeyPair`/`Ed25519Verifier`
+implement `SignatureProvider`; `ChaCha20Poly1305Provider` implements `AeadProvider`. Used for:
+signed config changes, attestation upgrade (replacing/wrapping the symmetric MAC), and
+update-artifact verification. Key generation is seed-based (`rand::random()` → `SigningKey::from_bytes`),
+needing no new `rand_core`/`zeroize` workspace dependency. Keystore integration (`ssk-secrets`) is
+still Phase 5 work.
 
 #### `ssk-updater` — secure updates (**[5]**)
 
-Channels `stable`/`beta`; **signature verification mandatory** (via `ssk-signing`); atomic
-install; rollback to last-known-good. Realizes `docs/ROADMAP_DESKTOP_GUI.md` auto-update section.
+Channels `stable`/`beta`; **signature verification mandatory** (via `ssk-crypto`'s ed25519 impls);
+atomic install; rollback to last-known-good. Realizes `docs/ROADMAP_DESKTOP_GUI.md` auto-update section.
 
 #### `ssk-tauri-bridge` — GUI backend (**[5]**, Phase 7)
 
@@ -425,9 +433,9 @@ No business logic, no shell-out. Ships the Tauri app.
 
 | Crate | Extension |
 |-------|-----------|
-| `ssk-netadmin` | Add a `RouteCandidate`→executable binding hook consumed by `ssk-netcore`; make `AuditLedger`/`SessionLedger` persistable by delegating to `ssk-tensor::FileLedgerBackend`; add `AuditOutcome` variants for real transport outcomes (e.g. `DispatchedBytes`, `TransportFailed`, `KillSwitchBlocked`). |
+| `ssk-netadmin` | **Done:** `AuditLedger`/`SessionLedger` are now generic over an `ssk_tensor::GenericLedgerBackend<E>` storage backend, defaulting to in-memory with an additive `::persisted(path)` constructor for real disk persistence. Remaining: a `RouteCandidate`→executable binding hook consumed by `ssk-netcore`; `AuditOutcome` variants for real transport outcomes (`AdapterUnreachable`, `KillSwitchBlocked`, `FallbackDispatched` — added as reserved/not-yet-produced). |
 | `ssk-config` | New **v3** product schema (Section I): profiles, adapters, chains, app rules, DNS rules, kill-switch, attestation reqs, tenant context, audit/logging, update channel, GUI prefs. Add a **save/write + atomic-replace path** (currently read-only) and a v2→v3 migration alongside the existing v1→v2. |
-| `ssk-crypto` | Keep the trait definitions; provide real impls via `ssk-signing` (ed25519), BLAKE3 (delegating to existing usage), and an AEAD (chacha20poly1305) for at-rest secret/config sealing. |
+| `ssk-crypto` | **Done:** real impls behind the `crypto` feature — `Ed25519KeyPair`/`Ed25519Verifier` (`SignatureProvider`), `ChaCha20Poly1305Provider` (`AeadProvider`). `KeyAgreementProvider` (x25519) and `CapabilityWitnessProvider` remain unimplemented (no current acceptance criterion needs them). |
 | `ssk-cli` | Retarget `run/replay-verify/verify-ledger/doctor/net-admin/...` to talk to the daemon through `ssk-ipc`; keep an offline `--local` mode for the pure decision pipeline. |
 | `ssk-runtime` | Expose the deterministic pipeline as a re-entrant, service-callable unit (borrowable by the daemon per flow), plus wire `RuntimeEvent` into the daemon event bus. |
 
@@ -631,7 +639,7 @@ Extends the existing versioned, migratable, fail-closed model (`crates/ssk-confi
 - `version: 3`, validated (fail-closed), migratable, serde (YAML/TOML in, plus a new **atomic
   save** path — the current crate only reads).
 - Secrets are **never** stored inline: config holds secret *references* resolved via `ssk-secrets`.
-- Signed changes: mutating writes carry an ed25519 signature (`ssk-signing`) recorded in audit.
+- Signed changes: mutating writes carry an ed25519 signature (`ssk-crypto`'s `crypto` feature) recorded in audit.
 
 ### I.2 Model (shape, not final Rust)
 
@@ -792,11 +800,14 @@ freeze writes, alert.
 - **Kill switch.** When armed, loss of the required route blocks traffic (incl. LAN if configured),
   including across daemon crash (recovery-mode fail-closed).
 - **Tamper-evident, persisted audit.** All dangerous/state-changing actions append to a BLAKE3
-  hash-chained ledger persisted via `ssk-tensor::FileLedgerBackend`; `verify_audit_chain` detects
-  mutation/gaps (extends `audit.rs:131-144` with real persistence).
+  hash-chained ledger. **Done** (Phase 1): `ssk-netadmin`'s `AuditLedger`/`SessionLedger` are generic
+  over `ssk_tensor::GenericLedgerBackend<E>` with a `::persisted(path)` constructor delegating to
+  `ssk-tensor`'s (now-generalized) `GenericFileLedgerBackend`; `verify()` detects mutation/gaps across
+  a process restart. Wiring this into the live daemon's audit binding is still Phase 6 work.
 - **Secret redaction & isolation.** Secrets live in the OS keychain (`ssk-secrets`), are zeroized in
   memory, are referenced (not inlined) in config, and are redacted from logs/diagnostics.
-- **Signed config changes.** Mutating config is ed25519-signed (`ssk-signing`) and audited.
+- **Signed config changes.** Mutating config is ed25519-signed (`ssk-crypto`'s `crypto` feature,
+  `Ed25519KeyPair`) and audited.
 - **Secure updates.** Signature verification is mandatory; rollback to last-known-good is available.
 - **Local-only IPC authentication.** Peer-credential + per-session token; same-user only.
 - **Explicit privilege boundary.** Privileged capture runs in a minimal, separate helper.
@@ -813,19 +824,28 @@ freeze writes, alert.
 
 ### L.3 Forbidden claims (correct the current docs)
 
-The following current statements are **false or overstated** and must not appear in the product:
+The following were **false or overstated**; items 2 and 4 are now fixed (Phase 1), item 1 has a real
+alternative available but the *default* attestation scheme is still the symmetric MAC, and item 3
+remains unclaimable until the Phase 3 data plane ships:
 
-1. "Cryptographically **signed** attestation" while using a **symmetric** BLAKE3 keyed-MAC
-   (`ssk-interop/src/lib.rs:53-71`, `ssk-netadmin/src/attestation.rs:67-113`). Until `ssk-signing`
-   ships, call it "keyed-MAC attestation"; after, "ed25519-signed attestation."
-2. "Zero-key constructors are compile-time restricted to test builds" (`SECURITY.md:47-49`) — the
-   constructors are unrestricted `pub` (`ssk-interop/src/lib.rs:53-57`). Fix: gate zero/test keys
-   behind a `cfg(test)`/feature and forbid them in release, then the claim becomes true.
+1. "Cryptographically **signed** attestation" — `ssk-netadmin::AttestationBinder` and
+   `ssk-interop::Blake3KeyedVerifier` still *default* to a **symmetric** BLAKE3 keyed-MAC
+   (`ssk-interop/src/lib.rs`, `ssk-netadmin/src/attestation.rs`) — call this "keyed-MAC attestation."
+   A real asymmetric alternative now exists (`ssk_crypto::Ed25519KeyPair`/`Ed25519Verifier`, behind
+   the `crypto` feature) and may be called "ed25519-signed attestation" **only** where it is actually
+   used — wiring it into `AttestationBinder` itself is not yet done.
+2. **Fixed.** "Zero-key constructors are compile-time restricted to test builds" (`SECURITY.md:47-49`)
+   is now true: `Blake3KeyedVerifier::new`/`AttestationBinder::new` unconditionally reject an all-zero
+   key; a separate `new_test_key()` (gated by `cfg(test)`/the `insecure-test-keys` feature, off by
+   default) supplies the fixed reference key. `ssk-cli` is the one shipped binary that opts
+   `ssk-interop` into that feature (for its `interop conformance` self-test only); `ssk-netadmin`'s
+   `AttestationBinder` has no such exception anywhere.
 3. "In-process **Proxifier replacement** / cryptographically-audited traffic **routing**" while
    adapters are descriptor-only and no bytes move (`adapter.rs:5-9`, `route.rs:117-128`). Only claim
    this once `ssk-netcore` + `ssk-capture` ship and pass the Section-N data-plane tests.
-4. `DataPlaneAdapter::connect()` in `NETADMIN_SPEC.md:176-182` — align the spec with the real
-   `describe()`-only trait (or ship the runtime that makes it true).
+4. **Fixed.** `DataPlaneAdapter::connect()` in `NETADMIN_SPEC.md` has been removed from the documented
+   trait; the spec now matches the real `describe()`-only trait and points to the Phase 3
+   `ssk-netcore::AdapterRuntime::connect` runtime layered alongside it.
 
 ### L.4 Threat-model boundaries
 
@@ -841,13 +861,26 @@ signatures.
 Each phase lists crates/files, key APIs, tests, and acceptance criteria. Phases are additive; nothing
 built is later discarded. "AC" = acceptance criteria (executable).
 
-### Phase 1 — Core completion & honesty pass
-- Crates: `ssk-netadmin`, `ssk-config`, `ssk-crypto`, `ssk-signing` (new), `SECURITY.md`, `NETADMIN_SPEC.md`.
-- Work: persist netadmin `AuditLedger`/`SessionLedger` via `ssk-tensor::FileLedgerBackend`; feature-gate
-  zero/test keys (fix `SECURITY.md:47`); scaffold `ssk-signing` (ed25519) implementing `ssk-crypto::SignatureProvider`;
-  add real transport `AuditOutcome` variants; correct doc claims (Section L.3).
-- Tests: persisted-then-reopened audit chain verifies; release build rejects zero key; ed25519 sign/verify vectors.
-- AC: `verify_audit_chain` passes across a daemon restart; a release-profile build **fails** if a zero attestation key is used; docs contain no forbidden claim.
+### Phase 1 — Core completion & honesty pass — **done**
+- Crates: `ssk-tensor` (generalized), `ssk-netadmin`, `ssk-crypto`, `ssk-interop`, `ssk-cli`, `SECURITY.md`, `NETADMIN_SPEC.md`.
+- Work: generalized `ssk-tensor`'s `LedgerBackend`/`MemoryBackend`/`FileLedgerBackend` to be generic
+  over the entry type (via a `GenericLedgerBackend<E>` storage trait + type aliases, preserving the
+  old API); wired `ssk-netadmin`'s `AuditLedger`/`SessionLedger` to real disk persistence via
+  `AuditLedger::persisted(path)`/`SessionLedger::persisted(path)`; implemented ed25519
+  (`Ed25519KeyPair`/`Ed25519Verifier`) + ChaCha20-Poly1305 (`ChaCha20Poly1305Provider`) directly in
+  `ssk-crypto` behind its existing `crypto` feature (no new `ssk-signing` crate); feature-gated the
+  zero-key constructors (`Blake3KeyedVerifier::new`/`AttestationBinder::new` now reject an all-zero
+  key unconditionally; `new_test_key()` is the explicit, narrowly-scoped exception — only `ssk-cli`
+  opts `ssk-interop` into it, for the real `interop conformance` production call site that needed the
+  fixed reference key); corrected `SECURITY.md`/`NETADMIN_SPEC.md`/this doc's forbidden claims (L.3).
+- Tests: `ssk-tensor` generic-backend unit tests; `ssk-netadmin`'s `persisted_chain_survives_reopen`
+  (audit + session); `ssk-crypto/tests/ed25519_vectors.rs` (9 tests: sign/verify round-trip, tamper
+  detection, deterministic seed, AEAD round-trip/tamper/AAD-mismatch); `new_rejects_zero_key` in both
+  `ssk-interop` and `ssk-netadmin::attestation`. All existing tests (including `ux_snapshots.rs`)
+  pass unmodified.
+- AC verified: `verify()` passes on both ledgers after a real process restart at the same path; a
+  plain `cargo build --release -p ssk-netadmin` (no feature flags) rejects `AttestationBinder::new([0u8;32])`;
+  `cargo test --workspace`/`cargo clippy --workspace --all-targets -- -D warnings` are green.
 
 ### Phase 2 — Daemon + IPC
 - Crates: `ssk-daemon` (new, bin `sskd`), `ssk-ipc` (new).
@@ -905,7 +938,7 @@ built is later discarded. "AC" = acceptance criteria (executable).
 |-------|------|----------------|-------|
 | Control plane | unit | policy/route-plan/attestation/ledger logic (existing) | `crates/ssk-netadmin/**`, `ssk-runtime/**` |
 | Config | unit | v3 validate/migrate/save, secret-ref resolution | `ssk-config` |
-| Signing | unit/vectors | ed25519 sign/verify, key handling | `ssk-signing` |
+| Signing | unit/vectors | ed25519 sign/verify, key handling — **done** | `ssk-crypto/tests/ed25519_vectors.rs` |
 | Data plane | integration | real handshakes to local test servers per adapter; multi-hop; fallback | `ssk-netcore/tests` |
 | Data plane | conformance | SOCKS5/HTTP-CONNECT/TLS wire correctness | `ssk-netcore/tests` |
 | Invariants | integration | unknown-adapter-deny, no-direct-fallback, Denied-terminal, kill-switch supremacy, DNS-no-bypass | `ssk-netcore/tests` |

@@ -23,11 +23,7 @@ pub struct HopSpec {
 }
 
 impl HopSpec {
-    pub fn new(
-        adapter_id: impl Into<String>,
-        address: impl Into<String>,
-        port: u16,
-    ) -> Self {
+    pub fn new(adapter_id: impl Into<String>, address: impl Into<String>, port: u16) -> Self {
         Self {
             adapter_id: adapter_id.into(),
             address: address.into(),
@@ -148,17 +144,17 @@ impl RouteOrchestrator {
                 false,
             )),
             PolicyAction::Redirect { adapter_id } => {
-                let entry = self.resolve_adapter(adapter_id).ok_or_else(|| {
-                    NetAdminError::UnknownAdapter(adapter_id.clone())
-                })?;
+                let entry = self
+                    .resolve_adapter(adapter_id)
+                    .ok_or_else(|| NetAdminError::UnknownAdapter(adapter_id.clone()))?;
                 Ok((RouteKind::SingleHop(entry.default_hop.clone()), false))
             }
             PolicyAction::SplitRoute { adapter_ids } => {
                 let mut hops = Vec::with_capacity(adapter_ids.len());
                 for aid in adapter_ids {
-                    let entry = self.resolve_adapter(aid).ok_or_else(|| {
-                        NetAdminError::UnknownAdapter(aid.clone())
-                    })?;
+                    let entry = self
+                        .resolve_adapter(aid)
+                        .ok_or_else(|| NetAdminError::UnknownAdapter(aid.clone()))?;
                     hops.push(entry.default_hop.clone());
                 }
                 if hops.is_empty() {
@@ -194,7 +190,13 @@ mod tests {
         FlowRecord::new(
             id,
             0,
-            FlowDescriptor::new("app", "example.com", 443, ProtocolKind::Https, RiskLevel::Low),
+            FlowDescriptor::new(
+                "app",
+                "example.com",
+                443,
+                ProtocolKind::Https,
+                RiskLevel::Low,
+            ),
         )
     }
 

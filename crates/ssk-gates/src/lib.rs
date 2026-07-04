@@ -76,9 +76,11 @@ impl Gate for BasicGate {
             }
             // Defense-in-depth: Hypercube independently checks seam integrity.
             // BCIK also checks seam_ok; this gate catches any bypass of BCIK.
-            GateId::Hypercube if !sc.seam_ok => {
-                reject(self.id, ResidueKind::Boundary, "hypercube seam integrity failed")
-            }
+            GateId::Hypercube if !sc.seam_ok => reject(
+                self.id,
+                ResidueKind::Boundary,
+                "hypercube seam integrity failed",
+            ),
             GateId::Capability if !sc.capability_witness => reject(
                 self.id,
                 ResidueKind::Capability,
@@ -90,10 +92,13 @@ impl Gate for BasicGate {
             }
             // Privacy enforces a maximum linkability score on the locator.
             GateId::Privacy
-                if ssk_privacy::linkability_score(&sc.locator)
-                    > PRIVACY_LINKABILITY_THRESHOLD =>
+                if ssk_privacy::linkability_score(&sc.locator) > PRIVACY_LINKABILITY_THRESHOLD =>
             {
-                reject(self.id, ResidueKind::Correlation, "privacy linkability threshold exceeded")
+                reject(
+                    self.id,
+                    ResidueKind::Correlation,
+                    "privacy linkability threshold exceeded",
+                )
             }
             GateId::Boundary if !sc.boundary_complete => reject(
                 self.id,

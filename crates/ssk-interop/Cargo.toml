@@ -4,6 +4,13 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+default = []
+# Enables `Blake3KeyedVerifier::new_test_key()`, which supplies the fixed
+# all-zero reference key used by protocol conformance self-tests. Never
+# enable this for peer-trust verification in a shipped binary.
+insecure-test-keys = []
+
 [dependencies]
 serde.workspace = true
 thiserror.workspace = true
@@ -15,6 +22,9 @@ ssk-types = { path = "../ssk-types" }
 [dev-dependencies]
 proptest.workspace = true
 serde_json.workspace = true
+# Self-dependency: unifies `insecure-test-keys` on for `cargo test -p ssk-interop`
+# without enabling it by default for real consumers.
+ssk-interop = { path = ".", features = ["insecure-test-keys"] }
 
 [lints]
 workspace = true

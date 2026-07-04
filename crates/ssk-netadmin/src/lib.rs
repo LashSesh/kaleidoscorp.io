@@ -49,7 +49,7 @@ pub use adapter::{
     AdapterDescriptor, AdapterKind, DataPlaneAdapter, DirectAdapter, DnsOverrideAdapter,
     HttpConnectAdapter, Socks5Adapter, TlsTunnelAdapter,
 };
-pub use attestation::{AttestationBinding, AttestationBinder};
+pub use attestation::{AttestationBinder, AttestationBinding};
 pub use audit::{AuditLedger, AuditOutcome, ForensicEntry};
 pub use control::{ControlPlane, OperatorProfile, RolloutMode, TenantContext};
 pub use error::NetAdminError;

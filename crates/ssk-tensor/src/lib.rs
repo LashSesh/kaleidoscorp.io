@@ -1,7 +1,9 @@
 #![forbid(unsafe_code)]
 
 use parking_lot::RwLock;
+use serde::{de::DeserializeOwned, Serialize};
 use ssk_types::{digest_of, Digest, GateReport, HashAlg, RunId, StitchId, TensorEntry};
+use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, thiserror::Error)]
@@ -16,52 +18,86 @@ pub enum TensorError {
     VerificationFailed,
 }
 
-pub trait LedgerBackend: Send + Sync {
-    fn append(&self, entry: TensorEntry) -> Result<(), TensorError>;
-    fn entries(&self) -> Result<Vec<TensorEntry>, TensorError>;
-    fn verify(&self) -> Result<(), TensorError>;
+/// Entry-type-agnostic storage: append and list entries. Hash-chain
+/// verification is deliberately not part of this trait since different entry
+/// types compute/represent their chain hash differently (see `LedgerBackend`
+/// for the `TensorEntry`-specific verification built on top of this).
+pub trait GenericLedgerBackend<E>: Send + Sync
+where
+    E: Send + Sync,
+{
+    fn append(&self, entry: E) -> Result<(), TensorError>;
+    fn entries(&self) -> Result<Vec<E>, TensorError>;
 }
 
-#[derive(Default)]
-pub struct MemoryBackend {
-    entries: RwLock<Vec<TensorEntry>>,
-}
-
-impl MemoryBackend {
-    #[must_use]
-    pub fn new() -> Self {
-        Self::default()
+/// `TensorEntry`-specific ledger backend. `append`/`entries` are inherited
+/// unchanged from the `GenericLedgerBackend<TensorEntry>` supertrait (and,
+/// per Rust's supertrait method visibility rules, are callable directly on
+/// any `L: LedgerBackend`-bounded value with no extra import); `verify()` is
+/// the one addition, using `ssk_types::Digest`-based canonical-CBOR
+/// hash-chain checks.
+pub trait LedgerBackend: GenericLedgerBackend<TensorEntry> {
+    fn verify(&self) -> Result<(), TensorError> {
+        verify_chain(&GenericLedgerBackend::entries(self)?)
     }
 }
 
-impl LedgerBackend for MemoryBackend {
-    fn append(&self, entry: TensorEntry) -> Result<(), TensorError> {
+impl<T: GenericLedgerBackend<TensorEntry>> LedgerBackend for T {}
+
+#[derive(Default)]
+pub struct GenericMemoryBackend<E> {
+    entries: RwLock<Vec<E>>,
+}
+
+impl<E> GenericMemoryBackend<E> {
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            entries: RwLock::new(Vec::new()),
+        }
+    }
+}
+
+impl<E: Clone + Send + Sync> GenericMemoryBackend<E> {
+    /// Overwrite the whole in-memory entry list. Used for compaction and for
+    /// deliberately constructing an invalid chain in tests.
+    pub fn replace_all(&self, entries: Vec<E>) {
+        *self.entries.write() = entries;
+    }
+}
+
+impl<E: Clone + Send + Sync> GenericLedgerBackend<E> for GenericMemoryBackend<E> {
+    fn append(&self, entry: E) -> Result<(), TensorError> {
         self.entries.write().push(entry);
         Ok(())
     }
 
-    fn entries(&self) -> Result<Vec<TensorEntry>, TensorError> {
+    fn entries(&self) -> Result<Vec<E>, TensorError> {
         Ok(self.entries.read().clone())
     }
-
-    fn verify(&self) -> Result<(), TensorError> {
-        verify_chain(&self.entries.read())
-    }
 }
 
-pub struct FileLedgerBackend {
+/// `TensorEntry`-flavored in-memory backend. Kept as a type alias so every
+/// existing `MemoryBackend::new()` call site keeps compiling unchanged.
+pub type MemoryBackend = GenericMemoryBackend<TensorEntry>;
+
+pub struct GenericFileLedgerBackend<E> {
     path: PathBuf,
+    _marker: PhantomData<E>,
 }
 
-impl FileLedgerBackend {
+impl<E> GenericFileLedgerBackend<E> {
     #[must_use]
     pub fn new(path: impl AsRef<Path>) -> Self {
         Self {
             path: path.as_ref().to_path_buf(),
+            _marker: PhantomData,
         }
     }
+}
 
-    fn read_entries(&self) -> Result<Vec<TensorEntry>, TensorError> {
+impl<E: Serialize + DeserializeOwned + Clone + Send + Sync> GenericFileLedgerBackend<E> {
+    fn read_entries(&self) -> Result<Vec<E>, TensorError> {
         if !self.path.exists() {
             return Ok(Vec::new());
         }
@@ -72,28 +108,30 @@ impl FileLedgerBackend {
         Ok(serde_json::from_slice(&bytes)?)
     }
 
-    fn write_entries(&self, entries: &[TensorEntry]) -> Result<(), TensorError> {
+    fn write_entries(&self, entries: &[E]) -> Result<(), TensorError> {
         let bytes = serde_json::to_vec_pretty(entries)?;
         std::fs::write(&self.path, bytes)?;
         Ok(())
     }
 }
 
-impl LedgerBackend for FileLedgerBackend {
-    fn append(&self, entry: TensorEntry) -> Result<(), TensorError> {
+impl<E: Serialize + DeserializeOwned + Clone + Send + Sync> GenericLedgerBackend<E>
+    for GenericFileLedgerBackend<E>
+{
+    fn append(&self, entry: E) -> Result<(), TensorError> {
         let mut entries = self.read_entries()?;
         entries.push(entry);
         self.write_entries(&entries)
     }
 
-    fn entries(&self) -> Result<Vec<TensorEntry>, TensorError> {
+    fn entries(&self) -> Result<Vec<E>, TensorError> {
         self.read_entries()
     }
-
-    fn verify(&self) -> Result<(), TensorError> {
-        verify_chain(&self.read_entries()?)
-    }
 }
+
+/// `TensorEntry`-flavored file backend. Kept as a type alias so every existing
+/// `FileLedgerBackend::new(path)` call site keeps compiling unchanged.
+pub type FileLedgerBackend = GenericFileLedgerBackend<TensorEntry>;
 
 pub fn make_entry(
     run: RunId,
@@ -155,5 +193,47 @@ mod tests {
         .expect("entry creation should succeed");
         backend.append(e1).expect("append should work");
         backend.verify().expect("verification should succeed");
+    }
+
+    #[test]
+    fn generic_memory_backend_works_with_a_non_tensor_entry_type() {
+        #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+        struct Toy {
+            value: u32,
+        }
+
+        let backend: GenericMemoryBackend<Toy> = GenericMemoryBackend::new();
+        backend.append(Toy { value: 1 }).expect("append");
+        backend.append(Toy { value: 2 }).expect("append");
+        assert_eq!(
+            backend.entries().expect("entries"),
+            vec![Toy { value: 1 }, Toy { value: 2 }]
+        );
+
+        backend.replace_all(vec![Toy { value: 9 }]);
+        assert_eq!(backend.entries().expect("entries"), vec![Toy { value: 9 }]);
+    }
+
+    #[test]
+    fn generic_file_backend_persists_a_non_tensor_entry_type() {
+        #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+        struct Toy {
+            value: u32,
+        }
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("toy.json");
+
+        {
+            let backend: GenericFileLedgerBackend<Toy> = GenericFileLedgerBackend::new(&path);
+            backend.append(Toy { value: 1 }).expect("append");
+            backend.append(Toy { value: 2 }).expect("append");
+        }
+
+        let reopened: GenericFileLedgerBackend<Toy> = GenericFileLedgerBackend::new(&path);
+        assert_eq!(
+            reopened.entries().expect("entries"),
+            vec![Toy { value: 1 }, Toy { value: 2 }]
+        );
     }
 }

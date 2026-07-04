@@ -4,6 +4,11 @@
 //!
 //! Each `SessionDecision` is chained via its `prev_hash`/`decision_hash`
 //! fields using the same Blake3 hash-chain pattern as `ssk-tensor`.
+//!
+//! `SessionLedger` is generic over its storage backend (defaulting to an
+//! in-memory `ssk_tensor::GenericMemoryBackend`); use
+//! [`SessionLedger::persisted`] for a disk-backed ledger whose decisions
+//! survive a process restart.
 
 use serde::{Deserialize, Serialize};
 
@@ -11,6 +16,7 @@ use crate::attestation::AttestationBinding;
 use crate::error::NetAdminError;
 use crate::policy::PolicyDecision;
 use crate::route::RouteCandidate;
+use ssk_tensor::{GenericFileLedgerBackend, GenericLedgerBackend, GenericMemoryBackend};
 
 /// A single, hash-chained session decision record.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -41,23 +47,50 @@ fn hash_session_decision_body(d: &SessionDecision) -> Result<String, NetAdminErr
         "attestation": d.attestation,
         "prev_hash": d.prev_hash,
     });
-    let bytes = serde_json::to_vec(&body)
-        .map_err(|e| NetAdminError::Serialization(e.to_string()))?;
+    let bytes =
+        serde_json::to_vec(&body).map_err(|e| NetAdminError::Serialization(e.to_string()))?;
     Ok(hex::encode(blake3::hash(&bytes).as_bytes()))
 }
 
-/// Append-only, hash-chained ledger of session decisions.
-#[derive(Debug, Default)]
-pub struct SessionLedger {
-    decisions: Vec<SessionDecision>,
+/// Append-only, hash-chained ledger of session decisions, generic over its
+/// storage backend. Defaults to an ephemeral in-memory backend; use
+/// [`SessionLedger::persisted`] for a disk-backed ledger.
+#[derive(Debug)]
+pub struct SessionLedger<B = GenericMemoryBackend<SessionDecision>>
+where
+    B: GenericLedgerBackend<SessionDecision>,
+{
+    backend: B,
 }
 
-impl SessionLedger {
+impl Default for SessionLedger<GenericMemoryBackend<SessionDecision>> {
+    fn default() -> Self {
+        Self {
+            backend: GenericMemoryBackend::new(),
+        }
+    }
+}
+
+impl SessionLedger<GenericMemoryBackend<SessionDecision>> {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
+}
 
+impl SessionLedger<GenericFileLedgerBackend<SessionDecision>> {
+    /// A disk-persisted session ledger: every `record()` call is durably
+    /// written, so `verify()` succeeds across a process restart at the same
+    /// `path`.
+    #[must_use]
+    pub fn persisted(path: impl AsRef<std::path::Path>) -> Self {
+        Self {
+            backend: GenericFileLedgerBackend::new(path),
+        }
+    }
+}
+
+impl<B: GenericLedgerBackend<SessionDecision>> SessionLedger<B> {
     /// Record a new decision, chaining it to the previous entry.
     pub fn record(
         &mut self,
@@ -66,9 +99,10 @@ impl SessionLedger {
         policy_decision: PolicyDecision,
         route_candidate: RouteCandidate,
         attestation: Option<AttestationBinding>,
-    ) -> Result<&SessionDecision, NetAdminError> {
+    ) -> Result<SessionDecision, NetAdminError> {
         let prev_hash = self
-            .decisions
+            .backend
+            .entries()?
             .last()
             .map(|d| d.decision_hash.clone())
             .unwrap_or_else(|| "genesis".to_string());
@@ -83,16 +117,16 @@ impl SessionLedger {
             decision_hash: String::new(),
         };
         entry.decision_hash = hash_session_decision_body(&entry)?;
-        self.decisions.push(entry);
-        Ok(self.decisions.last().expect("just pushed"))
+        self.backend.append(entry.clone())?;
+        Ok(entry)
     }
 
     /// Verify the hash chain of all decisions.
     pub fn verify(&self) -> Result<(), NetAdminError> {
         let mut prev = "genesis".to_string();
-        for d in &self.decisions {
+        for d in self.backend.entries()? {
             // Recompute expected hash.
-            let expected = hash_session_decision_body(d)?;
+            let expected = hash_session_decision_body(&d)?;
             if expected != d.decision_hash {
                 return Err(NetAdminError::AuditChainBroken(d.decision_id.clone()));
             }
@@ -104,19 +138,16 @@ impl SessionLedger {
         Ok(())
     }
 
-    #[must_use]
-    pub fn decisions(&self) -> &[SessionDecision] {
-        &self.decisions
+    pub fn decisions(&self) -> Result<Vec<SessionDecision>, NetAdminError> {
+        Ok(self.backend.entries()?)
     }
 
-    #[must_use]
-    pub fn len(&self) -> usize {
-        self.decisions.len()
+    pub fn len(&self) -> Result<usize, NetAdminError> {
+        Ok(self.backend.entries()?.len())
     }
 
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.decisions.is_empty()
+    pub fn is_empty(&self) -> Result<bool, NetAdminError> {
+        Ok(self.len()? == 0)
     }
 }
 
@@ -147,11 +178,12 @@ mod tests {
         let mut ledger = SessionLedger::new();
         for i in 0..5u32 {
             let (pd, rc) = sample_decision(&format!("sd-{i}"), &format!("f-{i}"));
-            ledger.record(format!("sd-{i}"), format!("f-{i}"), pd, rc, None)
+            ledger
+                .record(format!("sd-{i}"), format!("f-{i}"), pd, rc, None)
                 .expect("record must succeed");
         }
         ledger.verify().expect("chain must be intact");
-        assert_eq!(ledger.len(), 5);
+        assert_eq!(ledger.len().expect("len"), 5);
     }
 
     #[test]
@@ -160,7 +192,34 @@ mod tests {
         let (pd, rc) = sample_decision("sd-0", "f-0");
         ledger.record("sd-0", "f-0", pd, rc, None).expect("record");
         // Tamper with the decision hash.
-        ledger.decisions[0].decision_hash = "tampered".into();
+        let mut decisions = ledger.decisions().expect("decisions");
+        decisions[0].decision_hash = "tampered".into();
+        ledger.backend.replace_all(decisions);
         assert!(ledger.verify().is_err());
+    }
+
+    #[test]
+    fn persisted_chain_survives_reopen() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("session.json");
+
+        {
+            let mut ledger = SessionLedger::persisted(&path);
+            for i in 0..3u32 {
+                let (pd, rc) = sample_decision(&format!("sd-{i}"), &format!("f-{i}"));
+                ledger
+                    .record(format!("sd-{i}"), format!("f-{i}"), pd, rc, None)
+                    .expect("record must succeed");
+            }
+            ledger.verify().expect("chain valid before reopen");
+        }
+
+        let reopened = SessionLedger::persisted(&path);
+        reopened.verify().expect("chain valid after reopen");
+        assert_eq!(reopened.len().expect("len"), 3);
+        assert_eq!(
+            reopened.decisions().expect("decisions")[2].decision_id,
+            "sd-2"
+        );
     }
 }

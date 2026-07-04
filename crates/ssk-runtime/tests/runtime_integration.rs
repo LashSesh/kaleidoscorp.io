@@ -1,7 +1,7 @@
 use ssk_gates::GateVector;
 use ssk_locator::LocatorPool;
 use ssk_runtime::{sample_intent, Runtime};
-use ssk_tensor::{LedgerBackend, MemoryBackend};
+use ssk_tensor::{GenericLedgerBackend, MemoryBackend};
 use ssk_types::{GateOutcomeKind, Locator, LocatorId, LocatorType};
 
 fn pool() -> LocatorPool {
