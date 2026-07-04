@@ -30,6 +30,7 @@ members = [
   "crates/ssk-field-tensor",
   "crates/ssk-meta-resonance",
   "crates/ssk-crown",
+  "crates/ssk-host-cells",
   "crates/ssk-cli",
   "crates/ssk-ipc",
   "crates/ssk-daemon",
