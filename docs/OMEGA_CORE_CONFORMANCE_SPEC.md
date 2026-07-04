@@ -116,7 +116,12 @@ and 2 complete:** SSKΩ-1/2 are now met to the letter (`HypertoroidalScheduler`'
 (always `None` today); wiring `GateVector`'s output back into `BcikStitch` remains open for a
 later phase. **Update — Phase 3 complete:** SSKΩ-4 is now met — the gate system overhaul (Section
 K, twelve real gate structs, no early-`break`) and the Projective Connection Hypercube (Section I,
-real 9-axis `Hypercube` plus the Gabriel Constraint Cells) both landed, tested, and verified. This
+real 9-axis `Hypercube` plus the Gabriel Constraint Cells) both landed, tested, and verified.
+**Update — Phase 4 partial:** the persistent Stitch Tensor itself (Section M — real
+`StitchTensor`/`apply_sorted`/`StorageBackend`/`StitchGraph`) is now real and tested in
+`ssk-tensor`; wiring it into `ssk-runtime`'s live pipeline and into
+`Connection<GatePassed>::materialize` is deferred to Phase 5, alongside the `RunOutcome`
+redesign that will also carry the real `BcikStitch` forward instead of discarding it. This
 document designs the closing architecture for SSKΩ-5 through SSKΩ-9 (remaining).
 
 ---
@@ -152,7 +157,7 @@ earlier pass without recheck).
 | `GateProfile` richer fields | [2] | `crates/ssk-config/src/lib.rs:30-46` — only `order`, `fail_closed`; missing `thresholds, required_evidence, failure_policy, hold_policy, pass_policy` | Ch. 11.3 |
 | `CapabilityWitness` struct | **[1] Phase 2 done** | `crates/ssk-types/src/lib.rs` — real struct with all ch. 5.2 fields; `StitchCandidate`/`ConnectionIntent.capability_witness: bool` replaced by `capability: Option<CapabilityWitness>` | Ch. 5.2 |
 | `CapabilityWitnessProvider`/`KeyAgreementProvider` impls | **[1] Phase 2 done** | `crates/ssk-crypto/src/lib.rs` — `Ed25519CapabilityWitnessProvider` (`WitnessKind::Signature`, real issue/verify with scope+expiry checks, tested incl. tamper/expiry/scope-mismatch/wrong-issuer); `X25519KeyPair` real `KeyAgreementProvider` (zero new deps — `x25519-dalek` was already an unused optional dependency) | Ch. 5.1 |
-| `StitchTensor`/`apply_sorted`/`StorageBackend` | [3] | `crates/ssk-tensor/src/lib.rs` (240 lines) — no `StitchTensor` wrapper, no `apply_sorted`, no `StorageBackend` trait, no `StitchGraph`/`Accepted`; only free functions `make_entry`/`verify_chain` plus the generic backend traits | Ch. 12.1-12.2 |
+| `StitchTensor`/`apply_sorted`/`StorageBackend` | **[2] Phase 4 done (ssk-tensor)** | `crates/ssk-tensor/src/lib.rs` — real `StitchTensor{graph, head, backend}`, `apply_sorted` (deterministic `(epoch, StitchId)` ordering, hash-chained `StitchTensorEntry`s), `StorageBackend` (supertrait of `GenericLedgerBackend<StitchTensorEntry>`, blanket-implemented), real `StitchGraph`; `ssk-runtime`'s live pipeline still writes the older flat `TensorEntry` — wiring it to `StitchTensor` is deferred to Phase 5 alongside the `RunOutcome`/pipeline-stage rework (Section R), since that is where the gate witness starts carrying a real `BcikStitch` forward instead of discarding it | Ch. 12.1-12.2 |
 | `FocusEngine`/`FocusReport`/`CoreSessionClass` | [3] | `crates/ssk-focus/src/lib.rs:6-8` — `refocuses()` is one boolean expression | Ch. 13.1 |
 | `LinkabilityEstimator`/`AdversaryModel`/`LinkabilityReport` | [3] | `crates/ssk-privacy/src/lib.rs:6-12` — `linkability_score()` is one heuristic function | Ch. 15.3 |
 | Real re-executing `ReplayEngine` | [2] | `crates/ssk-replay/src/lib.rs:17-37` — pure field-equality diff of two pre-computed `RuntimeOutcome`s passed in by the caller; no re-execution happens inside this crate | Ch. 16.3 |
@@ -202,7 +207,7 @@ if all tests for levels 0..*k* pass"):
 | SSKΩ-2 | Mirror-facet orbit + locator pool with real typing and locator-reality checks. | ✅ met (Phase 1: content-addressed `MirrorOrbit`, real `claims_external_plurality()`) |
 | SSKΩ-3 | BCIK `StitchCandidate` pipeline: every crossing carries seam, boundary, gate, trace, replay. | ⚠️ seam/boundary/trace/replay are real (Phase 2); `gate_report` is still always `None` — real per-gate evidence is Phase 3 |
 | SSKΩ-4 | Gate vector + boundary residues: twelve gates, fail-closed, typed residues, PCH projection checks. | ✅ met (Phase 3: twelve real gate structs, no early-break, typed `ResidueKind` on every fail path, `HypercubeGate` drives the real 9-axis PCH) |
-| SSKΩ-5 | Persistent Stitch Tensor + audit: hash-chained append, storage backends, tensor-preservation theorem tested. | ⚠️ hash-chained append + storage backends are real; the theorem is provable only informally, not as a typestate guarantee |
+| SSKΩ-5 | Persistent Stitch Tensor + audit: hash-chained append, storage backends, tensor-preservation theorem tested. | ⚠️ `ssk-tensor`'s real `StitchTensor`/`apply_sorted`/`StorageBackend` landed (Phase 4), hash-chained and tested (including the empty-`Vec`-preserves-the-tensor case); not yet wired into `ssk-runtime`'s live pipeline (Phase 5), so the theorem is not yet provable end-to-end through the actual runtime driver |
 | SSKΩ-6 | Concave Reanalysis Focus + replay: class reconstruction, replay determinism harness green. | ❌ absent |
 | SSKΩ-7 | Locator pool + relay-fabric adapters: real egress adapters behind the async edge, health probing. | ❌ absent |
 | SSKΩ-8 | Full simulation + conformance testbed: privacy metric tests, defensive adversary sim, all vectors. | ❌ absent |
@@ -1006,20 +1011,29 @@ pub trait StorageBackend: Send + Sync {
 > **Theorem — no persistent stitch without replay:** every tensor revision implies replay
 > readiness; the `ReplayGate` is mandatory and part of the gate vector.
 
-**Current:** `crates/ssk-tensor/src/lib.rs` (post the prior implementation pass's
-`GenericLedgerBackend<E>` generalization, confirmed 240 lines) has no `StitchTensor` wrapper
-type, no `apply_sorted`, no `StorageBackend` trait, no `StitchGraph`/`Accepted` — only free
-functions `make_entry`/`verify_chain` plus the generic backend traits.
+**Current — Phase 4 done (in `ssk-tensor`):** `crates/ssk-tensor/src/lib.rs` now has a real
+`StitchTensor{graph, head, backend: Box<dyn StorageBackend>}`; `StorageBackend` is a supertrait
+of the already-real `GenericLedgerBackend<StitchTensorEntry>` adding `get`/`iter`/`head`
+(blanket-implemented for every existing backend type, mirroring `LedgerBackend`'s own pattern);
+`StitchGraph` is a real content-addressed index with `insert`/`contains`/`len`; `Accepted`
+(this document's own disclosed elaboration — the PDF names the type but the excerpted text does
+not enumerate its fields) carries exactly what `apply_sorted` needs to build a
+`StitchTensorEntry` and sort deterministically. `apply_sorted` batch-sorts by
+`(epoch, StitchId)` before chaining, tested including the empty-input case
+(`empty_apply_sorted_preserves_the_tensor`) and a from-disk graph/head rebuild
+(`open_rebuilds_graph_and_head_from_existing_entries`). Two disclosed, documented deviations
+from the PDF's literal `StorageBackend` signature (both already inherited from
+`GenericLedgerBackend`'s own established pattern): `append` takes `&self` not `&mut self` and
+returns `TensorError` not `FaultKind`; `get`/`iter` degrade to `None`/empty on a storage read
+failure rather than panicking.
 
-**Design: additive, not a fork.** The key decision: reuse, don't fork, the already-real
-`GenericLedgerBackend<E>`/`LedgerBackend` infrastructure (tested, disk-persisted via
-`GenericFileLedgerBackend`). Define `StorageBackend: GenericLedgerBackend<StitchTensorEntry>`
-as a supertrait adding exactly `get`/`iter`/`head`, blanket-implemented for the existing
-backend types — so the literal-conformance `StorageBackend` trait from the PDF is satisfied by
-wrapping working infrastructure rather than duplicating it (mirrors the exact pattern already
-used for `LedgerBackend` itself, `crates/ssk-tensor/src/lib.rs:39-45`). `apply_sorted`
-batch-sorts by `(epoch, StitchId)` before chaining and is the real body for
-`Connection<GatePassed>::materialize` (Section E.3).
+**Not yet done:** wiring `StitchTensor` into `ssk-runtime`'s live pipeline (still writes the
+older flat `TensorEntry` via `make_entry`) and into `Connection<GatePassed>::materialize`
+(Section E.3, still a stub) — both deferred to Phase 5 alongside the `RunOutcome`/pipeline-stage
+rework (Section R). Wiring `materialize` today would need the gate vector to hand back the real
+`BcikStitch` it already computes inside `BcikGate::evaluate` — currently discarded after the
+gate resolves to `Pass` — rather than recomputing it a second time; that plumbing change is
+Section R's job, done once for both `RunOutcome`'s redesign and this wiring together.
 
 ---
 

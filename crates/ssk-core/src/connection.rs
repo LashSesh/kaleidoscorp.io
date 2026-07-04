@@ -6,15 +6,29 @@
 //!
 //! Phase 0 scaffolding note (`docs/OMEGA_CORE_CONFORMANCE_SPEC.md` Section
 //! E.3): `canonicalize`/`birefract`/`place`/`gate`/`materialize` bodies are
-//! deliberately stubbed here — their real logic depends on later phases
-//! (spec Section V): `birefract` needs Phase 1's real split logic, `place`
-//! needs Phase 3's Hypercube, `gate` needs Phase 3's real gate vector,
-//! `materialize` needs Phase 4's real tensor. The collaborator parameter
-//! types below (`CoreCanonicalizer`, `Policy`, `Hypercube`, `GateVector`,
-//! `StitchTensor`) are Phase-0-local placeholders, not the real cross-crate
-//! types those names will resolve to once wired up in later phases — kept
-//! local here so this foundation-crate skeleton compiles today without
-//! introducing a dependency on higher crates before it is time.
+//! deliberately stubbed here. The collaborator parameter types below
+//! (`CoreCanonicalizer`, `Policy`, `Hypercube`, `GateVector`, `StitchTensor`)
+//! are local placeholders, not the real cross-crate types of the same name.
+//!
+//! **Disclosed architectural constraint (as of Phase 4):** `place`/`gate`
+//! cannot be wired to the real `ssk_gates::pch::Hypercube`/
+//! `ssk_gates::GateVector` without creating a dependency cycle —
+//! `ssk-gates` already depends on `ssk-core` (for `MirrorOrbit` and
+//! `CoreObject`). Closing this for real needs dependency inversion: local
+//! traits defined here in `ssk-core` that `ssk-gates`' concrete types
+//! implement (since `ssk-gates` already sees this crate), so `place`/`gate`
+//! become generic over the trait rather than naming `ssk-gates` types
+//! directly. That redesign is deliberately out of scope for this pass — it
+//! is a structural decision, not a per-phase content addition, so it should
+//! land deliberately once made rather than being rushed alongside other
+//! phase work. `materialize`'s real body — building an `Accepted` and
+//! calling `ssk_tensor::StitchTensor::apply_sorted` (Section M, real and
+//! tested as of Phase 4) — is deferred to land alongside Phase 5's
+//! `RunOutcome`/pipeline-stage rework (Section R), since that is where the
+//! runtime's gate-witness plumbing is already being reshaped to carry a
+//! real `BcikStitch` forward instead of discarding it after `BcikGate`
+//! evaluates; wiring `StitchTensor` in before that would mean computing the
+//! same `Bcik::cross()` a second time here.
 
 use core::marker::PhantomData;
 use ssk_types::{BoundaryResidue, FaultKind, PhaseVector};

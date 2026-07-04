@@ -303,6 +303,12 @@ pub struct EpochId(pub u64);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct Ttl(pub u64);
 
+/// A scheduler tick count (ch. 12.1's `StitchTensorEntry.accepted_at`) —
+/// distinct from `EpochId`: an epoch is a coarse policy/session generation,
+/// a tick is the scheduler's own per-advance counter (`SchedulerState.ticks`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct Tick(pub u64);
+
 /// Route classification (ch. 4.3/6.4). Phase 1 placeholder — the excerpted
 /// PDF text names the field but does not enumerate `RouteClass`'s variants;
 /// this minimal, disclosed set stands in until the funnel-DAG work
@@ -878,6 +884,37 @@ pub struct TensorEntry {
     pub replay_witness: bool,
     pub prev_hash: Digest,
     pub entry_hash: Digest,
+}
+
+/// A hash-chained entry in the persistent Stitch Tensor (Master Spec Ω+1
+/// ch. 12.1, verbatim field list) — carries the real `BcikStitch` payload
+/// rather than `TensorEntry`'s flat id-only record, so an accepted stitch's
+/// full crossing evidence survives into the persisted tensor, not just its
+/// identity.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StitchTensorEntry {
+    pub id: StitchId,
+    pub stitch: BcikStitch,
+    pub gate_report: GateReportId,
+    pub accepted_at: Tick,
+    pub epoch: EpochId,
+    pub ttl: Ttl,
+    pub prev_hash: Digest,
+    pub entry_hash: Digest,
+}
+
+/// One gate-passed candidate ready for tensor acceptance (ch. 12.1's
+/// `Accepted`, referenced but not field-enumerated by the excerpted PDF
+/// text). This document's own necessary elaboration: the minimal field set
+/// `StitchTensor::apply_sorted` needs to build a `StitchTensorEntry` and to
+/// sort deterministically by `(epoch, stitch.id)` per ch. 12.2.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Accepted {
+    pub stitch: BcikStitch,
+    pub gate_report: GateReportId,
+    pub accepted_at: Tick,
+    pub epoch: EpochId,
+    pub ttl: Ttl,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

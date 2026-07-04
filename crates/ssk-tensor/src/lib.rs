@@ -2,7 +2,11 @@
 
 use parking_lot::RwLock;
 use serde::{de::DeserializeOwned, Serialize};
-use ssk_types::{digest_of, Digest, GateReport, HashAlg, RunId, StitchId, TensorEntry};
+use ssk_types::{
+    digest_of, Accepted, BcikStitch, Digest, FaultKind, GateReport, HashAlg, RunId, StitchId,
+    StitchTensorEntry, TensorEntry,
+};
+use std::collections::HashMap;
 use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
 
@@ -43,6 +47,146 @@ pub trait LedgerBackend: GenericLedgerBackend<TensorEntry> {
 }
 
 impl<T: GenericLedgerBackend<TensorEntry>> LedgerBackend for T {}
+
+/// `StitchTensorEntry`-specific storage backend (Master Spec Ω+1 ch. 12.1's
+/// `StorageBackend`). Reuses the existing, already-tested
+/// `GenericLedgerBackend<E>` infrastructure as a supertrait rather than
+/// forking it — the same pattern `LedgerBackend` itself already uses above.
+/// Two disclosed deviations from the PDF's literal signature, both needed to
+/// build on shared-reference (`RwLock`-backed) infrastructure honestly:
+/// `append` is inherited from `GenericLedgerBackend` and so takes `&self`
+/// (not `&mut self`) and returns `TensorError` (not `FaultKind`); `get`/
+/// `iter` degrade to `None`/empty on a storage read failure rather than
+/// panicking — callers that need the underlying error can call
+/// `GenericLedgerBackend::entries` directly.
+pub trait StorageBackend: GenericLedgerBackend<StitchTensorEntry> {
+    fn get(&self, id: &StitchId) -> Option<StitchTensorEntry> {
+        self.entries().ok()?.into_iter().find(|e| &e.id == id)
+    }
+
+    fn iter(&self) -> Box<dyn Iterator<Item = StitchTensorEntry> + '_> {
+        Box::new(self.entries().unwrap_or_default().into_iter())
+    }
+
+    fn head(&self) -> Digest {
+        self.entries()
+            .ok()
+            .and_then(|es| es.last().map(|e| e.entry_hash))
+            .unwrap_or(Digest::GENESIS)
+    }
+}
+
+impl<T: GenericLedgerBackend<StitchTensorEntry>> StorageBackend for T {}
+
+/// The accepted-stitch graph `G_s` (ch. 12.1's `StitchGraph`) — a
+/// content-addressed index of every stitch accepted into the tensor so far.
+/// Phase 4 placeholder for real edge/adjacency structure: the PDF's
+/// excerpted text names the type but does not enumerate connectivity
+/// queries beyond membership, so this holds exactly that until a consumer
+/// needs more (e.g. Section G's funnel-DAG work).
+#[derive(Debug, Clone, Default)]
+pub struct StitchGraph {
+    stitches: HashMap<StitchId, BcikStitch>,
+}
+
+impl StitchGraph {
+    pub fn insert(&mut self, stitch: &BcikStitch) {
+        self.stitches.insert(stitch.id.clone(), stitch.clone());
+    }
+
+    #[must_use]
+    pub fn contains(&self, id: &StitchId) -> bool {
+        self.stitches.contains_key(id)
+    }
+
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.stitches.len()
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.stitches.is_empty()
+    }
+}
+
+/// The persistent Stitch Tensor (Master Spec Ω+1 ch. 12.1-12.2, verbatim
+/// shape) — the append-only, hash-chained, gate-passed-only record of
+/// accepted stitches. Only reachable via `apply_sorted`, which only ever
+/// receives `Accepted` values (themselves only constructible from a
+/// `Connection<GatePassed>`, Section E.3) — so "gate failure preserves the
+/// tensor" (ch. 12.2's theorem) holds by construction: nothing calls
+/// `apply_sorted` with an empty `Vec` on a failed candidate, and an empty
+/// `Vec` is a genuine no-op (`ST(t+1) = ST(t)`).
+pub struct StitchTensor {
+    graph: StitchGraph,
+    head: Digest,
+    backend: Box<dyn StorageBackend>,
+}
+
+impl StitchTensor {
+    /// Rebuilds `graph`/`head` from whatever the backend already persists,
+    /// so re-opening a `StitchTensor` over an existing file backend resumes
+    /// with a correct in-memory graph rather than silently starting empty.
+    pub fn open(backend: Box<dyn StorageBackend>) -> Result<Self, FaultKind> {
+        let entries = backend.entries().map_err(|_| FaultKind::StorageFailure)?;
+        let mut graph = StitchGraph::default();
+        for e in &entries {
+            graph.insert(&e.stitch);
+        }
+        let head = entries.last().map_or(Digest::GENESIS, |e| e.entry_hash);
+        Ok(Self {
+            graph,
+            head,
+            backend,
+        })
+    }
+
+    /// Deterministic ordering by `(epoch, StitchId)` for replay stability
+    /// (ch. 12.2, verbatim), then chains and appends each entry in order.
+    pub fn apply_sorted(&mut self, accepted: Vec<Accepted>) -> Result<Vec<StitchId>, FaultKind> {
+        let mut acc = accepted;
+        acc.sort_by(|a, b| (a.epoch, &a.stitch.id).cmp(&(b.epoch, &b.stitch.id)));
+
+        let mut ids = Vec::new();
+        for a in acc {
+            let entry = self.chain(a)?;
+            self.backend
+                .append(entry.clone())
+                .map_err(|_| FaultKind::StorageFailure)?;
+            self.graph.insert(&entry.stitch);
+            self.head = entry.entry_hash;
+            ids.push(entry.id);
+        }
+        Ok(ids)
+    }
+
+    fn chain(&self, a: Accepted) -> Result<StitchTensorEntry, FaultKind> {
+        let mut entry = StitchTensorEntry {
+            id: a.stitch.id.clone(),
+            stitch: a.stitch,
+            gate_report: a.gate_report,
+            accepted_at: a.accepted_at,
+            epoch: a.epoch,
+            ttl: a.ttl,
+            prev_hash: self.head,
+            entry_hash: Digest::PENDING,
+        };
+        entry.entry_hash =
+            digest_of(&entry, HashAlg::Blake3).map_err(|_| FaultKind::StorageFailure)?;
+        Ok(entry)
+    }
+
+    #[must_use]
+    pub fn head(&self) -> Digest {
+        self.head
+    }
+
+    #[must_use]
+    pub fn graph(&self) -> &StitchGraph {
+        &self.graph
+    }
+}
 
 #[derive(Default)]
 pub struct GenericMemoryBackend<E> {
@@ -169,9 +313,99 @@ fn verify_chain(entries: &[TensorEntry]) -> Result<(), TensorError> {
     Ok(())
 }
 
+/// `StitchTensorEntry`-flavored in-memory backend, so tests can build a
+/// `StitchTensor` without a real file on disk.
+pub type StitchMemoryBackend = GenericMemoryBackend<StitchTensorEntry>;
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ssk_types::{
+        BoundaryRecord, EpochId, FacetId, GateReportId, HashAlg, LocatorId, PhaseVector,
+        SeamWitness, StitchId, TraceId, Ttl,
+    };
+
+    fn sample_stitch(id: &str) -> BcikStitch {
+        BcikStitch {
+            id: StitchId::new(id),
+            facet: FacetId::of(&id, HashAlg::Blake3).expect("hash"),
+            locator: LocatorId::new("l1"),
+            fiber: ssk_types::FiberType::Data,
+            phase: PhaseVector::zero(),
+            capability: None,
+            seam: SeamWitness(Digest::GENESIS),
+            boundary: BoundaryRecord {
+                closed: true,
+                detail: "ok".into(),
+            },
+            residues: Vec::new(),
+            gate_report: None,
+            trace: TraceId::new(format!("trace-{id}")),
+            replay: ssk_types::ReplayRef::new(format!("replay-{id}")),
+        }
+    }
+
+    fn sample_accepted(id: &str, epoch: u64) -> Accepted {
+        Accepted {
+            stitch: sample_stitch(id),
+            gate_report: GateReportId::new(format!("gr-{id}")),
+            accepted_at: ssk_types::Tick(0),
+            epoch: EpochId(epoch),
+            ttl: Ttl(100),
+        }
+    }
+
+    #[test]
+    fn apply_sorted_orders_by_epoch_then_id_and_chains_hashes() {
+        let backend: StitchMemoryBackend = GenericMemoryBackend::new();
+        let mut tensor = StitchTensor::open(Box::new(backend)).expect("open");
+
+        let ids = tensor
+            .apply_sorted(vec![sample_accepted("b", 1), sample_accepted("a", 0)])
+            .expect("apply_sorted");
+
+        // "a" (epoch 0) must be chained before "b" (epoch 1) regardless of
+        // input order (ch. 12.2's deterministic-ordering requirement).
+        assert_eq!(ids, vec![StitchId::new("a"), StitchId::new("b")]);
+        assert_eq!(tensor.graph().len(), 2);
+        assert!(tensor.graph().contains(&StitchId::new("a")));
+        assert_ne!(tensor.head(), Digest::GENESIS);
+    }
+
+    #[test]
+    fn empty_apply_sorted_preserves_the_tensor() {
+        let backend: StitchMemoryBackend = GenericMemoryBackend::new();
+        let mut tensor = StitchTensor::open(Box::new(backend)).expect("open");
+        let head_before = tensor.head();
+
+        let ids = tensor.apply_sorted(Vec::new()).expect("apply_sorted");
+
+        assert!(ids.is_empty());
+        assert_eq!(tensor.head(), head_before);
+        assert!(tensor.graph().is_empty());
+    }
+
+    #[test]
+    fn open_rebuilds_graph_and_head_from_existing_entries() {
+        let backend: StitchMemoryBackend = GenericMemoryBackend::new();
+        let stitch = sample_stitch("x");
+        let entry = StitchTensorEntry {
+            id: stitch.id.clone(),
+            stitch,
+            gate_report: GateReportId::new("gr-x"),
+            accepted_at: ssk_types::Tick(0),
+            epoch: EpochId(0),
+            ttl: Ttl(100),
+            prev_hash: Digest::GENESIS,
+            entry_hash: digest_of(&"seed-entry", HashAlg::Blake3).expect("hash"),
+        };
+        backend.append(entry).expect("append");
+
+        let reopened = StitchTensor::open(Box::new(backend)).expect("reopen");
+        assert_eq!(reopened.graph().len(), 1);
+        assert!(reopened.graph().contains(&StitchId::new("x")));
+        assert_ne!(reopened.head(), Digest::GENESIS);
+    }
 
     #[test]
     fn memory_hash_chain_verifies() {
