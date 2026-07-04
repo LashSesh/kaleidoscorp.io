@@ -36,10 +36,13 @@
 //! through the SSK content-address path rather than reproducing Python's
 //! `sha256(json.dumps(...))` byte-for-byte).
 
+pub mod calibration;
 pub mod canonical;
+pub mod corpus;
 pub mod features;
 pub mod fingerprints;
 pub mod gate;
+pub mod iteration;
 pub mod kernel;
 pub mod object;
 pub mod operators;
@@ -52,7 +55,15 @@ pub mod target;
 pub mod url;
 pub mod value;
 
+pub use calibration::{
+    calibration_preset_names, calibration_spectrum, get_calibration_preset, CalibrationPreset,
+    DEFAULT_CALIBRATION_PRESET,
+};
 pub use canonical::{canonicalize, CanonicalObject};
+pub use corpus::{
+    ClusterReport, CorpusError, DimensionStats, DriftReport, ProfileCorpus, ProfileDistance,
+    ProfileStore, SignatureProfileRecord,
+};
 pub use features::{extract_features, FeatureVector};
 pub use fingerprints::{
     compare_fingerprint_bundles, extract_fingerprint_bundle, fingerprint_layer_names,
@@ -60,6 +71,10 @@ pub use fingerprints::{
     FingerprintLayerSpec, ProtocolFingerprint,
 };
 pub use gate::{GateBundle, GateDecision, GateVector};
+pub use iteration::{
+    surface_ref, IterationCandidate, IterationError, IterationParams, IterationRound,
+    RecursiveIterationResult, RecursiveSignatureIterator,
+};
 pub use kernel::{BatchAnalysisResult, ChameleonEvent, ChameleonKernel, DEFAULT_MODE};
 pub use object::SurfaceObject;
 pub use operators::{

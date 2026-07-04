@@ -8,6 +8,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use serde::{Deserialize, Serialize};
 use ssk_types::{digest_of, Digest, HashAlg};
 
 use crate::features::FeatureVector;
@@ -70,7 +71,7 @@ impl SignatureComparisonReport {
 }
 
 /// The multi-dimensional spectrum of a surface plus its content digest.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct SpectralSignature {
     pub dimensions: Dimensions,
     pub digest: Digest,
