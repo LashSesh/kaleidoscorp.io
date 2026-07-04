@@ -5,7 +5,7 @@ use serde::Serialize;
 use ssk_faultscan::{run_playbook, FaultKind};
 use ssk_gates::GateVector;
 use ssk_interop::{Blake3KeyedVerifier, CompatibilityPolicy, ConformanceSuite};
-use ssk_locator::LocatorPool;
+use ssk_locator::StaticLocatorPool;
 use ssk_netadmin::{
     audit::{AuditLedger, AuditOutcome},
     flow::{FlowDescriptor, FlowRecord, ProtocolKind, RiskLevel},
@@ -16,7 +16,7 @@ use ssk_netadmin::{
 use ssk_replay::{DeterministicReplayEngine, ReplayEngine};
 use ssk_runtime::{sample_intent, DeterminismContext, Runtime, RuntimeEvent, RuntimeMetrics};
 use ssk_tensor::{FileLedgerBackend, LedgerBackend, MemoryBackend};
-use ssk_types::{GateId, GateOutcomeKind, Locator, LocatorId, LocatorType, ReplayVerdict};
+use ssk_types::{GateId, GateOutcomeKind, LocatorId, ReplayVerdict};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -1748,10 +1748,20 @@ fn default_route_orchestrator() -> RouteOrchestrator {
     }])
 }
 
-fn default_pool() -> LocatorPool {
-    LocatorPool::new(vec![Locator {
+fn default_pool() -> StaticLocatorPool {
+    StaticLocatorPool::new(vec![ssk_types::LocatorFacet {
         id: LocatorId::new("local"),
-        locator_type: LocatorType::LocalOverlay,
+        kind: ssk_types::LocatorKind::LocalOverlay,
+        endpoint: ssk_types::EndpointRef::new("local-endpoint"),
+        route: ssk_types::RouteClass::Direct,
+        transport: ssk_types::TransportClass::Tcp,
+        epoch: ssk_types::EpochId(0),
+        ttl: ssk_types::Ttl(100),
+        trust: ssk_types::TrustClass::Owned,
+        cost: ssk_types::CostClass::Free,
+        risk: ssk_types::RiskClass::Low,
+        health: ssk_types::HealthStatus::Live,
+        trace: ssk_types::TraceId::new("trace-local"),
         trusted: true,
         risk_score: 10,
     }])

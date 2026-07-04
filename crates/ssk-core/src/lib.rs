@@ -4,12 +4,47 @@
 extern crate alloc;
 
 use alloc::format;
+use alloc::vec;
 use ssk_types::{
-    CoreNode, FacetId, FaultKind, HashAlg, KeyContextRef, MirrorFacet, ObjectKind, OrbitSeed,
-    Orientation, PhaseVector, ResidueKind, ResiduePolicy, ResidueRef, Sector, SessionId, TraceId,
+    ConnectionIntent, CoreNode, CostBudget, FacetId, FaultKind, HashAlg, IdentityRay,
+    KeyContextRef, LocatorKind, LocatorRay, LocatorTypeSet, MirrorFacet, ObjectKind, OrbitSeed,
+    Orientation, PhaseVector, ReplayNeed, ResidueKind, ResiduePolicy, ResidueRef, RiskBudget,
+    RouteClass, Sector, SessionId, SessionIntent, TimingClass, TraceId, TransportClass,
 };
 
 pub mod connection;
+
+/// Split a connection intent into its identity ray and locator ray
+/// (Master Spec Ω+1 ch. 4.2). Pure function, no I/O — this is the real body
+/// for `connection::Connection<Canonical>::birefract`.
+///
+/// Phase 1 placeholder: the locator ray is populated with conservative,
+/// policy-independent defaults (local-overlay only, direct route, minimal
+/// budgets) since real policy-driven ray construction depends on
+/// `ssk-config`'s richer schema (Section S, Phase 8) — not yet wired here.
+pub fn birefract(
+    intent: &ConnectionIntent,
+    core: &CoreNode,
+    _p: &connection::Policy,
+) -> Result<(IdentityRay, LocatorRay), FaultKind> {
+    let identity = IdentityRay {
+        core_ref: core.id.clone(),
+        session_intent: SessionIntent::new(format!("session-intent:{}", intent.run.0 .0)),
+        key_context: KeyContextRef::new(format!("birefract:{}:key-ctx", core.id.0 .0)),
+        app_policy: core.policy_root.clone(),
+        replay_need: ReplayNeed::Required,
+        residue_policy: ResiduePolicy(ResidueKind::Identity),
+    };
+    let locator = LocatorRay {
+        allowed_locator_types: LocatorTypeSet(vec![LocatorKind::LocalOverlay]),
+        route_class: RouteClass::Direct,
+        transport_class: TransportClass::Unknown,
+        timing_class: TimingClass::Immediate,
+        risk_budget: RiskBudget(100),
+        cost_budget: CostBudget(100),
+    };
+    Ok((identity, locator))
+}
 
 /// Deterministic set of facets derived from one core at a phase state
 /// (Master Spec Ω+1 ch. 4.1). Replaces the old string-formatting `Orbit`:
@@ -159,5 +194,24 @@ mod tests {
         let b = mk_core(2);
         let facet_from_b = MirrorOrbit::for_core(&b).derive(&PhaseVector::zero(), Sector::Identity);
         assert!(MirrorOrbit::for_core(&a).recover(&facet_from_b).is_err());
+    }
+
+    #[test]
+    fn birefract_splits_into_an_identity_ray_and_a_locator_ray() {
+        let core = mk_core(1);
+        let intent = ssk_types::ConnectionIntent {
+            run: ssk_types::RunId::new("run-1"),
+            core: core.clone(),
+            target_locator: ssk_types::LocatorId::new("local"),
+            capability_witness: true,
+            ttl_epoch: 1,
+        };
+        let (identity, locator) =
+            birefract(&intent, &core, &connection::Policy).expect("birefract must succeed");
+        assert_eq!(identity.core_ref, core.id);
+        assert_eq!(
+            locator.allowed_locator_types.0,
+            vec![ssk_types::LocatorKind::LocalOverlay]
+        );
     }
 }

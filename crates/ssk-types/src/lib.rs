@@ -239,22 +239,177 @@ pub enum Sector {
     Focus,
 }
 
+/// Closed enum of egress classes (Master Spec Ω+1 ch. 4.3), 9 variants —
+/// replaces the old 6-variant `LocatorType`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum LocatorType {
+pub enum LocatorKind {
     DirectIp,
     VpnExit,
     ProxyExit,
     Relay,
     Gateway,
+    MultiHopPath,
     LocalOverlay,
+    ControlledEgress,
+    TestHarness,
 }
 
+/// Operator's trust in the egress surface (ch. 6.1, exact variants given).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TrustClass {
+    Untrusted,
+    Weak,
+    Managed,
+    Owned,
+}
+
+/// Budgeting class for locator selection (ch. 6.1, exact variants given).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CostClass {
+    Free,
+    Low,
+    Metered,
+    High,
+}
+
+/// Linkability/exposure risk estimate (ch. 6.1, exact variants given).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RiskClass {
+    Low,
+    Medium,
+    High,
+    Critical,
+}
+
+/// Liveness/route state from probes (ch. 6.1, exact variants given).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum HealthStatus {
+    Unknown,
+    Live,
+    Degraded,
+    Down,
+}
+
+id_type!(EndpointRef);
+
+/// Rotation-window/lifetime counter for a locator or a run (ch. 3.1/6.1).
+/// Plain ordinal rather than an opaque string or content-addressed id, since
+/// epochs are a monotonic counter, not a canonical object with its own
+/// content to hash.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct EpochId(pub u64);
+
+/// Lifetime/expiry counter (ch. 4.3/5.2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct Ttl(pub u64);
+
+/// Route classification (ch. 4.3/6.4). Phase 1 placeholder — the excerpted
+/// PDF text names the field but does not enumerate `RouteClass`'s variants;
+/// this minimal, disclosed set stands in until the funnel-DAG work
+/// (Section G.2) needs a richer one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RouteClass {
+    Direct,
+    SingleHop,
+    MultiHop,
+    Fallback,
+    Denied,
+}
+
+/// Transport classification (ch. 4.3). Phase 1 placeholder — same disclosure
+/// as `RouteClass`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TransportClass {
+    Tcp,
+    Udp,
+    Tls,
+    Unknown,
+}
+
+/// Timing-shaping classification for a locator ray (ch. 4.2). Phase 1
+/// placeholder — same disclosure as `RouteClass`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TimingClass {
+    Immediate,
+    Delayed,
+    Batched,
+}
+
+/// The observable, accountable metadata of one egress resource
+/// (Master Spec Ω+1 ch. 4.3/6.1) — replaces the old 4-field `Locator`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Locator {
+pub struct LocatorFacet {
     pub id: LocatorId,
-    pub locator_type: LocatorType,
+    pub kind: LocatorKind,
+    pub endpoint: EndpointRef,
+    pub route: RouteClass,
+    pub transport: TransportClass,
+    pub epoch: EpochId,
+    pub ttl: Ttl,
+    pub trust: TrustClass,
+    pub cost: CostClass,
+    pub risk: RiskClass,
+    pub health: HealthStatus,
+    pub trace: TraceId,
+    /// Phase 1 bridge fields: today's thin gate checks (`LocatorGate`/
+    /// `FiberGate`/`PrivacyGate` in `ssk-gates`) compare a simple trusted
+    /// flag and a numeric risk threshold. Rewiring those gates against the
+    /// real `trust`/`risk` enum classes above is Phase 3's job (spec
+    /// Section K); until then these two fields preserve today's exact gate
+    /// behavior undisturbed.
     pub trusted: bool,
     pub risk_score: u8,
+}
+
+id_type!(SessionIntent);
+
+/// Whether a birefringent split's identity ray requires a replay witness
+/// (ch. 4.2). Phase 1 placeholder — the excerpted text names the field but
+/// not its variants.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ReplayNeed {
+    Required,
+    Optional,
+}
+
+/// "What the core intends to do." (Master Spec Ω+1 ch. 4.2, verbatim field
+/// list.)
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IdentityRay {
+    pub core_ref: CoreId,
+    pub session_intent: SessionIntent,
+    pub key_context: KeyContextRef,
+    pub app_policy: PolicyId,
+    pub replay_need: ReplayNeed,
+    pub residue_policy: ResiduePolicy,
+}
+
+/// A set of permitted locator kinds (ch. 4.2's `LocatorTypeSet`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LocatorTypeSet(pub Vec<LocatorKind>);
+
+/// Bounded risk allowance for locator selection (ch. 4.2). Phase 1
+/// placeholder scale (0-100, higher = more risk tolerated).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RiskBudget(pub u8);
+
+/// Bounded cost allowance for locator selection (ch. 4.2). Phase 1
+/// placeholder scale (0-100, higher = more cost tolerated).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CostBudget(pub u8);
+
+/// "How the connection may appear externally." (Master Spec Ω+1 ch. 4.2,
+/// verbatim field list.) Deliberately not `From`/`Into`-convertible with
+/// `IdentityRay` — the plane-separation invariant is enforced at compile
+/// time by this omission.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LocatorRay {
+    pub allowed_locator_types: LocatorTypeSet,
+    pub route_class: RouteClass,
+    pub transport_class: TransportClass,
+    pub timing_class: TimingClass,
+    pub risk_budget: RiskBudget,
+    pub cost_budget: CostBudget,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -273,7 +428,7 @@ pub struct StitchCandidate {
     pub run: RunId,
     pub core: CoreNode,
     pub facet: MirrorFacet,
-    pub locator: Locator,
+    pub locator: LocatorFacet,
     pub capability_witness: bool,
     pub seam_ok: bool,
     pub boundary_complete: bool,

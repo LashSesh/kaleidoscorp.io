@@ -4,7 +4,7 @@ use ssk_audit::chain_trace;
 use ssk_focus::refocuses;
 use ssk_gates::GateVector;
 use ssk_identity::derive_identity_facet;
-use ssk_locator::LocatorPool;
+use ssk_locator::StaticLocatorPool;
 use ssk_scheduler::DeterministicScheduler;
 use ssk_stitch::from_intent;
 use ssk_tensor::{make_entry, LedgerBackend, TensorError};
@@ -70,7 +70,7 @@ impl<'a, L: LedgerBackend> Runtime<'a, L> {
     pub fn run_once(
         &self,
         intent: ConnectionIntent,
-        pool: &LocatorPool,
+        pool: &StaticLocatorPool,
     ) -> Result<(RuntimeOutcome, ReplayManifest), RuntimeError> {
         self.run_once_with_context(intent, pool, &DeterminismContext::default())
     }
@@ -78,7 +78,7 @@ impl<'a, L: LedgerBackend> Runtime<'a, L> {
     pub fn run_once_with_context(
         &self,
         intent: ConnectionIntent,
-        pool: &LocatorPool,
+        pool: &StaticLocatorPool,
         determinism: &DeterminismContext,
     ) -> Result<(RuntimeOutcome, ReplayManifest), RuntimeError> {
         let mut scheduler = DeterministicScheduler::new(
@@ -225,7 +225,29 @@ pub fn sample_intent(valid: bool) -> ConnectionIntent {
 mod tests {
     use super::*;
     use ssk_tensor::GenericLedgerBackend;
-    use ssk_types::{Locator, LocatorType};
+    use ssk_types::{
+        CostClass, EndpointRef, EpochId, HealthStatus, LocatorFacet, LocatorKind, RiskClass,
+        RouteClass, TransportClass, TrustClass, Ttl,
+    };
+
+    fn mk_locator_facet() -> LocatorFacet {
+        LocatorFacet {
+            id: ssk_types::LocatorId::new("local"),
+            kind: LocatorKind::LocalOverlay,
+            endpoint: EndpointRef::new("local-endpoint"),
+            route: RouteClass::Direct,
+            transport: TransportClass::Tcp,
+            epoch: EpochId(0),
+            ttl: Ttl(100),
+            trust: TrustClass::Owned,
+            cost: CostClass::Free,
+            risk: RiskClass::Low,
+            health: HealthStatus::Live,
+            trace: TraceId::new("trace-local"),
+            trusted: true,
+            risk_score: 10,
+        }
+    }
 
     #[test]
     fn failed_gate_preserves_tensor() {
@@ -234,12 +256,7 @@ mod tests {
             gate_vector: GateVector::with_all_default(),
             tensor: &tensor,
         };
-        let pool = LocatorPool::new(vec![Locator {
-            id: ssk_types::LocatorId::new("local"),
-            locator_type: LocatorType::LocalOverlay,
-            trusted: true,
-            risk_score: 10,
-        }]);
+        let pool = StaticLocatorPool::new(vec![mk_locator_facet()]);
         let (outcome, _) = runtime
             .run_once(sample_intent(false), &pool)
             .expect("runtime should execute");
@@ -259,12 +276,7 @@ mod tests {
             gate_vector: GateVector::with_all_default(),
             tensor: &tensor_b,
         };
-        let pool = LocatorPool::new(vec![Locator {
-            id: ssk_types::LocatorId::new("local"),
-            locator_type: LocatorType::LocalOverlay,
-            trusted: true,
-            risk_score: 10,
-        }]);
+        let pool = StaticLocatorPool::new(vec![mk_locator_facet()]);
         let ctx = DeterminismContext {
             seeded: true,
             epoch: 77,

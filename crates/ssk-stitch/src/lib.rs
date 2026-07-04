@@ -5,7 +5,7 @@ use ssk_types::{ConnectionIntent, MirrorFacet, StitchCandidate, StitchId};
 pub fn from_intent(
     intent: ConnectionIntent,
     facet: MirrorFacet,
-    locator: ssk_types::Locator,
+    locator: ssk_types::LocatorFacet,
 ) -> StitchCandidate {
     StitchCandidate {
         id: StitchId::new(format!("stitch:{}:{}", intent.run.0 .0, locator.id.0 .0)),
