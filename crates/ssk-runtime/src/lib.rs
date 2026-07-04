@@ -23,13 +23,11 @@ use ssk_types::{
 /// `ssk-types`, and `ssk-types` cannot depend on `ssk-focus` without a
 /// cycle (`ssk-focus` already depends on `ssk-types`).
 ///
-/// **Not yet wired into `Runtime::run_once_with_context`.** Building a real
-/// `Pass` variant needs a genuine `FocusReport`, which needs real
-/// `Response` evidence from a `FiberExecution`/`ResponseCapture` pipeline
-/// stage — neither exists yet (ch. 14.1's spine names them, but no fiber
-/// execution or response-capture subsystem is implemented anywhere in this
-/// workspace). `resolve` below is real and tested against `GateOutcomeKind`
-/// today; wiring a live call site is future work once those stages land.
+/// Produced for real by `run_to_outcome` (below): a `Pass` carries the
+/// materialized stitch ids, a genuine `FocusReport` from
+/// `ssk_focus::FocusEngine::reanalyze` over a real captured `Response`, and
+/// its replay reference. `resolve` remains available as the pure
+/// gate-report → outcome mapping, tested independently of the full driver.
 #[derive(Debug, Clone, PartialEq)]
 pub enum RunOutcome {
     Pass {
@@ -165,6 +163,150 @@ pub fn execute_pipeline(
         gate_report,
         traces,
         scheduler_state: scheduler.state(),
+    })
+}
+
+/// Executes a closed stitch's fiber and captures its response (Master Spec
+/// Ω+1 ch. 14.1's `FiberExecution` + `ResponseCapture` stages). This is the
+/// abstraction boundary the PDF's own non-goals draw: a *real network*
+/// execution is exclusively `ssk-netcore`'s (Desktop track's) job and never
+/// this crate's — so the only executor implemented here is
+/// `LocalFiberExecutor`, a deterministic local echo suitable for
+/// local-overlay / test-harness locators. It fabricates no network
+/// liveness: the captured `Response`'s `payload_digest` is a content hash
+/// of the stitch itself, honestly labeled as a local execution, never
+/// presented as evidence a remote peer answered.
+pub trait FiberExecutor {
+    fn execute(&self, stitch: &ssk_types::BcikStitch) -> ssk_focus::Response;
+}
+
+/// Deterministic, non-network fiber executor: echoes a `Response` derived
+/// entirely from the stitch's own content. Suitable for `LocalOverlay`/
+/// `TestHarness` locators (the only kinds this workspace's core layer
+/// serves); a real egress executor lives in the Desktop track, out of
+/// scope here (Section X).
+#[derive(Debug, Default)]
+pub struct LocalFiberExecutor;
+
+impl FiberExecutor for LocalFiberExecutor {
+    fn execute(&self, stitch: &ssk_types::BcikStitch) -> ssk_focus::Response {
+        // Content-address the stitch's identifying fields into a payload
+        // digest — deterministic, so replay reproduces it bit-for-bit.
+        let payload_digest = digest_of(
+            &format!(
+                "{}:{}:{:?}",
+                stitch.facet.0.to_hex(),
+                stitch.locator.0 .0,
+                stitch.fiber
+            ),
+            HashAlg::Blake3,
+        )
+        .unwrap_or(ssk_types::Digest::GENESIS);
+        ssk_focus::Response {
+            facet: stitch.facet,
+            locator: stitch.locator.clone(),
+            fiber: stitch.fiber,
+            trace: stitch.trace.clone(),
+            payload_digest,
+        }
+    }
+}
+
+/// Drives the full decision-core pipeline through to one of the PDF's three
+/// legitimate terminal outcomes (Master Spec Ω+1 ch. 14.2's `RunOutcome`),
+/// including the stages `run_once_with_context` omits: real BCIK crossing
+/// (`ssk_bcik::Bcik::cross`, not just `BcikGate`'s pass/fail), tensor
+/// materialization into a real `StitchTensor` (`apply_sorted`, not a flat
+/// `TensorEntry`), fiber execution + response capture (`FiberExecutor`),
+/// and concave focus (`ssk_focus::FocusEngine::reanalyze`).
+///
+/// "A connection event ends in exactly one of three legitimate outcomes.
+/// Silent loss is not a legitimate outcome" (ch. 14.2) — this function has
+/// no path that drops a candidate without returning a variant.
+///
+/// # Errors
+/// Returns `RuntimeError` if locator resolution, hashing, or tensor
+/// materialization fails.
+pub fn run_to_outcome(
+    intent: &ConnectionIntent,
+    pool: &StaticLocatorPool,
+    determinism: &DeterminismContext,
+    gate_vector: &GateVector,
+    tensor: &mut ssk_tensor::StitchTensor,
+    fiber_exec: &impl FiberExecutor,
+    current_epoch: ssk_types::EpochId,
+) -> Result<RunOutcome, RuntimeError> {
+    let execution = execute_pipeline(intent, pool, determinism, gate_vector)?;
+    let PipelineExecution {
+        candidate,
+        gate_report,
+        scheduler_state,
+        ..
+    } = execution;
+
+    let audit = AuditRef::new(format!("audit:{}", intent.run.0 .0));
+
+    // Non-pass gate outcomes dissolve or hold — never silently — before any
+    // crossing or materialization is attempted (fail-closed).
+    match gate_report.outcome {
+        GateOutcomeKind::Hold | GateOutcomeKind::Refine => {
+            return Ok(RunOutcome::HoldRefine {
+                residues: gate_report.residues.iter().map(|r| r.id.clone()).collect(),
+            });
+        }
+        GateOutcomeKind::Reject | GateOutcomeKind::Quarantine => {
+            return Ok(RunOutcome::DissolveRejectQuarantine {
+                residues: gate_report.residues.iter().map(|r| r.id.clone()).collect(),
+                audit,
+            });
+        }
+        GateOutcomeKind::Pass => {}
+    }
+
+    // Gate passed: cross the seam for real. An open crossing is a boundary
+    // residue, which dissolves (still not a silent loss).
+    let provider = ssk_crypto::Blake3HashProvider;
+    let mut bcik = ssk_bcik::Bcik::new(&provider);
+    let stitch = match bcik.cross(
+        &candidate.facet,
+        &candidate.locator,
+        ssk_types::FiberType::Data,
+        &candidate,
+    ) {
+        ssk_types::CrossOutcome::Closed(stitch) => stitch,
+        ssk_types::CrossOutcome::Residue(residue) => {
+            return Ok(RunOutcome::DissolveRejectQuarantine {
+                residues: vec![residue.id],
+                audit,
+            });
+        }
+    };
+
+    // Materialize into the real persistent tensor (apply_sorted).
+    let accepted = ssk_types::Accepted {
+        stitch: stitch.clone(),
+        gate_report: gate_report.id.clone(),
+        accepted_at: ssk_types::Tick(scheduler_state.ticks),
+        epoch: current_epoch,
+        ttl: ssk_types::Ttl(candidate.ttl_epoch),
+    };
+    let stitches = tensor
+        .apply_sorted(vec![accepted])
+        .map_err(|_| RuntimeError::Tensor(TensorError::VerificationFailed))?;
+
+    // FiberExecution + ResponseCapture → ConcaveFocus.
+    let response = fiber_exec.execute(&stitch);
+    let focus = ssk_focus::FocusEngine::new(&provider).reanalyze(
+        &[response],
+        &candidate.core,
+        &ssk_focus::Policy,
+    );
+    let replay = focus.replay.clone();
+
+    Ok(RunOutcome::Pass {
+        stitches,
+        focus,
+        replay,
     })
 }
 
@@ -512,5 +654,98 @@ mod tests {
         assert_eq!(a.gate_report, b.gate_report);
         assert_eq!(ma.trace_head, mb.trace_head);
         assert_eq!(ma.descriptor.scheduler, mb.descriptor.scheduler);
+    }
+
+    fn fresh_stitch_tensor() -> ssk_tensor::StitchTensor {
+        ssk_tensor::StitchTensor::open(Box::new(ssk_tensor::GenericMemoryBackend::<
+            ssk_types::StitchTensorEntry,
+        >::new()))
+        .expect("open")
+    }
+
+    #[test]
+    fn run_to_outcome_materializes_and_passes_on_a_valid_intent() {
+        let pool = StaticLocatorPool::new(vec![mk_locator_facet()]);
+        let mut tensor = fresh_stitch_tensor();
+        let outcome = run_to_outcome(
+            &sample_intent(true),
+            &pool,
+            &DeterminismContext::default(),
+            &GateVector::with_all_default(),
+            &mut tensor,
+            &LocalFiberExecutor,
+            EpochId(0),
+        )
+        .expect("run");
+
+        match outcome {
+            RunOutcome::Pass {
+                stitches, focus, ..
+            } => {
+                assert_eq!(stitches.len(), 1);
+                assert_eq!(focus.verdict, ssk_focus::FocusVerdict::Pass);
+            }
+            other => panic!("expected Pass, got {other:?}"),
+        }
+        // The tensor genuinely mutated.
+        assert_eq!(tensor.graph().len(), 1);
+    }
+
+    #[test]
+    fn run_to_outcome_dissolves_and_preserves_the_tensor_on_a_failed_gate() {
+        let pool = StaticLocatorPool::new(vec![mk_locator_facet()]);
+        let mut tensor = fresh_stitch_tensor();
+        let head_before = tensor.head();
+        let outcome = run_to_outcome(
+            &sample_intent(false),
+            &pool,
+            &DeterminismContext::default(),
+            &GateVector::with_all_default(),
+            &mut tensor,
+            &LocalFiberExecutor,
+            EpochId(0),
+        )
+        .expect("run");
+
+        assert!(matches!(
+            outcome,
+            RunOutcome::DissolveRejectQuarantine { .. }
+        ));
+        // Fail-closed: no crossing, no materialization.
+        assert_eq!(tensor.head(), head_before);
+        assert!(tensor.graph().is_empty());
+    }
+
+    #[test]
+    fn run_to_outcome_is_deterministic() {
+        let pool = StaticLocatorPool::new(vec![mk_locator_facet()]);
+        let ctx = DeterminismContext {
+            seeded: true,
+            epoch: 9,
+        };
+        let mut tensor_a = fresh_stitch_tensor();
+        let mut tensor_b = fresh_stitch_tensor();
+        let a = run_to_outcome(
+            &sample_intent(true),
+            &pool,
+            &ctx,
+            &GateVector::with_all_default(),
+            &mut tensor_a,
+            &LocalFiberExecutor,
+            EpochId(3),
+        )
+        .expect("run a");
+        let b = run_to_outcome(
+            &sample_intent(true),
+            &pool,
+            &ctx,
+            &GateVector::with_all_default(),
+            &mut tensor_b,
+            &LocalFiberExecutor,
+            EpochId(3),
+        )
+        .expect("run b");
+        assert_eq!(a, b);
+        assert_eq!(tensor_a.head(), tensor_b.head());
     }
 }
