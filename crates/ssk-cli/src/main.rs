@@ -2,7 +2,7 @@
 
 use clap::{Parser, Subcommand};
 use serde::Serialize;
-use ssk_faultscan::{run_playbook, FaultKind};
+use ssk_faultscan::{run_playbook, ChaosFaultKind};
 use ssk_gates::GateVector;
 use ssk_interop::{Blake3KeyedVerifier, CompatibilityPolicy, ConformanceSuite};
 use ssk_locator::StaticLocatorPool;
@@ -1404,14 +1404,14 @@ fn chaos_command(command: &ChaosCommand, json: bool) -> Result<(), AppError> {
     }
 }
 
-fn parse_fault_kind(s: &str) -> Result<FaultKind, AppError> {
+fn parse_fault_kind(s: &str) -> Result<ChaosFaultKind, AppError> {
     match s {
-        "signature-corruption" => Ok(FaultKind::SignatureCorruption),
-        "capability-withdrawal" => Ok(FaultKind::CapabilityWithdrawal),
-        "ttl-expiry" => Ok(FaultKind::TtlExpiry),
-        "replay-drift" => Ok(FaultKind::ReplayDrift),
-        "attestation-failure" => Ok(FaultKind::AttestationFailure),
-        "locator-untrust" => Ok(FaultKind::LocatorUntrust),
+        "signature-corruption" => Ok(ChaosFaultKind::SignatureCorruption),
+        "capability-withdrawal" => Ok(ChaosFaultKind::CapabilityWithdrawal),
+        "ttl-expiry" => Ok(ChaosFaultKind::TtlExpiry),
+        "replay-drift" => Ok(ChaosFaultKind::ReplayDrift),
+        "attestation-failure" => Ok(ChaosFaultKind::AttestationFailure),
+        "locator-untrust" => Ok(ChaosFaultKind::LocatorUntrust),
         _ => Err(AppError::new(
             ErrorClass::Usage,
             "CHAOS_UNKNOWN_FAULT",

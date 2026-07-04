@@ -132,9 +132,13 @@ honesty for a checkbox, so this document declines to. **Update — Phase 6 done 
 only):** SSKΩ-7's `StitchEdge`/`LocatorGraph`/`HyperEdge`/`select_path` (Section G.2) landed and
 tested in `ssk-locator`, generic over a new dependency-inverted `PathProjectionCheck` trait
 rather than the real `Hypercube` (same crate-cycle constraint as Phases 3-5, disclosed inline);
-real egress adapters and health probing remain out of scope per Section X. This document designs
-the closing architecture for SSKΩ-8/9 (remaining), plus Section R's unfinished wiring and G.2's
-undone `Hypercube` bridging.
+real egress adapters and health probing remain out of scope per Section X. **Update — Phase 7
+partial:** SSKΩ-8's detection-taxonomy half (Section P — `Faultscan`/`FaultEvent`/
+`DetectionSource`/`RuntimeSignalScan`, `ChaosFaultKind` rename) landed and is tested; the
+simulation/conformance-testbed half (concrete `LinkabilityEstimator` metric tests, the full
+deterministic test-vector + property-obligation suite of Section W) remains undone. This
+document designs the closing architecture for the remainder of SSKΩ-8 and all of SSKΩ-9, plus
+Section R's unfinished `RunOutcome` wiring and G.2's undone `Hypercube` bridging.
 
 ---
 
@@ -173,7 +177,7 @@ earlier pass without recheck).
 | `FocusEngine`/`FocusReport`/`CoreSessionClass` | **[1] Phase 5 done** | `crates/ssk-focus/src/lib.rs` — real `FocusEngine::reanalyze` over `Response` evidence, `CoreSessionClass`/`FocusVerdict`/`FocusReport`; the original `refocuses()` boolean check is kept unchanged as `FocusGate`'s real backing check (a different, faster, gate-time concern than session reconstruction) | Ch. 13.1 |
 | `LinkabilityEstimator`/`AdversaryModel`/`LinkabilityReport` | **[1] Phase 5 done** | `crates/ssk-privacy/src/lib.rs` — real trait/enum/struct; `HeuristicLinkabilityEstimator` wraps the original heuristic, declaring `AdversaryModel::PartialNetworkObserver`; `linkability_score()` kept unchanged for `PrivacyGate`'s existing call site | Ch. 15.3 |
 | Real re-executing `ReplayEngine` | **[1] Phase 5 done** | `crates/ssk-replay/src/lib.rs` — `ReplayEngine::replay` now re-executes the decision core itself (via `ssk_runtime::execute_pipeline`, Section Q's shared-pipeline extraction) and diffs the fresh result against the manifest's `trace_head`/`expected_outcome_digest`, rather than being handed two pre-computed outcomes | Ch. 16.3 |
-| 18-variant `FaultKind` + `Faultscan` trait | [3] | `crates/ssk-faultscan/src/lib.rs:16-29` — actual enum has 6 chaos-injection variants (`SignatureCorruption, CapabilityWithdrawal, TtlExpiry, ReplayDrift, AttestationFailure, LocatorUntrust`), API is `inject_fault`/`run_drill`/`run_playbook`, structurally unrelated to the PDF's detection taxonomy | Ch. 17.1 |
+| 18-variant `FaultKind` + `Faultscan` trait | **[1] Phase 7 done** | `FaultKind` (18-variant, `ssk-types`, Phase 0) + real `Faultscan`/`FaultEvent`/`DetectionSource`/`RuntimeSignalScan` (`crates/ssk-faultscan/src/lib.rs`); the old 6-variant chaos-injection enum is renamed `ChaosFaultKind`, API (`inject_fault`/`run_drill`/`run_playbook`) unchanged | Ch. 17.1 |
 | 3-variant `RunOutcome` | **[2] Phase 5 partial** | `crates/ssk-runtime/src/lib.rs` — real `RunOutcome{Pass, HoldRefine, DissolveRejectQuarantine}` and a tested `RunOutcome::resolve(gate_report, ...)` mapping all five `GateOutcomeKind` values correctly; lands in `ssk-runtime` rather than `ssk-types` (disclosed placement correction — `Pass.focus: FocusReport` means it can only live where both `ssk-focus` and `ssk-types` are already dependencies, and `ssk-types` cannot depend on `ssk-focus` without a cycle). **Not yet wired** into any live call site: a real `Pass` needs a genuine `FocusReport`, which needs real `Response` evidence from a `FiberExecution`/`ResponseCapture` stage that does not exist yet. `RuntimeOutcome` (the older flat struct) is unchanged and still what `Runtime::run_once_with_context` returns | Ch. 14.2 |
 | Full runtime pipeline stages | [2] | `crates/ssk-runtime/src/lib.rs` — still 5 traced steps (`Scheduler, Orbit, Locator, Bcik, Gates`) inside the newly-extracted `execute_pipeline`; PDF's spine (Ch. 14.1) names 20 stages including `PchPlacement, GabrielEvaluation, CapabilityCheck, LinkabilityResidue`. Not addressed this phase: splitting these out would require breaking `GateVector::evaluate` (currently one atomic call producing one `GateReport`) into separately-traceable per-check stages | Ch. 14.1 |
 | 12-section config schema | [2] | `crates/ssk-config/src/lib.rs:108-114` — `AppConfig{version, policy, runtime, interop}` covers roughly 4 of ~30 fields across the PDF's 12 sections | Ch. 21 |
@@ -222,7 +226,7 @@ if all tests for levels 0..*k* pass"):
 | SSKΩ-5 | Persistent Stitch Tensor + audit: hash-chained append, storage backends, tensor-preservation theorem tested. | ⚠️ `ssk-tensor`'s real `StitchTensor`/`apply_sorted`/`StorageBackend` landed (Phase 4), hash-chained and tested (including the empty-`Vec`-preserves-the-tensor case); not yet wired into `ssk-runtime`'s live pipeline (Phase 5), so the theorem is not yet provable end-to-end through the actual runtime driver |
 | SSKΩ-6 | Concave Reanalysis Focus + replay: class reconstruction, replay determinism harness green. | ⚠️ real `FocusEngine`/`FocusReport` (Phase 5) and a genuinely re-executing `ReplayEngine` (Phase 5) both landed and tested; the 3-variant `RunOutcome` exists but is not wired into any live pipeline call site (needs a real `FiberExecution`/`ResponseCapture` stage that doesn't exist yet) |
 | SSKΩ-7 | Locator pool + relay-fabric adapters: real egress adapters behind the async edge, health probing. | ⚠️ funnel-DAG (`StitchEdge`/`LocatorGraph`/`HyperEdge`/`select_path`, Phase 6) landed and tested; real egress adapters/health probing behind the `async-edge` feature remain out of scope (Section X — real network I/O stays the Desktop track's `ssk-netcore` responsibility) |
-| SSKΩ-8 | Full simulation + conformance testbed: privacy metric tests, defensive adversary sim, all vectors. | ❌ absent |
+| SSKΩ-8 | Full simulation + conformance testbed: privacy metric tests, defensive adversary sim, all vectors. | ⚠️ the `FaultKind`/`Faultscan` detection taxonomy (Section P) landed and is tested (Phase 7); concrete `LinkabilityEstimator` metric tests (locator reuse, timing concentration, cross-facet correlation, residue-visibility completeness — PDF ch. 18.4) and the full deterministic test-vector/property-obligation suite (Section W) remain undone |
 | SSKΩ-9 | Production-hardened runtime profile: dissolution/TTL sweeps, ledger verification, deployment audit, documented limits. | ❌ absent (TTL is a bare `==0` check, no sweeping) |
 
 **Target of this document: close SSKΩ-3 through SSKΩ-9**, in the phase order of Section V.
@@ -1199,19 +1203,26 @@ pub trait Faultscan {
 > **Axiom — metrics do not replace gates:** a metric can inform a gate, but no aggregate score
 > overrides a required gate.
 
-**Current:** `crates/ssk-faultscan/src/lib.rs:16-29` — a real, working **chaos-injection
-harness**: `FaultKind{SignatureCorruption, CapabilityWithdrawal, TtlExpiry, ReplayDrift,
-AttestationFailure, LocatorUntrust}` (6 variants), API is `inject_fault`/`run_drill`/
-`run_playbook` — structurally unrelated to the PDF's 18-variant **detection** taxonomy. These
-are two genuinely different concerns wearing the same name.
+**Current — Phase 7 done:** the old chaos-injection enum is renamed to `ChaosFaultKind`
+(mechanical rename, `crates/ssk-faultscan/src/lib.rs` + `ssk-cli`'s `chaos drill` call site) —
+`FaultKind` (18-variant, `ssk-types`, landed in Phase 0) now unambiguously names the PDF's
+detection taxonomy. `ssk-faultscan` has the real `Faultscan` trait, `FaultEvent`,
+`DetectionSource` (this document's own minimal, disclosed elaboration — the excerpted PDF text
+names the field but not a closed variant set), and a first real implementation
+(`RuntimeSignalScan`) that derives `FaultEvent`s from existing signals: every `GateReport`
+residue maps to its nearest `FaultKind` variant via `ResidueKind` (e.g. `Capability` →
+`CapabilityInvalid`, `Correlation` → `PrivacyBudgetExceeded`), and a `ReplayVerdict::Divergent`
+maps to a `Critical`-severity `FaultKind::ReplayGap`. `RuntimeState` (ch. 17.1's own referenced
+but unenumerated parameter type) is this crate's own disclosed placeholder, carrying exactly
+the `GateReport`/`Option<ReplayVerdict>` pair `RuntimeSignalScan` needs — not a full runtime
+snapshot, since nothing in this codebase yet models one. `fail_closed`'s default body matches
+the PDF's own — a diagnostic signal for callers, explicitly never itself a gate (ch. 17's
+axiom).
 
-**Design:** **rename** the existing enum to `ChaosFaultKind` in `ssk-faultscan` — a small,
-contained, mechanical rename touching only this crate's tests and the `ssk-cli` `chaos drill`
-call site. This frees up `FaultKind` for the spec's 18-variant foundation vocabulary (Section
-E.5), which lands in `ssk-types`. Add the `Faultscan` trait + `FaultEvent`/`Severity` to
-`ssk-faultscan`, with a first real `scan()` implementation that derives `FaultEvent`s from
-existing runtime signals (gate residues, replay divergence, storage errors) rather than
-inventing a new detection subsystem from scratch.
+Tested: `scan_maps_a_gate_residue_to_the_matching_fault_kind`,
+`scan_reports_replay_divergence_as_a_critical_fault`,
+`scan_on_a_clean_pass_reports_no_faults_and_does_not_fail_closed`; all pre-existing chaos-drill
+tests pass unchanged under the renamed type.
 
 ---
 
