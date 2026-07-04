@@ -19,13 +19,20 @@
 >   C_coupling + δF, honestly typed as an observation surface.
 > - **`ssk-meta-resonance`** — the MetaResonanceController (Band B): PID feedback that
 >   stabilizes/delays but never bypasses a gate; no gate-flicker.
+> - **`ssk-host-cells`** — the HostCellPlane (Heavenly Hosts, Band B): ephemeral,
+>   capability/scope-bound role cells with TTL + dissolution; HostCell ≠ public identity.
+> - **`ssk-funnel-dag`** — the FunnelDAG (FCHL sense, Band B): host-relation work DAG,
+>   DAG-by-construction, TTL + hash-chained trace (temporal-window replay).
+> - **`ssk-crown`** — the SSCL CrownSupervisor: the fail-closed emission gate that clamps
+>   signature gate + IMDF QLOGIC + kill-switch + MetaResonance + open obligations into one
+>   audited, replay-stable emission decision.
 >
-> All four capabilities the author named are implemented: spectrum-as-identity,
-> SystemTrafficField capture, session-local kill-switch, FieldTensorSkin. Remaining
-> greenfield: the rest of Band B (HostCellPlane, FunnelDAG, TFA, TopologyScalpel), the
-> SSCL Crown (ProfileManifold, ServiceHost/packaging/DeliveryEnvelope, CrownSupervisor),
-> binding the pure seams to real privileged backends, and the top rungs (…-9) of each
-> conformance ladder.
+> Whole workspace: **32 crates, 357 tests green**, `clippy -D warnings` clean, `cargo deny`
+> ok, `ssk-core` no_std intact. All four named capabilities are in. Remaining greenfield:
+> the rest of Band B (**TFA**, **TopologyScalpel**), the rest of the SSCL Crown
+> (**ProfileManifold**, **ServiceHost/PrivilegedHelper**, **DeliveryEnvelope/packaging**),
+> binding the pure seams to real privileged backends (OS capture, egress teardown), and the
+> top rungs (…-9) of each conformance ladder + productization (CI, release artifacts).
 
 **Deliverable "A": the complete architecture correspondence across the whole normative corpus, mapped onto the existing `ssk-*` workspace.** This subsumes and extends `FCHL_MPK_INTEGRATION_STRATEGY.md` (which was FCHL-MPK-scoped) to all seven source documents, unifies their conformance ladders into one, and gives one integration sequence.
 
