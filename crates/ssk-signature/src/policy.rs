@@ -7,8 +7,10 @@
 //! carries no clock (a manifest's `created_at` is caller-supplied) so evaluation
 //! stays deterministic and replay-friendly.
 
+use serde::{Deserialize, Serialize};
+
 /// Outcome of a policy evaluation.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PolicyOutcome {
     Pass,
     Fail,
@@ -30,7 +32,7 @@ impl PolicyOutcome {
 }
 
 /// A policy decision: outcome + machine-readable reason.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct PolicyDecision {
     pub outcome: PolicyOutcome,
     pub reason: String,

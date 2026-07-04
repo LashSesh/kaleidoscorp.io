@@ -36,8 +36,10 @@
 //! through the SSK content-address path rather than reproducing Python's
 //! `sha256(json.dumps(...))` byte-for-byte).
 
+pub mod audit_ledger;
 pub mod calibration;
 pub mod canonical;
+pub mod controlled_adapter;
 pub mod corpus;
 pub mod features;
 pub mod fingerprints;
@@ -52,14 +54,20 @@ pub mod replay;
 pub mod residue;
 pub mod signature;
 pub mod target;
+pub mod trace_adapter;
 pub mod url;
 pub mod value;
 
+pub use audit_ledger::{AuditLedger, LedgerError};
 pub use calibration::{
     calibration_preset_names, calibration_spectrum, get_calibration_preset, CalibrationPreset,
     DEFAULT_CALIBRATION_PRESET,
 };
 pub use canonical::{canonicalize, CanonicalObject};
+pub use controlled_adapter::{
+    object_ref, AdapterExportBundle, AdapterPolicyDecision, ControlIntent, ControlPlan,
+    ControlPlanStep, ControlledAdapterFramework, ControlledAdapterPolicy,
+};
 pub use corpus::{
     ClusterReport, CorpusError, DimensionStats, DriftReport, ProfileCorpus, ProfileDistance,
     ProfileStore, SignatureProfileRecord,
@@ -91,6 +99,7 @@ pub use signature::{
     Decision, SignatureComparisonReport, SignatureDimensionDelta, SpectralSignature,
 };
 pub use target::{OperationalMask, TargetProfile};
+pub use trace_adapter::{TraceAdapter, TraceImportError};
 pub use url::{urlparse, ParsedUrl};
 pub use value::{
     bucket, categorical_equal, round6, shannon_entropy, Dimension, Dimensions, FeatureValue,

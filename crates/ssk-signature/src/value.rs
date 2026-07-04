@@ -182,6 +182,28 @@ pub type Dimension = BTreeMap<String, FeatureValue>;
 /// The full multi-dimensional spectrum: dimension name → dimension.
 pub type Dimensions = BTreeMap<String, Dimension>;
 
+/// Convert an arbitrary `serde_json::Value` into a surface [`Value`], preserving
+/// object key order. Used by the import adapters (a `serde(untagged)` derive
+/// cannot deserialize a JSON object into the order-preserving `Object` variant,
+/// so external JSON is converted explicitly).
+#[must_use]
+pub fn value_from_json(json: &serde_json::Value) -> Value {
+    match json {
+        serde_json::Value::Null => Value::Null,
+        serde_json::Value::Bool(b) => Value::Bool(*b),
+        serde_json::Value::Number(n) => Value::Num(n.as_f64().unwrap_or(0.0)),
+        serde_json::Value::String(s) => Value::Text(s.clone()),
+        serde_json::Value::Array(a) => Value::Array(a.iter().map(value_from_json).collect()),
+        serde_json::Value::Object(o) => {
+            let mut m = OrderedMap::new();
+            for (k, v) in o {
+                m.insert(k.clone(), value_from_json(v));
+            }
+            Value::Object(m)
+        }
+    }
+}
+
 /// Python `round(x, 6)` — round-half-to-even at six decimal places. Used
 /// everywhere distances are produced so comparisons against tolerances are
 /// stable and reproducible.
