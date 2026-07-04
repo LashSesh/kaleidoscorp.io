@@ -5,7 +5,7 @@ use ssk_focus::refocuses;
 use ssk_gates::GateVector;
 use ssk_identity::derive_identity_facet;
 use ssk_locator::StaticLocatorPool;
-use ssk_scheduler::DeterministicScheduler;
+use ssk_scheduler::HypertoroidalScheduler;
 use ssk_stitch::from_intent;
 use ssk_tensor::{make_entry, LedgerBackend, TensorError};
 use ssk_types::{
@@ -81,10 +81,15 @@ impl<'a, L: LedgerBackend> Runtime<'a, L> {
         pool: &StaticLocatorPool,
         determinism: &DeterminismContext,
     ) -> Result<(RuntimeOutcome, ReplayManifest), RuntimeError> {
-        let mut scheduler = DeterministicScheduler::new(
+        let mode = if determinism.seeded {
+            ssk_types::SchedulerMode::Seeded(ssk_types::SchedulerSeed(determinism.epoch))
+        } else {
+            ssk_types::SchedulerMode::Deterministic
+        };
+        let mut scheduler = HypertoroidalScheduler::new(
             ssk_types::PhaseVector::zero(),
             FrequencyVector::deterministic(),
-            determinism.seeded,
+            mode,
             determinism.epoch,
         );
         let _phase = scheduler.tick();

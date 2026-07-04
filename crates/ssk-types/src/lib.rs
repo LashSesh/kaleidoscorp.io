@@ -540,11 +540,27 @@ pub struct GateReport {
     pub residues: Vec<BoundaryResidue>,
 }
 
+/// A recorded PRNG seed for `SchedulerMode::Seeded` (ch. 7.2) — stored in the
+/// `RunDescriptor` so replay is exact.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct SchedulerSeed(pub u64);
+
+/// Both modes are deterministic given their inputs; the difference is only
+/// whether a seed perturbs increments (Master Spec Ω+1 ch. 7.2, verbatim).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SchedulerMode {
+    /// Pure: phase advances by a fixed `FrequencyVector`. Fully reproducible.
+    Deterministic,
+    /// Seeded: a recorded seed drives a deterministic PRNG that jitters
+    /// increments; the seed is stored in the `RunDescriptor` so replay is exact.
+    Seeded(SchedulerSeed),
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SchedulerState {
     pub theta0: PhaseVector,
     pub freq: FrequencyVector,
-    pub seeded: bool,
+    pub mode: SchedulerMode,
     pub epoch: u64,
     pub ticks: u64,
 }
@@ -553,6 +569,13 @@ pub struct SchedulerState {
 pub struct Phase(pub u32);
 
 pub const PHASE_MODULUS: u32 = 1 << 20;
+
+/// Visibility half-width for the toroidal-distance predicate (ch. 7.1,
+/// verbatim).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Window {
+    pub epsilon: u32,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PhaseVector {

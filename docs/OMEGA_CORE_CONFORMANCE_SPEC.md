@@ -104,12 +104,15 @@ BCIK crossing → twelve-gate vector → conditional tensor append → replay ma
   `projective_connection_hypercube`, `hypertorus`, `bcik`, `capabilities`, `privacy`, `gates`,
   `replay`, `ledger`, `dissolution`.
 
-**Honest conformance ceiling today: SSKΩ-2, bordering SSKΩ-3.** The typed model, deterministic
-core, and mirror-facet orbit with a locator pool exist (SSKΩ-0/1/2's requirements), but SSKΩ-2's
-own "locator-reality checks" are not real (no `claims_external_plurality()`), and SSKΩ-3's
-requirement that "every crossing carries seam, boundary, gate, trace, replay" is not met — the
-BCIK crossing carries none of the PDF's fields. This document designs the closing architecture
-for SSKΩ-3 through SSKΩ-9.
+**Honest conformance ceiling at the time of writing: SSKΩ-2, bordering SSKΩ-3.** The typed model,
+deterministic core, and mirror-facet orbit with a locator pool existed (SSKΩ-0/1/2's
+requirements), but SSKΩ-2's own "locator-reality checks" were not real, and SSKΩ-3's requirement
+that "every crossing carries seam, boundary, gate, trace, replay" was not met. **Update — Phase 1
+complete:** SSKΩ-1/2 are now met to the letter (`HypertoroidalScheduler`'s real `SchedulerMode`/
+`visible()`; content-addressed `MirrorOrbit`; real `LocatorPool::claims_external_plurality()`).
+The remaining gap to SSKΩ-3 is now narrowly the BCIK crossing kernel itself (Section J, Phase 2)
+— the crossing still carries none of the PDF's `BcikStitch` fields. This document designs the
+closing architecture for SSKΩ-3 through SSKΩ-9.
 
 ---
 
@@ -132,7 +135,7 @@ earlier pass without recheck).
 | 9-variant `LocatorKind`/`LocatorFacet` | **[1] Phase 1 done** | `crates/ssk-types/src/lib.rs` — all 9 variants; `LocatorFacet` carries the full field list plus two disclosed Phase-1 bridge fields (`trusted`/`risk_score`) preserving today's gate checks until Phase 3 rewires them | Ch. 4.3 |
 | `LocatorAdapter`/`LocatorPool` trait + `claims_external_plurality()` | **[1] Phase 1 done** | `crates/ssk-locator/src/lib.rs` — real traits; `StaticLocatorPool` implements both, with `claims_external_plurality()` genuinely counting distinct live endpoints (tested false-for-one, false-for-shared-endpoint, false-for-non-live, true-for-two-distinct-live) | Ch. 6.2 |
 | `StitchEdge`/`LocatorGraph`/`HyperEdge`/`select_path` | [4] | not present anywhere | Ch. 6.3-6.4 |
-| `SchedulerMode`/`SchedulerSeed`/`visible()` | [3] | `crates/ssk-scheduler/src/lib.rs:6-22` — `seeded: bool` is stored in `SchedulerState` but never read in `tick()` (lines 25-42 advance every axis unconditionally); no `visible()` predicate exists | Ch. 7.2 |
+| `SchedulerMode`/`SchedulerSeed`/`visible()` | **[1] Phase 1 done** | `crates/ssk-scheduler/src/lib.rs` — renamed `HypertoroidalScheduler`; `Seeded` mode genuinely jitters phase advancement via a `rand_pcg`-seeded PRNG keyed by `(seed, tick count)`; `visible()` implements the literal toroidal-distance formula, tested including wraparound | Ch. 7.2 |
 | Projective Connection Hypercube | [4] | not present anywhere | Ch. 8 |
 | Gabriel Constraint Cells | [4] | not present anywhere | Ch. 10 |
 | `BcikStitch` payload | [4] | `crates/ssk-bcik/src/lib.rs:6-9` — `CrossOutcome::Closed` is a unit-like variant, no payload | Ch. 9.1 |
@@ -191,7 +194,7 @@ if all tests for levels 0..*k* pass"):
 |-------|-----------------|-----------------|
 | SSKΩ-0 | Typed model: `ssk-types`/`ssk-core` compile; Core, Identity Plane, Locator Plane exist and are separately typed. | ✅ met |
 | SSKΩ-1 | Deterministic core + scheduler: fixed-point phase, deterministic tick, replayable phase selection. | ✅ met |
-| SSKΩ-2 | Mirror-facet orbit + locator pool with real typing and locator-reality checks. | ⚠️ orbit exists but is not content-addressed; locator-reality check (`claims_external_plurality()`) does not exist |
+| SSKΩ-2 | Mirror-facet orbit + locator pool with real typing and locator-reality checks. | ✅ met (Phase 1: content-addressed `MirrorOrbit`, real `claims_external_plurality()`) |
 | SSKΩ-3 | BCIK `StitchCandidate` pipeline: every crossing carries seam, boundary, gate, trace, replay. | ❌ crossing carries none of these as real objects — two hardcoded booleans |
 | SSKΩ-4 | Gate vector + boundary residues: twelve gates, fail-closed, typed residues, PCH projection checks. | ❌ twelve gates exist but are thin; no PCH |
 | SSKΩ-5 | Persistent Stitch Tensor + audit: hash-chained append, storage backends, tensor-preservation theorem tested. | ⚠️ hash-chained append + storage backends are real; the theorem is provable only informally, not as a typestate guarantee |
