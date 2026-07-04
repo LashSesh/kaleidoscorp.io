@@ -1,6 +1,30 @@
 #![forbid(unsafe_code)]
 
 use ssk_types::HashAlg;
+use zeroize::{Zeroize, ZeroizeOnDrop};
+
+/// Ephemeral key material, capability secrets and session keys are wrapped
+/// so they are zeroed on drop and never printed (Master Spec Ω+1 ch. 3.4).
+#[derive(Clone, Zeroize, ZeroizeOnDrop)]
+pub struct SecretBytes(Vec<u8>);
+
+impl SecretBytes {
+    #[must_use]
+    pub fn new(bytes: Vec<u8>) -> Self {
+        Self(bytes)
+    }
+
+    #[must_use]
+    pub fn expose(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl core::fmt::Debug for SecretBytes {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("SecretBytes(<redacted>)")
+    }
+}
 
 pub trait HashProvider {
     fn algorithm(&self) -> HashAlg;
@@ -174,3 +198,20 @@ mod chacha_impl {
 
 #[cfg(feature = "crypto")]
 pub use chacha_impl::ChaCha20Poly1305Provider;
+
+#[cfg(test)]
+mod secret_bytes_tests {
+    use super::SecretBytes;
+
+    #[test]
+    fn debug_output_is_redacted() {
+        let secret = SecretBytes::new(vec![1, 2, 3, 4]);
+        assert_eq!(format!("{secret:?}"), "SecretBytes(<redacted>)");
+    }
+
+    #[test]
+    fn expose_returns_the_original_bytes() {
+        let secret = SecretBytes::new(vec![9, 9, 9]);
+        assert_eq!(secret.expose(), &[9, 9, 9]);
+    }
+}

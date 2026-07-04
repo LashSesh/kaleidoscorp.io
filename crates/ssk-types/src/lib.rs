@@ -38,9 +38,92 @@ id_type!(StitchId);
 id_type!(GateReportId);
 id_type!(ResidueId);
 id_type!(ReplayRoot);
-id_type!(Digest);
 id_type!(LocatorId);
 id_type!(PolicyId);
+
+/// Content-addressed hash value (Master Spec Ω+1 ch. 3.1). Backed by a real
+/// 32-byte digest rather than an opaque string, so `content_id!`-derived ids
+/// are genuinely computed from their object's canonical bytes, not chosen by
+/// the caller. Serializes as the same lowercase-hex string the old
+/// string-backed `Digest` produced, so persisted `GenericFileLedgerBackend`
+/// JSON files remain readable across this change.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct Digest(pub [u8; 32]);
+
+impl Digest {
+    /// Sentinel used as the `prev_hash` of the first entry in a hash chain.
+    pub const GENESIS: Digest = Digest([0u8; 32]);
+    /// Placeholder written into a `entry_hash`/`trace_head`-style field before
+    /// its real value has been computed (mirrors the old `Digest::new("pending")`
+    /// two-pass compute-then-overwrite pattern). Never compared for equality
+    /// against a real digest by any passing code path.
+    pub const PENDING: Digest = Digest([0u8; 32]);
+
+    /// Parse a lowercase-hex-encoded 32-byte digest, e.g. as read back from a
+    /// persisted ledger file.
+    pub fn from_hex(s: &str) -> Result<Self, TypeError> {
+        let bytes = hex::decode(s).map_err(|e| TypeError::Serialization(e.to_string()))?;
+        let arr: [u8; 32] = bytes
+            .try_into()
+            .map_err(|_| TypeError::Serialization("digest must be exactly 32 bytes".to_owned()))?;
+        Ok(Digest(arr))
+    }
+
+    #[must_use]
+    pub fn to_hex(&self) -> String {
+        hex::encode(self.0)
+    }
+}
+
+impl fmt::Debug for Digest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_tuple("Digest").field(&self.to_hex()).finish()
+    }
+}
+
+impl fmt::Display for Digest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.to_hex())
+    }
+}
+
+impl Serialize for Digest {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&self.to_hex())
+    }
+}
+
+impl<'de> Deserialize<'de> for Digest {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(deserializer)?;
+        Digest::from_hex(&s).map_err(serde::de::Error::custom)
+    }
+}
+
+/// Derives a content-addressed identifier: two objects with identical
+/// canonical serialization always produce the same id (Master Spec Ω+1
+/// ch. 3.1's identifier rule). Additive foundation infrastructure — no
+/// existing id type is migrated to this macro yet; each id migrates only once
+/// its owning object carries real canonical content to derive from.
+#[macro_export]
+macro_rules! content_id {
+    ($name:ident) => {
+        #[derive(
+            Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize,
+        )]
+        pub struct $name(pub $crate::Digest);
+
+        impl $name {
+            /// Derive the id from the canonical (CBOR) encoding of `value`.
+            pub fn of<T: Serialize>(
+                value: &T,
+                alg: $crate::HashAlg,
+            ) -> Result<Self, $crate::TypeError> {
+                Ok(Self($crate::digest_of(value, alg)?))
+            }
+        }
+    };
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum HashAlg {
@@ -178,6 +261,23 @@ pub struct BoundaryResidue {
     pub source_gate: GateId,
     pub detail: String,
 }
+
+/// The class of foundation object a `CoreObject` impl identifies as (Master
+/// Spec Ω+1 ch. 3.2). Additive — grows as later phases add object types
+/// (`BcikStitch`, `CapabilityWitness`, `StitchEdge`, ...).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ObjectKind {
+    Core,
+    MirrorFacet,
+}
+
+/// Which `ResidueKind` a `CoreObject` type escalates to if it fails
+/// validation. A thin, additive wrapper: the real per-instance failure detail
+/// still flows through `BoundaryResidue`/`ResidueKind` (ch. 9.2); this only
+/// declares the type-level default, matching the gate table's "residue on
+/// fail" column (ch. 11.2) for `CoreGate`/`MirrorGate`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResiduePolicy(pub ResidueKind);
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum GateVerdict {
@@ -367,6 +467,43 @@ pub enum TypeError {
     Serialization(String),
 }
 
+/// The unified fault-detection taxonomy (Master Spec Ω+1 ch. 17.1). Additive
+/// foundation vocabulary: no crate's public API returns this yet — each
+/// foundation crate migrates its fallible boundary methods to return
+/// `FaultKind` (directly or via a `From<LocalError>` bridge) only as its own
+/// phase in `docs/OMEGA_CORE_CONFORMANCE_SPEC.md` lands, per that document's
+/// Section E.5/T.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum FaultKind {
+    CoreNotCanonical,
+    FacetNotRecoverable,
+    LocatorUnavailable,
+    SingleIpOverclaim,
+    BcikSeamMissing,
+    PchProjectionGap,
+    CapabilityInvalid,
+    PrivacyBudgetExceeded,
+    TimingResidueHigh,
+    FiberInvariantFailure,
+    FocusAmbiguity,
+    ReplayGap,
+    ReanalysisMismatch,
+    SilentResidueAttempt,
+    DissolutionFailure,
+    StorageFailure,
+    ConfigInvalid,
+    CryptoProviderError,
+}
+
+/// Fault severity (Master Spec Ω+1 ch. 17.1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Severity {
+    Info,
+    Low,
+    High,
+    Critical,
+}
+
 pub fn canonical_bytes<T: Serialize>(value: &T) -> Result<Vec<u8>, TypeError> {
     let mut out = Vec::new();
     ciborium::ser::into_writer(value, &mut out)
@@ -376,15 +513,19 @@ pub fn canonical_bytes<T: Serialize>(value: &T) -> Result<Vec<u8>, TypeError> {
 
 pub fn digest_of<T: Serialize>(value: &T, alg: HashAlg) -> Result<Digest, TypeError> {
     let bytes = canonical_bytes(value)?;
-    let hex = match alg {
-        HashAlg::Blake3 => blake3::hash(&bytes).to_hex().to_string(),
+    let raw: [u8; 32] = match alg {
+        HashAlg::Blake3 => *blake3::hash(&bytes).as_bytes(),
         HashAlg::Sha256 => {
             let mut hasher = Sha256::new();
             hasher.update(&bytes);
-            hex::encode(hasher.finalize())
+            hasher
+                .finalize()
+                .as_slice()
+                .try_into()
+                .expect("sha256 output is 32 bytes")
         }
     };
-    Ok(Digest::new(hex))
+    Ok(Digest(raw))
 }
 
 impl fmt::Display for Id {
@@ -408,5 +549,37 @@ mod tests {
         let d1 = digest_of(&c, HashAlg::Blake3).expect("hash must work");
         let d2 = digest_of(&c, HashAlg::Blake3).expect("hash must work");
         assert_eq!(d1, d2);
+    }
+
+    #[test]
+    fn digest_hex_round_trips() {
+        let d = digest_of(&"payload", HashAlg::Blake3).expect("hash must work");
+        let hex = d.to_hex();
+        assert_eq!(Digest::from_hex(&hex).expect("valid hex"), d);
+    }
+
+    #[test]
+    fn digest_serde_round_trips_as_hex_string() {
+        let d = digest_of(&"payload", HashAlg::Sha256).expect("hash must work");
+        let json = serde_json::to_string(&d).expect("serialize");
+        assert_eq!(json, format!("\"{}\"", d.to_hex()));
+        let back: Digest = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back, d);
+    }
+
+    content_id!(TestId);
+
+    #[test]
+    fn content_id_is_deterministic() {
+        let a = TestId::of(&"payload", HashAlg::Blake3).expect("hash");
+        let b = TestId::of(&"payload", HashAlg::Blake3).expect("hash");
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn content_id_differs_for_different_input() {
+        let a = TestId::of(&"payload-a", HashAlg::Blake3).expect("hash");
+        let b = TestId::of(&"payload-b", HashAlg::Blake3).expect("hash");
+        assert_ne!(a, b);
     }
 }

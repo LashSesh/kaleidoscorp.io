@@ -99,7 +99,7 @@ impl<'a, L: LedgerBackend> Runtime<'a, L> {
         let gate_report = self.gate_vector.evaluate(&candidate);
 
         let mut traces = Vec::new();
-        let mut prev_hash = ssk_types::Digest::new("genesis");
+        let mut prev_hash = ssk_types::Digest::GENESIS;
         for step in [
             PipelineStep::Scheduler,
             PipelineStep::Orbit,
@@ -115,11 +115,11 @@ impl<'a, L: LedgerBackend> Runtime<'a, L> {
                 outputs: vec![digest_of(&gate_report, HashAlg::Blake3)?],
                 gate_report: Some(gate_report.id.clone()),
                 residues: gate_report.residues.iter().map(|r| r.id.clone()).collect(),
-                prev_hash: prev_hash.clone(),
-                entry_hash: ssk_types::Digest::new("pending"),
+                prev_hash,
+                entry_hash: ssk_types::Digest::PENDING,
             };
             let trace = chain_trace(&prev_hash, trace)?;
-            prev_hash = trace.entry_hash.clone();
+            prev_hash = trace.entry_hash;
             traces.push(trace);
         }
 
@@ -128,8 +128,8 @@ impl<'a, L: LedgerBackend> Runtime<'a, L> {
                 .tensor
                 .entries()?
                 .last()
-                .map(|e| e.entry_hash.clone())
-                .unwrap_or_else(|| ssk_types::Digest::new("genesis"));
+                .map(|e| e.entry_hash)
+                .unwrap_or_else(|| ssk_types::Digest::GENESIS);
             let entry = make_entry(
                 intent.run.clone(),
                 candidate.id.clone(),
@@ -157,13 +157,13 @@ impl<'a, L: LedgerBackend> Runtime<'a, L> {
                     .tensor
                     .entries()?
                     .last()
-                    .map(|e| e.entry_hash.clone())
-                    .unwrap_or_else(|| ssk_types::Digest::new("genesis")),
+                    .map(|e| e.entry_hash)
+                    .unwrap_or_else(|| ssk_types::Digest::GENESIS),
             },
             trace_head: traces
                 .last()
-                .map(|t| t.entry_hash.clone())
-                .unwrap_or_else(|| ssk_types::Digest::new("genesis")),
+                .map(|t| t.entry_hash)
+                .unwrap_or_else(|| ssk_types::Digest::GENESIS),
             expected_outcome_digest: digest_of(&gate_report, HashAlg::Blake3)?,
         };
 
@@ -189,7 +189,7 @@ impl<'a, L: LedgerBackend> Runtime<'a, L> {
         RuntimeEvent {
             event: "runtime.run.completed".into(),
             run_id: outcome.run.0 .0.clone(),
-            replay_id: manifest.trace_head.0 .0.clone(),
+            replay_id: manifest.trace_head.to_hex(),
             seeded: determinism.seeded,
             epoch: determinism.epoch,
             gate_outcome: outcome.gate_report.outcome,

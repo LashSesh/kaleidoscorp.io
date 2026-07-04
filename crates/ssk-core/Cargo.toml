@@ -14,6 +14,7 @@ ssk-types = { path = "../ssk-types", default-features = false }
 
 [dev-dependencies]
 proptest.workspace = true
+trybuild = "1"
 
 [lints]
 workspace = true

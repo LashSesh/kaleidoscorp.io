@@ -43,9 +43,13 @@ BCIK crossing → twelve-gate vector → conditional tensor append → replay ma
 
 - The **foundation layer** (Chapter 3 of the PDF: `content_id!`, sealed `CoreObject` with
   `object_kind()`/`residue_policy()`, the `Connection<S>` typestate, `SecretBytes`, the
-  18-variant `FaultKind` vocabulary) is **entirely absent** [4]. IDs are opaque strings, not
-  content-addressed; there is no typestate machine anywhere; there is no unified fault
-  vocabulary — each crate has its own independent `thiserror` enum.
+  18-variant `FaultKind` vocabulary) is now **implemented as scaffolding (Phase 0, done)**:
+  `Digest` is content-addressable (`[u8; 32]`, hex-serde-compatible), `CoreObject` has real
+  `object_kind()`/`residue_policy()` impls, `Connection<S>`'s typestate machine is real and
+  compile-time enforced (its five transition bodies are deliberately stubbed pending later
+  phases), `SecretBytes` is real, and the 18-variant `FaultKind` enum exists. What remains
+  absent is the *migration* of existing ids/errors onto this scaffolding, and the real
+  transition-body logic — both tracked phase-by-phase in Section V.
 - The **domain model** (Chapter 4: full `CoreNode`/`MirrorFacet` fields, cryptographic
   `MirrorOrbit`, `birefract()`/`IdentityRay`/`LocatorRay`, 9-variant `LocatorKind`) is
   **present in miniature** [2]/[3] — `CoreNode` has 4 of 7 spec fields, `MirrorFacet` has 3 of
@@ -116,11 +120,11 @@ earlier pass without recheck).
 
 | Area | Tag | Evidence (file:line) | PDF ref |
 |------|-----|----------------------|---------|
-| Content-addressed ids / `content_id!` | [4] | `crates/ssk-types/src/lib.rs:22-42` — `id_type!` wraps an opaque `String`, no hashing | Ch. 3.1 |
-| Sealed `CoreObject` (`object_kind`/`residue_policy`) | [3] | `crates/ssk-core/src/lib.rs:28-36` — `SealedCoreObject` is an empty marker trait, zero methods | Ch. 3.2 |
-| `Connection<S>` typestate | [4] | not present anywhere in the tree | Ch. 3.3 |
-| `SecretBytes`/zeroize | [4] | not present; `zeroize` is only a transitive dependency via `ed25519-dalek`/`x25519-dalek` | Ch. 3.4 |
-| Unified `FaultKind` vocabulary | [4] | each crate has its own `thiserror` enum (`TypeError`, `TensorError`, `RuntimeError`, `ConfigError`, …) | Ch. 3.5 |
+| Content-addressed ids / `content_id!` | **[1] Phase 0 done** | `Digest` is now `[u8; 32]`-backed with hex-string serde (`crates/ssk-types/src/lib.rs`); `content_id!` macro exists and is determinism-tested. `CoreId`/`RunId`/etc. deliberately **not yet migrated** off `id_type!`'s opaque-string form — each migrates only once its owning object carries real canonical content (Section V) | Ch. 3.1 |
+| Sealed `CoreObject` (`object_kind`/`residue_policy`) | **[1] Phase 0 done** | `crates/ssk-core/src/lib.rs` — `CoreObject` (renamed from `SealedCoreObject`, sealed via `mod sealed`) now has real `object_kind()`/`residue_policy()` impls for `CoreNode`/`MirrorFacet` | Ch. 3.2 |
+| `Connection<S>` typestate | **[2] Phase 0 skeleton** | `crates/ssk-core/src/connection.rs` — phantom-state machine is real and compile-time enforced (proven by two `trybuild` compile-fail fixtures); all five transition bodies are deliberately stubbed pending their owning phase (Section V) | Ch. 3.3 |
+| `SecretBytes`/zeroize | **[1] Phase 0 done** | `crates/ssk-crypto/src/lib.rs` — real zeroize-wrapped, redacted-`Debug` type; `zeroize` promoted to a direct dependency | Ch. 3.4 |
+| Unified `FaultKind` vocabulary | **[2] Phase 0 partial** | `crates/ssk-types/src/lib.rs` — the real 18-variant enum now exists; no crate's public API returns it yet (that migration is Phases 1-4's job, Section E.5/T) | Ch. 3.5 |
 | `CoreNode` full fields | [2] | `crates/ssk-types/src/lib.rs:52-57` — 4 of 7 fields (`id, canonical_name, policy_root, signature_ok`); missing `canonical: CanonicalForm`, `signature: CoreSignature`, `replay_root`, `audit_root`, `closure` | Ch. 4.1 |
 | `MirrorFacet` full fields | [2] | `crates/ssk-types/src/lib.rs:60-65` — 3 of 11 fields (`facet_id, core_id, sector`, plus non-spec `replay_root`); missing `phase, orientation, key_ctx, session, policy, trace, boundary, residue` | Ch. 4.1 |
 | Real `MirrorOrbit::derive/recover` | [3] | `crates/ssk-core/src/lib.rs:13-25` — `format!("facet:{}:{sector:?}", ...)` and a `starts_with("replay:")` string check; not content-addressed, no `HashProvider` used | Ch. 4.1 |

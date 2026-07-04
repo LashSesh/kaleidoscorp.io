@@ -146,25 +146,25 @@ pub fn make_entry(
         gate_report: gate_report.id.clone(),
         replay_witness,
         prev_hash,
-        entry_hash: Digest::new("pending"),
+        entry_hash: Digest::PENDING,
     };
     entry.entry_hash = digest_of(&entry, HashAlg::Blake3)?;
     Ok(entry)
 }
 
 fn verify_chain(entries: &[TensorEntry]) -> Result<(), TensorError> {
-    let mut prev = Digest::new("genesis");
+    let mut prev = Digest::GENESIS;
     for e in entries {
         if e.prev_hash != prev {
             return Err(TensorError::VerificationFailed);
         }
         let mut expected = e.clone();
-        expected.entry_hash = Digest::new("pending");
+        expected.entry_hash = Digest::PENDING;
         expected.entry_hash = digest_of(&expected, HashAlg::Blake3)?;
         if expected.entry_hash != e.entry_hash {
             return Err(TensorError::VerificationFailed);
         }
-        prev = e.entry_hash.clone();
+        prev = e.entry_hash;
     }
     Ok(())
 }
@@ -188,7 +188,7 @@ mod tests {
             StitchId::new("s1"),
             &report,
             true,
-            Digest::new("genesis"),
+            Digest::GENESIS,
         )
         .expect("entry creation should succeed");
         backend.append(e1).expect("append should work");

@@ -5,7 +5,11 @@ extern crate alloc;
 
 use alloc::format;
 use serde::{Deserialize, Serialize};
-use ssk_types::{CoreNode, Id, MirrorFacet, ReplayRoot, Sector};
+use ssk_types::{
+    CoreNode, Id, MirrorFacet, ObjectKind, ReplayRoot, ResidueKind, ResiduePolicy, Sector,
+};
+
+pub mod connection;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Orbit;
@@ -25,11 +29,36 @@ impl Orbit {
     }
 }
 
-pub trait SealedCoreObject: private::Sealed {}
-impl SealedCoreObject for CoreNode {}
-impl SealedCoreObject for MirrorFacet {}
+/// Only foundation types implement `CoreObject`; downstream crates cannot,
+/// since `sealed::Sealed` is not exported (Master Spec Ω+1 ch. 3.2).
+pub trait CoreObject: sealed::Sealed {
+    fn object_kind(&self) -> ObjectKind;
+    fn residue_policy(&self) -> ResiduePolicy;
+}
 
-mod private {
+impl CoreObject for CoreNode {
+    fn object_kind(&self) -> ObjectKind {
+        ObjectKind::Core
+    }
+
+    fn residue_policy(&self) -> ResiduePolicy {
+        // Matches the gate table's "residue on fail" column for CoreGate (ch. 11.2).
+        ResiduePolicy(ResidueKind::Identity)
+    }
+}
+
+impl CoreObject for MirrorFacet {
+    fn object_kind(&self) -> ObjectKind {
+        ObjectKind::MirrorFacet
+    }
+
+    fn residue_policy(&self) -> ResiduePolicy {
+        // Matches the gate table's "residue on fail" column for MirrorGate (ch. 11.2).
+        ResiduePolicy(ResidueKind::Identity)
+    }
+}
+
+mod sealed {
     pub trait Sealed {}
     impl Sealed for ssk_types::CoreNode {}
     impl Sealed for ssk_types::MirrorFacet {}
@@ -57,5 +86,20 @@ mod tests {
             let f = Orbit::derive(&c, Sector::Identity);
             prop_assert!(Orbit::recover(&f, &c));
         }
+    }
+
+    #[test]
+    fn core_node_object_kind_and_residue_policy() {
+        let c = mk_core(1);
+        assert_eq!(c.object_kind(), ObjectKind::Core);
+        assert_eq!(c.residue_policy(), ResiduePolicy(ResidueKind::Identity));
+    }
+
+    #[test]
+    fn mirror_facet_object_kind_and_residue_policy() {
+        let c = mk_core(1);
+        let f = Orbit::derive(&c, Sector::Identity);
+        assert_eq!(f.object_kind(), ObjectKind::MirrorFacet);
+        assert_eq!(f.residue_policy(), ResiduePolicy(ResidueKind::Identity));
     }
 }
