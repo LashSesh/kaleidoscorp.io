@@ -26,9 +26,25 @@ impl core::fmt::Debug for SecretBytes {
     }
 }
 
-pub trait HashProvider {
+pub trait HashProvider: Send + Sync {
     fn algorithm(&self) -> HashAlg;
     fn digest(&self, input: &[u8]) -> Vec<u8>;
+}
+
+/// The first real `HashProvider` implementation — unconditional (not behind
+/// the `crypto` feature), since BLAKE3 is already an unconditional workspace
+/// dependency used throughout `ssk-types::digest_of`.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Blake3HashProvider;
+
+impl HashProvider for Blake3HashProvider {
+    fn algorithm(&self) -> HashAlg {
+        HashAlg::Blake3
+    }
+
+    fn digest(&self, input: &[u8]) -> Vec<u8> {
+        blake3::hash(input).as_bytes().to_vec()
+    }
 }
 
 pub trait SignatureProvider {

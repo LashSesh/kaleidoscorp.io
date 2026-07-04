@@ -119,12 +119,15 @@ pub fn fault_residue(fault: FaultKind) -> BoundaryResidue {
         FaultKind::AttestationFailure => (ResidueKind::Capability, GateId::Capability),
         FaultKind::LocatorUntrust => (ResidueKind::Locator, GateId::Locator),
     };
-    BoundaryResidue {
-        id: ResidueId::new(format!("fault-{fault:?}")),
+    BoundaryResidue::new(
+        ResidueId::new(format!("fault-{fault:?}")),
         kind,
-        source_gate: gate,
-        detail: format!("chaos-injected fault: {fault:?}"),
-    }
+        gate,
+        format!("chaos-injected fault: {fault:?}"),
+        ssk_types::Severity::High,
+        ssk_types::TraceId::new(format!("fault-trace-{fault:?}")),
+        true,
+    )
 }
 
 /// Run a single drill: inject the fault, evaluate detection, then run a clean
@@ -225,12 +228,15 @@ mod tests {
             || intent.ttl_epoch == 0
             || replay_drift
         {
-            let residue = BoundaryResidue {
-                id: ResidueId::new("stub-fault"),
-                kind: ResidueKind::Identity,
-                source_gate: GateId::Core,
-                detail: "fault detected by stub".into(),
-            };
+            let residue = BoundaryResidue::new(
+                ResidueId::new("stub-fault"),
+                ResidueKind::Identity,
+                GateId::Core,
+                "fault detected by stub",
+                ssk_types::Severity::High,
+                ssk_types::TraceId::new("stub-fault-trace"),
+                true,
+            );
             (GateOutcomeKind::Reject, vec![residue])
         } else {
             (GateOutcomeKind::Pass, vec![])

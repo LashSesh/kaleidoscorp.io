@@ -1285,12 +1285,15 @@ fn chaos_command(command: &ChaosCommand, json: bool) -> Result<(), AppError> {
                         || intent.capability.is_none()
                         || intent.ttl_epoch == 0
                     {
-                        let residue = ssk_types::BoundaryResidue {
-                            id: ssk_types::ResidueId::new("chaos-fault"),
-                            kind: ssk_types::ResidueKind::Identity,
-                            source_gate: ssk_types::GateId::Core,
-                            detail: "chaos-injected fault detected".into(),
-                        };
+                        let residue = ssk_types::BoundaryResidue::new(
+                            ssk_types::ResidueId::new("chaos-fault"),
+                            ssk_types::ResidueKind::Identity,
+                            ssk_types::GateId::Core,
+                            "chaos-injected fault detected",
+                            ssk_types::Severity::High,
+                            ssk_types::TraceId::new("chaos-fault-trace"),
+                            true,
+                        );
                         (GateOutcomeKind::Reject, vec![residue])
                     } else {
                         (GateOutcomeKind::Pass, vec![])

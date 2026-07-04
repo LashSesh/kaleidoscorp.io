@@ -138,10 +138,10 @@ earlier pass without recheck).
 | `SchedulerMode`/`SchedulerSeed`/`visible()` | **[1] Phase 1 done** | `crates/ssk-scheduler/src/lib.rs` — renamed `HypertoroidalScheduler`; `Seeded` mode genuinely jitters phase advancement via a `rand_pcg`-seeded PRNG keyed by `(seed, tick count)`; `visible()` implements the literal toroidal-distance formula, tested including wraparound | Ch. 7.2 |
 | Projective Connection Hypercube | [4] | not present anywhere | Ch. 8 |
 | Gabriel Constraint Cells | [4] | not present anywhere | Ch. 10 |
-| `BcikStitch` payload | [4] | `crates/ssk-bcik/src/lib.rs:6-9` — `CrossOutcome::Closed` is a unit-like variant, no payload | Ch. 9.1 |
-| Real BCIK crossing condition | [3] | `crates/ssk-bcik/src/lib.rs:12-14` — `candidate.seam_ok && candidate.boundary_complete`, both hardcoded `true` at `crates/ssk-stitch/src/lib.rs:17-19` | Ch. 9.1 |
-| Full `BoundaryResidue` (severity/origin/open_obligation) | [2] | `crates/ssk-types/src/lib.rs:174-180` — only `id, kind, source_gate, detail` | Ch. 9.2 |
-| `ResidueRegister` | [4] | not present; residues are constructed ad hoc and collected into plain `Vec`s | Ch. 9.2 |
+| `BcikStitch` payload | **[1] Phase 2 done** | `crates/ssk-types/src/lib.rs` — real struct with all ch. 9.1 fields; `CrossOutcome::Closed(BcikStitch)` carries it | Ch. 9.1 |
+| Real BCIK crossing kernel | **[2] Phase 2 partial** | `crates/ssk-bcik/src/lib.rs` — real `Bcik<'p>` struct (`HashProvider`-backed seam witness, `ResidueRegister`), tested (closed-stitch fields populated, residue recorded on open crossing); closure condition is still `candidate.seam_ok && candidate.boundary_complete` — real per-fiber invariant checking is Phase 3's `FiberGate` job | Ch. 9.1 |
+| Full `BoundaryResidue` (severity/origin/open_obligation) | **[1] Phase 2 done** | `crates/ssk-types/src/lib.rs` — all ch. 9.2 fields present via `BoundaryResidue::new(...)`, wired at every construction site | Ch. 9.2 |
+| `ResidueRegister` | **[1] Phase 2 done** | `crates/ssk-types/src/lib.rs` — real `emit()`/`open_obligations()`/`entries()`; `Bcik` owns one and emits into it on every open crossing | Ch. 9.2 |
 | Twelve real per-gate evaluators | [2] | `crates/ssk-gates/src/lib.rs:59-119` — single `BasicGate` dispatching all 12 `GateId` variants in one `match`; 11 of 12 checks are single-boolean-flag reads; only `PrivacyGate` (line 94-102) computes a derived value | Ch. 11.2 |
 | `GateVector::evaluate` — all-gates-evaluated | [3] | `crates/ssk-gates/src/lib.rs:148,153` — explicit `break` on Quarantine/Reject; PDF's own pseudocode (Ch. 11.2) has **no break** | Ch. 11.2 |
 | `GateProfile` richer fields | [2] | `crates/ssk-config/src/lib.rs:30-46` — only `order`, `fail_closed`; missing `thresholds, required_evidence, failure_policy, hold_policy, pass_policy` | Ch. 11.3 |

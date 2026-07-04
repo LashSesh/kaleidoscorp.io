@@ -488,6 +488,39 @@ pub struct BoundaryRecord {
     pub detail: String,
 }
 
+/// A boundary-closed identity/locator/fiber binding (Master Spec Ω+1
+/// ch. 9.1, verbatim field list) — the real payload `CrossOutcome::Closed`
+/// now carries, replacing the old unit-like `Closed` variant.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BcikStitch {
+    pub id: StitchId,
+    pub facet: FacetId,
+    pub locator: LocatorId,
+    pub fiber: FiberType,
+    pub phase: PhaseVector,
+    pub capability: Option<CapabilityId>,
+    pub seam: SeamWitness,
+    pub boundary: BoundaryRecord,
+    pub residues: Vec<ResidueId>,
+    pub gate_report: Option<GateReportId>,
+    pub trace: TraceId,
+    pub replay: ReplayRef,
+}
+
+/// Either a closed stitch or a boundary residue — never a silent success and
+/// never a silent drop (ch. 9.1's "no silent crossing" invariant). Has no
+/// unit success variant: the caller is forced to handle either outcome.
+///
+/// `Closed(BcikStitch)` is kept unboxed to match the PDF's literal signature
+/// exactly rather than `Closed(Box<BcikStitch>)`; the resulting enum-size
+/// lint is accepted deliberately.
+#[allow(clippy::large_enum_variant)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CrossOutcome {
+    Closed(BcikStitch),
+    Residue(BoundaryResidue),
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConnectionIntent {
     pub run: RunId,
@@ -565,12 +598,73 @@ pub enum ResidueKind {
     Timing,
 }
 
+/// The visible currency of "no silent loss" (Master Spec Ω+1 ch. 9.2,
+/// verbatim field list — plus Phase 0's `Severity`, now wired in).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BoundaryResidue {
     pub id: ResidueId,
     pub kind: ResidueKind,
     pub source_gate: GateId,
     pub detail: String,
+    pub severity: Severity,
+    pub origin: TraceId,
+    /// Must policy quarantine/hold until resolved? (ch. 9.2, verbatim.)
+    pub open_obligation: bool,
+}
+
+impl BoundaryResidue {
+    #[must_use]
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        id: ResidueId,
+        kind: ResidueKind,
+        source_gate: GateId,
+        detail: impl Into<String>,
+        severity: Severity,
+        origin: TraceId,
+        open_obligation: bool,
+    ) -> Self {
+        Self {
+            id,
+            kind,
+            source_gate,
+            detail: detail.into(),
+            severity,
+            origin,
+            open_obligation,
+        }
+    }
+}
+
+/// Append-only register of residues emitted during one run (ch. 9.2's
+/// `R_res`). Additive over the plain `Vec<BoundaryResidue>` collections
+/// scattered through earlier phases' code — new call sites should prefer
+/// this over constructing a bare `Vec` directly.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ResidueRegister {
+    entries: Vec<BoundaryResidue>,
+}
+
+impl ResidueRegister {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn emit(&mut self, r: BoundaryResidue) -> ResidueId {
+        let id = r.id.clone();
+        self.entries.push(r);
+        id
+    }
+
+    pub fn open_obligations(&self) -> impl Iterator<Item = &BoundaryResidue> {
+        self.entries.iter().filter(|r| r.open_obligation)
+    }
+
+    #[must_use]
+    pub fn entries(&self) -> &[BoundaryResidue] {
+        &self.entries
+    }
 }
 
 /// The class of foundation object a `CoreObject` impl identifies as (Master

@@ -1,9 +1,10 @@
 #![forbid(unsafe_code)]
 
-use ssk_bcik::CrossOutcome;
+use ssk_bcik::Bcik;
+use ssk_crypto::Blake3HashProvider;
 use ssk_types::{
-    BoundaryResidue, GateId, GateOutcomeKind, GateReport, GateReportId, GateVerdict, GateWitness,
-    Id, ResidueId, ResidueKind, StitchCandidate,
+    BoundaryResidue, CrossOutcome, GateId, GateOutcomeKind, GateReport, GateReportId, GateVerdict,
+    GateWitness, ResidueId, ResidueKind, Severity, StitchCandidate,
 };
 
 /// Risk score above which the Fiber gate rejects a locator.
@@ -38,13 +39,16 @@ fn pass(id: GateId) -> GateVerdict {
     })
 }
 
-fn reject(id: GateId, kind: ResidueKind, detail: &str) -> GateVerdict {
-    GateVerdict::Reject(BoundaryResidue {
-        id: ResidueId(Id::new(format!("res-{id:?}"))),
+fn reject(id: GateId, kind: ResidueKind, detail: &str, sc: &StitchCandidate) -> GateVerdict {
+    GateVerdict::Reject(BoundaryResidue::new(
+        ResidueId::new(format!("res-{id:?}")),
         kind,
-        source_gate: id,
-        detail: detail.to_owned(),
-    })
+        id,
+        detail,
+        Severity::High,
+        sc.facet.trace.clone(),
+        true,
+    ))
 }
 
 impl Gate for BasicGate {
@@ -59,19 +63,27 @@ impl Gate for BasicGate {
     fn evaluate(&self, sc: &StitchCandidate) -> GateVerdict {
         match self.id {
             GateId::Core if !sc.core.signature.is_present() => {
-                reject(self.id, ResidueKind::Identity, "core signature invalid")
+                reject(self.id, ResidueKind::Identity, "core signature invalid", sc)
             }
             GateId::Mirror if sc.facet.core != sc.core.id => {
-                reject(self.id, ResidueKind::Identity, "facet not recoverable")
+                reject(self.id, ResidueKind::Identity, "facet not recoverable", sc)
             }
-            GateId::Locator if !sc.locator.trusted || sc.locator.risk_score > 70 => {
-                reject(self.id, ResidueKind::Locator, "locator risk bound exceeded")
-            }
+            GateId::Locator if !sc.locator.trusted || sc.locator.risk_score > 70 => reject(
+                self.id,
+                ResidueKind::Locator,
+                "locator risk bound exceeded",
+                sc,
+            ),
             GateId::Bcik => {
-                if matches!(ssk_bcik::cross(sc), CrossOutcome::Closed) {
+                let provider = Blake3HashProvider;
+                let mut bcik = Bcik::new(&provider);
+                if matches!(
+                    bcik.cross(&sc.facet, &sc.locator, ssk_types::FiberType::Data, sc),
+                    CrossOutcome::Closed(_)
+                ) {
                     pass(self.id)
                 } else {
-                    reject(self.id, ResidueKind::Boundary, "bcik crossing open")
+                    reject(self.id, ResidueKind::Boundary, "bcik crossing open", sc)
                 }
             }
             // Defense-in-depth: Hypercube independently checks seam integrity.
@@ -80,16 +92,21 @@ impl Gate for BasicGate {
                 self.id,
                 ResidueKind::Boundary,
                 "hypercube seam integrity failed",
+                sc,
             ),
             GateId::Capability if sc.capability.is_none() => reject(
                 self.id,
                 ResidueKind::Capability,
                 "missing capability witness",
+                sc,
             ),
             // Fiber enforces a stricter risk ceiling than the Locator gate.
-            GateId::Fiber if sc.locator.risk_score > FIBER_RISK_THRESHOLD => {
-                reject(self.id, ResidueKind::Locator, "fiber risk ceiling exceeded")
-            }
+            GateId::Fiber if sc.locator.risk_score > FIBER_RISK_THRESHOLD => reject(
+                self.id,
+                ResidueKind::Locator,
+                "fiber risk ceiling exceeded",
+                sc,
+            ),
             // Privacy enforces a maximum linkability score on the locator.
             GateId::Privacy
                 if ssk_privacy::linkability_score(&sc.locator) > PRIVACY_LINKABILITY_THRESHOLD =>
@@ -98,21 +115,23 @@ impl Gate for BasicGate {
                     self.id,
                     ResidueKind::Correlation,
                     "privacy linkability threshold exceeded",
+                    sc,
                 )
             }
             GateId::Boundary if !sc.boundary_complete => reject(
                 self.id,
                 ResidueKind::Boundary,
                 "incomplete residue register",
+                sc,
             ),
             GateId::Focus if !sc.focus_ready => {
-                reject(self.id, ResidueKind::Focus, "focus recovery failed")
+                reject(self.id, ResidueKind::Focus, "focus recovery failed", sc)
             }
             GateId::Replay if !sc.replay_ready => {
-                reject(self.id, ResidueKind::Replay, "replay witness missing")
+                reject(self.id, ResidueKind::Replay, "replay witness missing", sc)
             }
             GateId::Dissolution if sc.ttl_epoch == 0 => {
-                reject(self.id, ResidueKind::Timing, "ttl epoch missing")
+                reject(self.id, ResidueKind::Timing, "ttl epoch missing", sc)
             }
             _ => pass(self.id),
         }
