@@ -194,7 +194,7 @@ fn full_pipeline_redirect_via_socks5() {
 fn full_pipeline_attestation_required_and_verified() {
     let engine = build_engine();
     let orc = build_orchestrator();
-    let binder = AttestationBinder::test_key();
+    let binder = AttestationBinder::new([0u8; 32]);
     let mut session = SessionLedger::new();
     let mut audit = AuditLedger::new();
 

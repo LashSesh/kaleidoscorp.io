@@ -100,7 +100,7 @@ impl Default for InteropConfig {
         Self {
             min_protocol: "1.0.0".into(),
             capabilities: vec!["gate-vector-12".into(), "replay-v1".into()],
-            max_clock_skew_secs: 86_400,
+            max_clock_skew_secs: 300,
         }
     }
 }

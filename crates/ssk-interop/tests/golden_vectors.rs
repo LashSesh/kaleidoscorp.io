@@ -78,7 +78,7 @@ fn conformance_suite_reference_run() {
 
 #[test]
 fn blake3_verifier_sign_and_verify_roundtrip() {
-    let v = Blake3KeyedVerifier::test_key();
+    let v = Blake3KeyedVerifier::new([0u8; 32]);
     let data = b"capability-attestation-test";
     let sig = v.sign(data);
     assert!(v.verify_token(data, &sig));

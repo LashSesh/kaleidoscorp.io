@@ -81,7 +81,7 @@ pub struct TenantContext {
 pub struct ControlPlane {
     profiles: Vec<OperatorProfile>,
     tenants: Vec<TenantContext>,
-    pub rollout_mode: RolloutMode,
+    rollout_mode: RolloutMode,
 }
 
 impl ControlPlane {
@@ -92,6 +92,18 @@ impl ControlPlane {
             tenants: Vec::new(),
             rollout_mode,
         }
+    }
+
+    /// Returns the current rollout mode.
+    #[must_use]
+    pub fn rollout_mode(&self) -> RolloutMode {
+        self.rollout_mode
+    }
+
+    /// Update the rollout mode.  Use with care: switching to `Emergency`
+    /// must be time-limited and audited.
+    pub fn set_rollout_mode(&mut self, mode: RolloutMode) {
+        self.rollout_mode = mode;
     }
 
     /// Register an operator profile.
@@ -211,12 +223,12 @@ mod tests {
     #[test]
     fn shadow_mode_is_not_enforcing() {
         let plane = ControlPlane::new(RolloutMode::Shadow);
-        assert!(!plane.rollout_mode.is_enforcing());
+        assert!(!plane.rollout_mode().is_enforcing());
     }
 
     #[test]
     fn strict_mode_is_enforcing() {
         let plane = ControlPlane::new(RolloutMode::Strict);
-        assert!(plane.rollout_mode.is_enforcing());
+        assert!(plane.rollout_mode().is_enforcing());
     }
 }

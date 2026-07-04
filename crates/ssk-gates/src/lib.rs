@@ -6,6 +6,13 @@ use ssk_types::{
     Id, ResidueId, ResidueKind, StitchCandidate,
 };
 
+/// Risk score above which the Fiber gate rejects a locator.
+/// Stricter than the Locator gate's threshold of 70.
+const FIBER_RISK_THRESHOLD: u8 = 50;
+
+/// Linkability score above which the Privacy gate rejects a locator.
+const PRIVACY_LINKABILITY_THRESHOLD: u8 = 50;
+
 pub trait Gate: Send + Sync {
     fn id(&self) -> GateId;
     fn required(&self) -> bool;
@@ -67,11 +74,27 @@ impl Gate for BasicGate {
                     reject(self.id, ResidueKind::Boundary, "bcik crossing open")
                 }
             }
+            // Defense-in-depth: Hypercube independently checks seam integrity.
+            // BCIK also checks seam_ok; this gate catches any bypass of BCIK.
+            GateId::Hypercube if !sc.seam_ok => {
+                reject(self.id, ResidueKind::Boundary, "hypercube seam integrity failed")
+            }
             GateId::Capability if !sc.capability_witness => reject(
                 self.id,
                 ResidueKind::Capability,
                 "missing capability witness",
             ),
+            // Fiber enforces a stricter risk ceiling than the Locator gate.
+            GateId::Fiber if sc.locator.risk_score > FIBER_RISK_THRESHOLD => {
+                reject(self.id, ResidueKind::Locator, "fiber risk ceiling exceeded")
+            }
+            // Privacy enforces a maximum linkability score on the locator.
+            GateId::Privacy
+                if ssk_privacy::linkability_score(&sc.locator)
+                    > PRIVACY_LINKABILITY_THRESHOLD =>
+            {
+                reject(self.id, ResidueKind::Correlation, "privacy linkability threshold exceeded")
+            }
             GateId::Boundary if !sc.boundary_complete => reject(
                 self.id,
                 ResidueKind::Boundary,
@@ -187,6 +210,71 @@ mod tests {
     fn gate_vector_fail_closed() {
         let mut sc = candidate();
         sc.capability_witness = false;
+        let report = GateVector::with_all_default().evaluate(&sc);
+        assert_eq!(report.outcome, GateOutcomeKind::Reject);
+    }
+
+    #[test]
+    fn hypercube_gate_rejects_broken_seam() {
+        let gate = BasicGate::new(GateId::Hypercube);
+        let mut sc = candidate();
+        sc.seam_ok = false;
+        assert!(
+            matches!(gate.evaluate(&sc), GateVerdict::Reject(_)),
+            "Hypercube must reject when seam_ok is false"
+        );
+    }
+
+    #[test]
+    fn hypercube_gate_passes_intact_seam() {
+        let gate = BasicGate::new(GateId::Hypercube);
+        let sc = candidate();
+        assert!(matches!(gate.evaluate(&sc), GateVerdict::Pass(_)));
+    }
+
+    #[test]
+    fn fiber_gate_rejects_high_risk_locator() {
+        let gate = BasicGate::new(GateId::Fiber);
+        let mut sc = candidate();
+        sc.locator.risk_score = FIBER_RISK_THRESHOLD + 1;
+        assert!(
+            matches!(gate.evaluate(&sc), GateVerdict::Reject(_)),
+            "Fiber must reject risk_score > FIBER_RISK_THRESHOLD"
+        );
+    }
+
+    #[test]
+    fn fiber_gate_passes_acceptable_risk() {
+        let gate = BasicGate::new(GateId::Fiber);
+        let mut sc = candidate();
+        sc.locator.risk_score = FIBER_RISK_THRESHOLD;
+        assert!(matches!(gate.evaluate(&sc), GateVerdict::Pass(_)));
+    }
+
+    #[test]
+    fn privacy_gate_rejects_high_linkability_untrusted() {
+        let gate = BasicGate::new(GateId::Privacy);
+        let mut sc = candidate();
+        sc.locator.trusted = false;
+        sc.locator.risk_score = PRIVACY_LINKABILITY_THRESHOLD + 1;
+        // linkability_score = risk_score (untrusted) = 51 > 50
+        assert!(
+            matches!(gate.evaluate(&sc), GateVerdict::Reject(_)),
+            "Privacy must reject when linkability score exceeds threshold"
+        );
+    }
+
+    #[test]
+    fn privacy_gate_passes_low_linkability() {
+        let gate = BasicGate::new(GateId::Privacy);
+        let sc = candidate(); // trusted, risk_score=1 → linkability=0
+        assert!(matches!(gate.evaluate(&sc), GateVerdict::Pass(_)));
+    }
+
+    #[test]
+    fn gate_vector_rejects_fiber_high_risk() {
+        let mut sc = candidate();
+        sc.locator.risk_score = 60; // passes Locator (≤70) but fails Fiber (>50)
         let report = GateVector::with_all_default().evaluate(&sc);
         assert_eq!(report.outcome, GateOutcomeKind::Reject);
     }

@@ -167,6 +167,8 @@ where
         FaultKind::CapabilityWithdrawal,
         FaultKind::TtlExpiry,
         FaultKind::AttestationFailure,
+        FaultKind::ReplayDrift,
+        FaultKind::LocatorUntrust,
     ];
     let drills: Vec<DrillReport> = faults
         .into_iter()
@@ -204,7 +206,13 @@ mod tests {
 
     fn stub_run(intent: ConnectionIntent) -> (GateOutcomeKind, Vec<BoundaryResidue>) {
         // Simple heuristic matching the real gate logic.
-        if !intent.core.signature_ok || !intent.capability_witness || intent.ttl_epoch == 0 {
+        // ReplayDrift is detected by the "-drifted" marker injected by inject_fault.
+        let replay_drift = intent.run.0 .0.ends_with("-drifted");
+        if !intent.core.signature_ok
+            || !intent.capability_witness
+            || intent.ttl_epoch == 0
+            || replay_drift
+        {
             let residue = BoundaryResidue {
                 id: ResidueId::new("stub-fault"),
                 kind: ResidueKind::Identity,
@@ -242,6 +250,22 @@ mod tests {
     }
 
     #[test]
+    fn replay_drift_detected() {
+        let drill = run_drill(sample_clean_intent(), FaultKind::ReplayDrift, &stub_run);
+        assert!(drill.fault_detected, "replay drift must be detected");
+        assert!(drill.recovery_succeeded, "clean run must recover after drift");
+        assert!(drill.passed());
+    }
+
+    #[test]
+    fn locator_untrust_detected() {
+        let drill =
+            run_drill(sample_clean_intent(), FaultKind::LocatorUntrust, &stub_run);
+        assert!(drill.fault_detected, "locator untrust must be detected via proxy");
+        assert!(drill.passed());
+    }
+
+    #[test]
     fn full_playbook_all_pass() {
         let report = run_playbook(sample_clean_intent(), &stub_run);
         for drill in &report.drills {
@@ -254,5 +278,6 @@ mod tests {
             );
         }
         assert!(report.all_passed());
+        assert_eq!(report.total, 6, "playbook must cover all 6 fault kinds");
     }
 }

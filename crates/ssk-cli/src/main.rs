@@ -995,10 +995,12 @@ fn interop_command(command: &InteropCommand, json: bool) -> Result<(), AppError>
             profile,
             require_attestation,
         } => {
-            let mut policy = CompatibilityPolicy::default();
-            policy.require_attestation = *require_attestation;
+            let policy = CompatibilityPolicy {
+                require_attestation: *require_attestation,
+                ..CompatibilityPolicy::default()
+            };
 
-            let verifier = Blake3KeyedVerifier::test_key();
+            let verifier = Blake3KeyedVerifier::new([0u8; 32]);
             let verifier_ref: Option<&dyn ssk_interop::AttestationVerifier> =
                 if *require_attestation {
                     Some(&verifier)
@@ -1344,7 +1346,7 @@ fn net_admin_command(command: &NetAdminCommand, json: bool) -> Result<(), AppErr
             let mut session = SessionLedger::new();
             let mut audit = AuditLedger::new();
 
-            let flows = vec![
+            let flows = [
                 FlowRecord::new(
                     "audit-demo-f1",
                     1,

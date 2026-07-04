@@ -63,12 +63,6 @@ impl AttestationBinder {
         Self { key }
     }
 
-    /// Convenience constructor using the all-zeros test key.
-    #[must_use]
-    pub const fn test_key() -> Self {
-        Self::new([0u8; 32])
-    }
-
     /// Sign a raw attestation token, returning the hex-encoded MAC.
     pub fn sign(&self, raw: &RawAttestation) -> Result<String, NetAdminError> {
         let body = TokenBody {
@@ -146,7 +140,7 @@ mod tests {
 
     #[test]
     fn valid_attestation_produces_binding() {
-        let binder = AttestationBinder::test_key();
+        let binder = AttestationBinder::new([0u8; 32]);
         let flow = sample_flow();
         let raw = sample_raw(&binder);
         let binding = binder.bind(&flow, &raw, 10).expect("bind must succeed");
@@ -157,7 +151,7 @@ mod tests {
 
     #[test]
     fn tampered_signature_rejected() {
-        let binder = AttestationBinder::test_key();
+        let binder = AttestationBinder::new([0u8; 32]);
         let flow = sample_flow();
         let mut raw = sample_raw(&binder);
         raw.signature_hex = "deadbeef00000000".into();

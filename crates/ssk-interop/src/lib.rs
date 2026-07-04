@@ -56,12 +56,6 @@ impl Blake3KeyedVerifier {
         Self { key }
     }
 
-    /// Well-known test key (all-zeros; replace in production).
-    #[must_use]
-    pub const fn test_key() -> Self {
-        Self::new([0u8; 32])
-    }
-
     /// Sign a token with this key (for test/fixture generation).
     pub fn sign(&self, token_bytes: &[u8]) -> String {
         let hash = blake3::keyed_hash(&self.key, token_bytes);
@@ -483,7 +477,7 @@ impl Default for CompatibilityPolicy {
             current: CURRENT_PROTOCOL_VERSION,
             min_supported: MIN_COMPATIBLE_VERSION,
             required_capabilities: vec!["gate-vector-12".into(), "replay-v1".into()],
-            max_clock_skew_secs: 86_400,
+            max_clock_skew_secs: 300,
             strict_mode_only: true,
             local_capabilities: Capabilities {
                 features: vec![
@@ -625,7 +619,7 @@ mod tests {
 
     #[test]
     fn attestation_verified_on_valid_token() {
-        let verifier = Blake3KeyedVerifier::test_key();
+        let verifier = Blake3KeyedVerifier::new([0u8; 32]);
         let token = AttestationToken {
             subject_id: "peer-alpha".into(),
             capabilities: vec!["gate-vector-12".into(), "replay-v1".into()],
@@ -656,7 +650,7 @@ mod tests {
 
     #[test]
     fn attestation_invalid_signature_rejected() {
-        let verifier = Blake3KeyedVerifier::test_key();
+        let verifier = Blake3KeyedVerifier::new([0u8; 32]);
         let token = AttestationToken {
             subject_id: "peer-beta".into(),
             capabilities: vec!["gate-vector-12".into(), "replay-v1".into()],

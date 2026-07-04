@@ -126,7 +126,7 @@ mod tests {
     use crate::policy::PolicyAction;
     use crate::route::RouteKind;
 
-    fn sample_decision(id: &str, flow_id: &str) -> (PolicyDecision, RouteCandidate) {
+    fn sample_decision(_id: &str, flow_id: &str) -> (PolicyDecision, RouteCandidate) {
         (
             PolicyDecision {
                 flow_id: flow_id.into(),
