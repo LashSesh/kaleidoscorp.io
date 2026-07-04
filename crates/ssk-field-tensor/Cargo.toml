@@ -1,0 +1,24 @@
+[package]
+name = "ssk-field-tensor"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# FCHL-MPK Band B: the FieldTensorSkin (FTCSA). The observation surface
+# F = T_surface + T_res + C_coupling + δF that couples captured traffic spectra
+# (ssk-capture + ssk-signature) to discrete MPK windows (ssk-mpk) and carries the
+# δF signals (drift, anomaly, linkability impulse, route change, service fault,
+# OS event). Honestly typed: an ObjCard declares it a bookkeeping/observation
+# surface, never a literal physical field. See FCHL_MPK_INTEGRATION_STRATEGY.md.
+
+[dependencies]
+ssk-types = { path = "../ssk-types", version = "0.1.0" }
+ssk-signature = { path = "../ssk-signature", version = "0.1.0" }
+ssk-capture = { path = "../ssk-capture", version = "0.1.0" }
+ssk-mpk = { path = "../ssk-mpk", version = "0.1.0" }
+serde = { workspace = true }
+
+[dev-dependencies]
+
+[lints]
+workspace = true
