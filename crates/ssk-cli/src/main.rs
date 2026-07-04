@@ -52,6 +52,17 @@ enum Command {
         #[arg(long, default_value_t = 0)]
         epoch: u64,
     },
+    /// Drive the full decision-core pipeline (BCIK crossing → tensor
+    /// materialization → fiber execution → concave focus) to a real
+    /// 3-variant `RunOutcome`.
+    Connect {
+        #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+        valid_fixture: bool,
+        #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
+        seeded: bool,
+        #[arg(long, default_value_t = 0)]
+        epoch: u64,
+    },
     VerifyLedger {
         #[arg(long)]
         path: String,
@@ -319,6 +330,11 @@ fn run(cli: &Cli) -> Result<(), AppError> {
             seeded,
             epoch,
         } => replay_verify_command(*valid_fixture, *seeded, *epoch, cli),
+        Command::Connect {
+            valid_fixture,
+            seeded,
+            epoch,
+        } => connect_command(*valid_fixture, *seeded, *epoch, cli),
         Command::VerifyLedger { path } => verify_ledger_command(path, cli.json),
         Command::Doctor { ledger_path } => doctor_command(ledger_path.as_deref(), cli),
         Command::Explain { target } => explain_command(target, cli.json),
@@ -486,6 +502,79 @@ fn run_once_command(
         );
     } else {
         print_human_run_summary(&event, &metrics);
+    }
+
+    Ok(())
+}
+
+fn connect_command(
+    valid_fixture: bool,
+    seeded: bool,
+    epoch: u64,
+    cli: &Cli,
+) -> Result<(), AppError> {
+    let mut tensor = ssk_tensor::StitchTensor::open(Box::new(ssk_tensor::GenericMemoryBackend::<
+        ssk_types::StitchTensorEntry,
+    >::new()))
+    .map_err(|_| {
+        AppError::new(
+            ErrorClass::Runtime,
+            "TENSOR_OPEN_FAILED",
+            "could not open stitch tensor",
+            vec!["Check storage backend availability.".into()],
+        )
+    })?;
+    let determinism = DeterminismContext { seeded, epoch };
+    let outcome = ssk_runtime::run_to_outcome(
+        &sample_intent(valid_fixture),
+        &default_pool(),
+        &determinism,
+        &GateVector::with_all_default(),
+        &mut tensor,
+        &ssk_runtime::LocalFiberExecutor,
+        ssk_types::EpochId(epoch),
+    )
+    .map_err(|err| {
+        AppError::new(
+            ErrorClass::Runtime,
+            "RUNTIME_CONNECT_FAILED",
+            format!("connect pipeline failed: {err}"),
+            vec!["Run `ssk doctor` and inspect locator/policy checks.".into()],
+        )
+    })?;
+
+    let (kind, stitches, residues) = match &outcome {
+        ssk_runtime::RunOutcome::Pass { stitches, .. } => ("pass", stitches.len(), 0),
+        ssk_runtime::RunOutcome::HoldRefine { residues } => ("hold_refine", 0, residues.len()),
+        ssk_runtime::RunOutcome::DissolveRejectQuarantine { residues, .. } => {
+            ("dissolve_reject_quarantine", 0, residues.len())
+        }
+    };
+
+    if cli.json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "status": "ok",
+                "outcome_kind": kind,
+                "materialized_stitches": stitches,
+                "residues": residues,
+                "tensor_head": tensor.head().to_hex(),
+                "next_steps": [
+                    "A `pass` materialized the stitch into the tensor.",
+                    "A `dissolve_*` outcome is fail-closed: no tensor mutation, residues recorded."
+                ]
+            }))
+            .map_err(|err| AppError::new(
+                ErrorClass::Runtime,
+                "JSON_OUTPUT_FAILED",
+                err.to_string(),
+                vec![]
+            ))?
+        );
+    } else {
+        println!("connect: outcome={kind} materialized={stitches} residues={residues}");
+        println!("tensor head: {}", tensor.head().to_hex());
     }
 
     Ok(())

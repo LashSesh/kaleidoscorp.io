@@ -36,6 +36,21 @@ Reused from `docs/DESKTOP_CLIENT_ARCHITECTURE.md` for consistency:
 
 ## A. Executive Diagnosis
 
+> **STATUS (final) — SSKΩ-0 through SSKΩ-9 are all met.** The narrative below is the *original*
+> diagnosis (the codebase's starting point, ~SSKΩ-2/3); it is preserved as the historical record
+> that motivated the phased plan. Every gap it names has since been closed across Phases 0-8 plus
+> hardening iterations A-F — see the per-row **[1] done** tags in Section B's inventory, the
+> all-`✅`/`met` column in Section D's ladder, and the green Section W matrix. The system now runs
+> a genuine end-to-end pipeline (compile-time-enforced `Connection<S>` typestate → real BCIK
+> crossing → persistent `StitchTensor` materialization → fiber execution → concave focus → 3-variant
+> `RunOutcome`), reachable from the CLI (`ssk connect`), with every honesty non-claim from Section
+> U held: no fabricated network liveness, no `GlobalPassiveObserver` anonymity claim, no silent
+> loss. The handful of items left undone are recorded explicitly (not silently) at the end of each
+> section — chiefly real network egress adapters (deliberately `ssk-netcore`'s / the Desktop
+> track's job, Section X) and per-check pipeline-trace granularity (a diagnostic refinement with no
+> conformance payoff). The verification gate (`cargo test --workspace` + `cargo clippy --workspace
+> --all-targets -- -D warnings` + `cargo deny` + `cargo audit`) is green on every commit.
+
 The repository's decision-modeling core is a real, tested, deterministic MVP that implements
 the *shape* of the PDF's pipeline (scheduler tick → identity orbit → locator selection →
 BCIK crossing → twelve-gate vector → conditional tensor append → replay manifest) but
@@ -238,6 +253,8 @@ if all tests for levels 0..*k* pass"):
 | SSKΩ-9 | Production-hardened runtime profile: dissolution/TTL sweeps, ledger verification, deployment audit, documented limits. | ✅ met — `DissolutionManager::{is_expired, sweep, finalize_expired}` (real TTL sweep + typed residue finalization, hardening iter. D), the full 12-section validated config schema (Phase 8), and the existing hash-chained ledger `verify()`, all tested |
 
 **Target of this document: close SSKΩ-3 through SSKΩ-9**, in the phase order of Section V.
+**Result: achieved** — every ladder row above is now `✅ met` (Phases 0-8 + hardening iterations
+A-F), each with the file:line evidence and tests cited in Section B.
 
 ---
 
