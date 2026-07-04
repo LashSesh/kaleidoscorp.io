@@ -417,6 +417,16 @@ impl GateVector {
     }
 }
 
+/// Real `GateAuthority` for the `Connection<Placed>::gate` typestate
+/// transition (`ssk-core`'s dependency-inverted trait) — `ssk-gates` already
+/// depends on `ssk-core`, so implementing the trait here (rather than
+/// `ssk-core` naming `GateVector`) is what keeps the graph acyclic.
+impl ssk_core::connection::GateAuthority for GateVector {
+    fn evaluate(&self, sc: &StitchCandidate) -> GateReport {
+        GateVector::evaluate(self, sc)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

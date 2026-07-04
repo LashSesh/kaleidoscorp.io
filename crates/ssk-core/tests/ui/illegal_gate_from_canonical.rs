@@ -1,10 +1,14 @@
-use ssk_core::connection::{Connection, ConnectionInner, CoreCanonicalizer, GateVector, Intent, Policy};
+use ssk_core::connection::{Connection, ConnectionInner, Intent};
 
 fn main() {
-    let c = Connection::<Intent>::new(ConnectionInner::default());
-    let c = c.canonicalize(&CoreCanonicalizer).expect("canonicalize");
+    let c = Connection::<Intent>::new(make_inner());
+    let c = c.canonicalize().expect("canonicalize");
     // `Connection<Canonical>` has no `gate` method — only `Connection<Placed>`
     // does (Master Spec Ω+1 ch. 3.3's typestate guarantee: `birefract` and
     // `place` cannot be skipped). This must fail to compile.
-    let _ = c.gate(&GateVector, &Policy);
+    let _ = c.gate(&());
+}
+
+fn make_inner() -> ConnectionInner {
+    unimplemented!()
 }

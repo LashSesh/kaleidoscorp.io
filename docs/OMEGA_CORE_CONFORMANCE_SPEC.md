@@ -159,7 +159,7 @@ earlier pass without recheck).
 |------|-----|----------------------|---------|
 | Content-addressed ids / `content_id!` | **[1] Phase 0 done** | `Digest` is now `[u8; 32]`-backed with hex-string serde (`crates/ssk-types/src/lib.rs`); `content_id!` macro exists and is determinism-tested. `CoreId`/`RunId`/etc. deliberately **not yet migrated** off `id_type!`'s opaque-string form — each migrates only once its owning object carries real canonical content (Section V) | Ch. 3.1 |
 | Sealed `CoreObject` (`object_kind`/`residue_policy`) | **[1] Phase 0 done** | `crates/ssk-core/src/lib.rs` — `CoreObject` (renamed from `SealedCoreObject`, sealed via `mod sealed`) now has real `object_kind()`/`residue_policy()` impls for `CoreNode`/`MirrorFacet` | Ch. 3.2 |
-| `Connection<S>` typestate | **[2] Phase 0 skeleton** | `crates/ssk-core/src/connection.rs` — phantom-state machine is real and compile-time enforced (proven by two `trybuild` compile-fail fixtures); all five transition bodies are deliberately stubbed pending their owning phase (Section V) | Ch. 3.3 |
+| `Connection<S>` typestate | **[1] done (Phase 0 + hardening iter. C)** | `crates/ssk-core/src/connection.rs` — compile-time-enforced phantom-state machine (two `trybuild` compile-fail fixtures) with **real transition bodies**: `canonicalize`/`birefract`/`place` validate the carried `StitchCandidate`, and `gate`/`materialize` are dependency-inverted over `GateAuthority` (impl'd by `ssk-gates::GateVector`) and `MaterializationSink` (impl'd by `ssk_runtime::TensorMaterializationSink` composing real BCIK crossing + `StitchTensor`). `ssk-runtime` drives the full lifecycle to `Materialized` against the real collaborators, tested | Ch. 3.3 |
 | `SecretBytes`/zeroize | **[1] Phase 0 done** | `crates/ssk-crypto/src/lib.rs` — real zeroize-wrapped, redacted-`Debug` type; `zeroize` promoted to a direct dependency | Ch. 3.4 |
 | Unified `FaultKind` vocabulary | **[2] Phase 0 partial** | `crates/ssk-types/src/lib.rs` — the real 18-variant enum now exists; no crate's public API returns it yet (that migration is Phases 1-4's job, Section E.5/T) | Ch. 3.5 |
 | `CoreNode` full fields | **[1] Phase 1 done** | `crates/ssk-types/src/lib.rs` — all 7 fields present (`id, canonical, signature, policy_root, replay_root, audit_root, closure`) | Ch. 4.1 |
@@ -337,16 +337,35 @@ impl Connection<GatePassed> {
 > mutation. This makes fail-closed materialization a property of the API shape, not merely of
 > the runtime logic.
 
-**Current:** absent entirely.
+**Current — done (Phase 0 skeleton + hardening iteration C's real bodies).** Lives in
+`ssk-core::connection`. The compile-time guarantee shipped in Phase 0 (two `trybuild`
+compile-fail fixtures prove `Connection<Intent>` has no `materialize` and `Connection<Canonical>`
+has no `gate`). Hardening iteration C then gave every transition a **real body**:
+`ConnectionInner` now carries the assembled `StitchCandidate`; `canonicalize` rejects an unsigned
+core (`FaultKind::CoreNotCanonical`), `birefract` rejects a facet outside its core's orbit
+(`FaultKind::FacetNotRecoverable`), and `place`/`gate`/`materialize` are **dependency-inverted**
+— generic over the `PlacementAuthority` / `GateAuthority` / `MaterializationSink` traits defined
+in `ssk-core`, since `ssk-core` cannot name `ssk-gates`/`ssk-tensor` (they already depend on it).
+The real implementations live one layer up: `ssk-gates::GateVector` implements `GateAuthority`;
+`ssk_runtime::HypercubePathCheck` implements `PlacementAuthority` (the facet-level PCH pre-check);
+`ssk_runtime::TensorMaterializationSink` implements `MaterializationSink` (composing the real
+`ssk_bcik::Bcik::cross` with `ssk_tensor::StitchTensor::apply_sorted`). `ssk-runtime` drives the
+whole lifecycle to `Materialized` against these real collaborators.
 
-**Design:** land in `ssk-core::connection`, additive new type. Its transition method *bodies*
-depend on later sections (`canonicalize` needs a `CoreCanonicalizer`; `birefract` needs
-Section F.2; `place` needs Section I's `Hypercube`; `gate` needs Section K; `materialize`
-needs Section M). Phase 0 lands the skeleton with stub bodies that return
-`FaultKind::ConfigInvalid`-shaped placeholders; each later phase fills in exactly one
-transition once its dependency closes (Section V maps this precisely). A `trybuild`
-compile-fail test proves the guarantee holds at compile time, not just at runtime — this is
-the literal Phase 0 acceptance criterion (Section W).
+Two disclosed simplifications, both honest rather than fabricated: the PDF's signatures pass a
+`&CoreCanonicalizer` to `canonicalize` and a `&Policy` to `birefract` — this codebase's
+`canonicalize`/`birefract` take no collaborator because the checks they perform (core signed;
+facet-in-orbit) read only the candidate, so a parameter with nothing to read would be
+ceremony. And the candidate is assembled *before* the `Connection<Intent>` is constructed (by
+`ssk_stitch::from_intent`, exactly as the runtime pipeline does) rather than being built up
+across the transitions — the typestate models the *ordering* of validation/gate/materialize
+stages, which is its real value, not a staged constructor.
+
+Tested (all in `ssk-runtime`, driving the real collaborators, plus `ssk-core`'s own trait-level
+unit tests): `connection_typestate_drives_to_materialized_with_real_collaborators`,
+`connection_typestate_place_rejects_an_untrusted_locator`,
+`full_lifecycle_materializes_a_valid_candidate`, `an_unsigned_core_fails_canonicalization`,
+`a_facet_not_in_its_core_orbit_fails_birefraction`, `a_rejecting_gate_yields_no_gatepassed_connection`.
 
 ### E.4 Secrets and zeroization
 

@@ -356,6 +356,64 @@ pub fn select_egress(
     )
 }
 
+/// Real `PlacementAuthority` for the `Connection<Split>::place` typestate
+/// transition — the facet-level PCH pre-check, same predicate as
+/// `HypercubePathCheck`.
+impl ssk_core::connection::PlacementAuthority for HypercubePathCheck {
+    fn placement_ok(&self, sc: &StitchCandidate) -> bool {
+        ssk_gates::pch::locator_axes_consistent(&sc.locator)
+    }
+}
+
+/// Real `MaterializationSink` for the `Connection<GatePassed>::materialize`
+/// typestate transition: composes the genuine BCIK crossing
+/// (`ssk_bcik::Bcik::cross`) with `ssk_tensor::StitchTensor::apply_sorted` —
+/// exactly the chain `run_to_outcome` performs, exposed through the
+/// typestate so a caller holding a gate-passed connection materializes it
+/// (and, by the typestate, *only* then) with real persistence. Borrows the
+/// tensor for the sink's lifetime.
+pub struct TensorMaterializationSink<'t> {
+    tensor: &'t mut ssk_tensor::StitchTensor,
+    epoch: ssk_types::EpochId,
+    accepted_at: ssk_types::Tick,
+}
+
+impl<'t> TensorMaterializationSink<'t> {
+    #[must_use]
+    pub fn new(
+        tensor: &'t mut ssk_tensor::StitchTensor,
+        epoch: ssk_types::EpochId,
+        accepted_at: ssk_types::Tick,
+    ) -> Self {
+        Self {
+            tensor,
+            epoch,
+            accepted_at,
+        }
+    }
+}
+
+impl ssk_core::connection::MaterializationSink for TensorMaterializationSink<'_> {
+    fn materialize(&mut self, sc: &StitchCandidate) -> Result<Vec<StitchId>, ssk_types::FaultKind> {
+        let provider = ssk_crypto::Blake3HashProvider;
+        let mut bcik = ssk_bcik::Bcik::new(&provider);
+        let stitch = match bcik.cross(&sc.facet, &sc.locator, ssk_types::FiberType::Data, sc) {
+            ssk_types::CrossOutcome::Closed(stitch) => stitch,
+            ssk_types::CrossOutcome::Residue(_) => {
+                return Err(ssk_types::FaultKind::BcikSeamMissing);
+            }
+        };
+        let accepted = ssk_types::Accepted {
+            stitch,
+            gate_report: ssk_types::GateReportId::new(format!("gr:{}", sc.id.0 .0)),
+            accepted_at: self.accepted_at,
+            epoch: self.epoch,
+            ttl: ssk_types::Ttl(sc.ttl_epoch),
+        };
+        self.tensor.apply_sorted(vec![accepted])
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct DeterminismContext {
     pub seeded: bool,
@@ -804,6 +862,51 @@ mod tests {
         assert!(matches!(
             result,
             Err(ssk_types::FaultKind::LocatorUnavailable)
+        ));
+    }
+
+    #[test]
+    fn connection_typestate_drives_to_materialized_with_real_collaborators() {
+        use ssk_core::connection::{Connection, ConnectionInner, GateOutcome, Intent};
+
+        // Build a real candidate exactly as the pipeline does.
+        let facet = ssk_identity::derive_identity_facet(&sample_intent(true).core);
+        let candidate = ssk_stitch::from_intent(sample_intent(true), facet, mk_locator_facet());
+
+        let mut tensor = fresh_stitch_tensor();
+        let gate_vector = GateVector::with_all_default();
+
+        let c = Connection::<Intent>::new(ConnectionInner::new(candidate));
+        let c = c.canonicalize().expect("canonicalize");
+        let c = c.birefract().expect("birefract");
+        let c = c.place(&HypercubePathCheck).expect("place");
+        let c = match c.gate(&gate_vector) {
+            GateOutcome::Pass(c) => c,
+            _ => panic!("expected GateOutcome::Pass"),
+        };
+        let mut sink = TensorMaterializationSink::new(&mut tensor, EpochId(0), ssk_types::Tick(1));
+        let c = c.materialize(&mut sink).expect("materialize");
+
+        assert_eq!(c.inner().stitches().len(), 1);
+        assert_eq!(tensor.graph().len(), 1);
+    }
+
+    #[test]
+    fn connection_typestate_place_rejects_an_untrusted_locator() {
+        use ssk_core::connection::{Connection, ConnectionInner, Intent};
+
+        let mut loc = mk_locator_facet();
+        loc.trusted = false;
+        loc.trust = TrustClass::Untrusted;
+        let facet = ssk_identity::derive_identity_facet(&sample_intent(true).core);
+        let candidate = ssk_stitch::from_intent(sample_intent(true), facet, loc);
+
+        let c = Connection::<Intent>::new(ConnectionInner::new(candidate));
+        let c = c.canonicalize().expect("canonicalize");
+        let c = c.birefract().expect("birefract");
+        assert!(matches!(
+            c.place(&HypercubePathCheck),
+            Err(ssk_types::FaultKind::PchProjectionGap)
         ));
     }
 
