@@ -101,6 +101,11 @@ impl StitchGraph {
     }
 
     #[must_use]
+    pub fn get(&self, id: &StitchId) -> Option<&BcikStitch> {
+        self.stitches.get(id)
+    }
+
+    #[must_use]
     pub fn len(&self) -> usize {
         self.stitches.len()
     }

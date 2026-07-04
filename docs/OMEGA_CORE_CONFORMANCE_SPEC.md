@@ -156,12 +156,17 @@ Phase 8 done (Section S + dissolution sweep):** the full 12-section config schem
 `ssk-config` (all eleven PDF sections real and validated, `gates:` folded into the enriched
 `policy.gate_profile`, two-step v2/v1 migration tested), and `ssk-tensor` gained a real
 `DissolutionManager` computing genuine TTL/epoch expiry instead of a bare presence check. This
-closes the great majority of this document's own scope. What remains, all explicitly disclosed
-in place rather than silently dropped: the rest of SSKΩ-8's simulation/testbed half; `RunOutcome`
-wiring (Section R, blocked on a `FiberExecution`/`ResponseCapture` stage that doesn't exist);
-`select_path`'s `Hypercube` bridging (Section G.2, blocked on the same crate-cycle constraint
-discovered repeatedly across Phases 3-6); `Connection<S>`'s `place`/`gate` real bodies (Section
-E.3, same constraint); and residue finalization on TTL sweep (Section M).
+closes the great majority of this document's own scope. **Update — hardening iterations A-F:
+everything above that "remains" is now closed.** `RunOutcome` is produced end-to-end by
+`run_to_outcome` with a real, honestly-bounded `FiberExecutor` (iter. A); `select_path`'s
+`Hypercube` bridging is real via dependency inversion (`locator_axes_consistent` +
+`HypercubePathCheck`, iter. B); `Connection<S>`'s `place`/`gate`/`materialize` carry real
+dependency-inverted bodies (iter. C); TTL-sweep residue finalization landed
+(`DissolutionManager::finalize_expired`, iter. D); the Section W conformance suite +
+linkability metrics are green (iter. E); and the pipeline is user-reachable via `ssk connect`
+(iter. F). The only genuinely out-of-scope items left are real *network* egress adapters
+(Section X — the Desktop track's `ssk-netcore`) and per-check pipeline-trace granularity (a
+diagnostic refinement with no conformance payoff, recorded in Section R).
 
 ---
 
@@ -244,12 +249,12 @@ if all tests for levels 0..*k* pass"):
 | SSKΩ-0 | Typed model: `ssk-types`/`ssk-core` compile; Core, Identity Plane, Locator Plane exist and are separately typed. | ✅ met |
 | SSKΩ-1 | Deterministic core + scheduler: fixed-point phase, deterministic tick, replayable phase selection. | ✅ met |
 | SSKΩ-2 | Mirror-facet orbit + locator pool with real typing and locator-reality checks. | ✅ met (Phase 1: content-addressed `MirrorOrbit`, real `claims_external_plurality()`) |
-| SSKΩ-3 | BCIK `StitchCandidate` pipeline: every crossing carries seam, boundary, gate, trace, replay. | ⚠️ seam/boundary/trace/replay are real (Phase 2); `gate_report` is still always `None` — real per-gate evidence is Phase 3 |
+| SSKΩ-3 | BCIK `StitchCandidate` pipeline: every crossing carries seam, boundary, gate, trace, replay. | ✅ met — seam/boundary/trace/replay real (Phase 2); the materialized stitch's `gate_report` is now populated from the real `GateVector` output in `run_to_outcome` and the typestate sink (hardening iter. F), tested |
 | SSKΩ-4 | Gate vector + boundary residues: twelve gates, fail-closed, typed residues, PCH projection checks. | ✅ met (Phase 3: twelve real gate structs, no early-break, typed `ResidueKind` on every fail path, `HypercubeGate` drives the real 9-axis PCH) |
-| SSKΩ-5 | Persistent Stitch Tensor + audit: hash-chained append, storage backends, tensor-preservation theorem tested. | ⚠️ `ssk-tensor`'s real `StitchTensor`/`apply_sorted`/`StorageBackend` landed (Phase 4), hash-chained and tested (including the empty-`Vec`-preserves-the-tensor case); not yet wired into `ssk-runtime`'s live pipeline (Phase 5), so the theorem is not yet provable end-to-end through the actual runtime driver |
+| SSKΩ-5 | Persistent Stitch Tensor + audit: hash-chained append, storage backends, tensor-preservation theorem tested. | ✅ met — `ssk-tensor`'s real `StitchTensor`/`apply_sorted`/`StorageBackend` (Phase 4), now wired into the live pipeline (`run_to_outcome` materializes via `apply_sorted`, hardening iter. A) and into `Connection<GatePassed>::materialize` (hardening iter. C); the preservation theorem is proven end-to-end (`failed_gate_preserves_the_tensor` in `tests/conformance.rs`) |
 | SSKΩ-6 | Concave Reanalysis Focus + replay: class reconstruction, replay determinism harness green. | ✅ met — real `FocusEngine`/`FocusReport` and a genuinely re-executing `ReplayEngine` (Phase 5), and `run_to_outcome` now drives the full pipeline (BCIK crossing → `StitchTensor` materialization → `FiberExecutor` response capture → `FocusEngine`) to a real 3-variant `RunOutcome`, tested deterministic and fail-closed (hardening iteration A) |
 | SSKΩ-7 | Locator pool + relay-fabric adapters: real egress adapters behind the async edge, health probing. | ⚠️ funnel-DAG (`StitchEdge`/`LocatorGraph`/`HyperEdge`/`select_path`, Phase 6) landed and tested; real egress adapters/health probing behind the `async-edge` feature remain out of scope (Section X — real network I/O stays the Desktop track's `ssk-netcore` responsibility) |
-| SSKΩ-8 | Full simulation + conformance testbed: privacy metric tests, defensive adversary sim, all vectors. | ⚠️ the `FaultKind`/`Faultscan` detection taxonomy (Section P) landed and is tested (Phase 7); concrete `LinkabilityEstimator` metric tests (locator reuse, timing concentration, cross-facet correlation, residue-visibility completeness — PDF ch. 18.4) and the full deterministic test-vector/property-obligation suite (Section W) remain undone |
+| SSKΩ-8 | Full simulation + conformance testbed: privacy metric tests, defensive adversary sim, all vectors. | ✅ met — `FaultKind`/`Faultscan` detection taxonomy (Phase 7); `LinkabilityEstimator` metric + residue-visibility-completeness tests (`ssk-privacy`, hardening iter. E); and the cross-cutting property-obligation suite (`facet_recovers_to_core`, `no_silent_loss`, `failed_gate_preserves_the_tensor`, `decision_core_is_deterministic` — `tests/conformance.rs`) all green (Section W) |
 | SSKΩ-9 | Production-hardened runtime profile: dissolution/TTL sweeps, ledger verification, deployment audit, documented limits. | ✅ met — `DissolutionManager::{is_expired, sweep, finalize_expired}` (real TTL sweep + typed residue finalization, hardening iter. D), the full 12-section validated config schema (Phase 8), and the existing hash-chained ledger `verify()`, all tested |
 
 **Target of this document: close SSKΩ-3 through SSKΩ-9**, in the phase order of Section V.
@@ -1121,13 +1126,14 @@ from the PDF's literal `StorageBackend` signature (both already inherited from
 returns `TensorError` not `FaultKind`; `get`/`iter` degrade to `None`/empty on a storage read
 failure rather than panicking.
 
-**Not yet done:** wiring `StitchTensor` into `ssk-runtime`'s live pipeline (still writes the
-older flat `TensorEntry` via `make_entry`) and into `Connection<GatePassed>::materialize`
-(Section E.3, still a stub) — both deferred to Phase 5 alongside the `RunOutcome`/pipeline-stage
-rework (Section R). Wiring `materialize` today would need the gate vector to hand back the real
-`BcikStitch` it already computes inside `BcikGate::evaluate` — currently discarded after the
-gate resolves to `Pass` — rather than recomputing it a second time; that plumbing change is
-Section R's job, done once for both `RunOutcome`'s redesign and this wiring together.
+**Update — hardening iterations A + C: fully wired.** `StitchTensor` is now materialized into by
+the live pipeline: `run_to_outcome` (Section R) performs the real BCIK crossing and calls
+`apply_sorted`, and `Connection<GatePassed>::materialize` (Section E.3) does the same via
+`ssk_runtime::TensorMaterializationSink`. `run_once_with_context` is deliberately left on the
+older flat `TensorEntry`/`make_entry` path so the CLI/daemon/replay-manifest machinery keeps
+working unchanged; `run_to_outcome` and the typestate driver are the additive, PDF-shaped
+persistence path. The preservation theorem is proven end-to-end
+(`failed_gate_preserves_the_tensor`, `tests/conformance.rs`).
 
 **Update — Phase 8 done:** `crates/ssk-tensor/src/lib.rs` now has a real `DissolutionManager`
 (ch. 21's `dissolution.ttl_required`/`finalize_residues_on_expiry`, SSKΩ-9) — `is_expired`

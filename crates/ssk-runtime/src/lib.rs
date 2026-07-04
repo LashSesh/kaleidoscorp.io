@@ -267,7 +267,7 @@ pub fn run_to_outcome(
     // residue, which dissolves (still not a silent loss).
     let provider = ssk_crypto::Blake3HashProvider;
     let mut bcik = ssk_bcik::Bcik::new(&provider);
-    let stitch = match bcik.cross(
+    let mut stitch = match bcik.cross(
         &candidate.facet,
         &candidate.locator,
         ssk_types::FiberType::Data,
@@ -281,6 +281,9 @@ pub fn run_to_outcome(
             });
         }
     };
+    // Carry the gate report into the closed stitch (ch. 9.1's field list /
+    // SSKΩ-3's "every crossing carries seam, boundary, gate, trace, replay").
+    stitch.gate_report = Some(gate_report.id.clone());
 
     // Materialize into the real persistent tensor (apply_sorted).
     let accepted = ssk_types::Accepted {
@@ -397,15 +400,17 @@ impl ssk_core::connection::MaterializationSink for TensorMaterializationSink<'_>
     fn materialize(&mut self, sc: &StitchCandidate) -> Result<Vec<StitchId>, ssk_types::FaultKind> {
         let provider = ssk_crypto::Blake3HashProvider;
         let mut bcik = ssk_bcik::Bcik::new(&provider);
-        let stitch = match bcik.cross(&sc.facet, &sc.locator, ssk_types::FiberType::Data, sc) {
+        let mut stitch = match bcik.cross(&sc.facet, &sc.locator, ssk_types::FiberType::Data, sc) {
             ssk_types::CrossOutcome::Closed(stitch) => stitch,
             ssk_types::CrossOutcome::Residue(_) => {
                 return Err(ssk_types::FaultKind::BcikSeamMissing);
             }
         };
+        let gate_report = ssk_types::GateReportId::new(format!("gr:{}", sc.id.0 .0));
+        stitch.gate_report = Some(gate_report.clone());
         let accepted = ssk_types::Accepted {
             stitch,
-            gate_report: ssk_types::GateReportId::new(format!("gr:{}", sc.id.0 .0)),
+            gate_report,
             accepted_at: self.accepted_at,
             epoch: self.epoch,
             ttl: ssk_types::Ttl(sc.ttl_epoch),
@@ -782,17 +787,21 @@ mod tests {
         )
         .expect("run");
 
-        match outcome {
+        let materialized_id = match outcome {
             RunOutcome::Pass {
                 stitches, focus, ..
             } => {
                 assert_eq!(stitches.len(), 1);
                 assert_eq!(focus.verdict, ssk_focus::FocusVerdict::Pass);
+                stitches[0].clone()
             }
             other => panic!("expected Pass, got {other:?}"),
-        }
-        // The tensor genuinely mutated.
+        };
+        // The tensor genuinely mutated, and the materialized stitch carries
+        // its gate report (SSKΩ-3: every crossing carries gate/seam/…).
         assert_eq!(tensor.graph().len(), 1);
+        let stitch = tensor.graph().get(&materialized_id);
+        assert!(stitch.is_some_and(|s| s.gate_report.is_some()));
     }
 
     #[test]
