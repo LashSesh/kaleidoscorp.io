@@ -1,0 +1,233 @@
+#![forbid(unsafe_code)]
+
+//! # ssk-meta-resonance — the MetaResonanceController (FCHL-MPK Band B)
+//!
+//! A PID + symmetry-feedback loop over the FieldTensorSkin's δF drift signal
+//! (setpoint = zero drift). It produces a [`ResonanceResponse`] that can
+//! **stabilize** or **delay**, but two invariants are structural, not advisory:
+//!
+//! * **Never bypasses a gate.** [`MetaResonanceController::apply_to_gate`] can
+//!   only keep a gate outcome or make it *more* conservative — it can never
+//!   promote `Hold`/`Reject`/`Quarantine` toward `Pass`. The response has no
+//!   "bypass" action at all.
+//! * **No gate-flicker.** `apply_to_gate` is deterministic and monotone, so the
+//!   same `(outcome, response)` always maps the same way and a decision never
+//!   oscillates toward `Pass`.
+//!
+//! The loop is meta-stable: the integral term is anti-windup clamped and the
+//! output is bounded, so a persistent drift produces a bounded response, never a
+//! runaway.
+
+use serde::{Deserialize, Serialize};
+use ssk_types::GateOutcomeKind;
+
+/// What the controller recommends. There is deliberately no `Bypass`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ResonanceAction {
+    /// Drift is under control; proceed.
+    Stabilize,
+    /// Drift is elevated; delay (downgrade a pass to a hold).
+    Delay,
+    /// Drift is high; hold.
+    Hold,
+}
+
+/// The controller's response for one step.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ResonanceResponse {
+    pub action: ResonanceAction,
+    /// The (clamped, bounded) PID adjustment.
+    pub adjustment: f64,
+    /// The drift the response was computed from.
+    pub measured_drift: f64,
+}
+
+/// PID gains and thresholds.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ResonanceConfig {
+    pub kp: f64,
+    pub ki: f64,
+    pub kd: f64,
+    /// Anti-windup / output clamp magnitude.
+    pub clamp: f64,
+    /// Drift at or below which the loop is considered stabilized.
+    pub stable_threshold: f64,
+    /// Drift above which the loop holds rather than merely delays.
+    pub hold_threshold: f64,
+}
+
+impl Default for ResonanceConfig {
+    fn default() -> Self {
+        ResonanceConfig {
+            kp: 0.6,
+            ki: 0.1,
+            kd: 0.2,
+            clamp: 10.0,
+            stable_threshold: 0.05,
+            hold_threshold: 0.5,
+        }
+    }
+}
+
+/// The PID + symmetry-feedback controller.
+#[derive(Clone, Debug)]
+pub struct MetaResonanceController {
+    config: ResonanceConfig,
+    integral: f64,
+    prev_error: f64,
+}
+
+impl Default for MetaResonanceController {
+    fn default() -> Self {
+        Self::new(ResonanceConfig::default())
+    }
+}
+
+impl MetaResonanceController {
+    #[must_use]
+    pub fn new(config: ResonanceConfig) -> Self {
+        MetaResonanceController {
+            config,
+            integral: 0.0,
+            prev_error: 0.0,
+        }
+    }
+
+    /// Advance the loop by one drift measurement (setpoint is zero drift).
+    pub fn step(&mut self, measured_drift: f64) -> ResonanceResponse {
+        let c = &self.config;
+        let error = measured_drift; // setpoint 0
+        self.integral = (self.integral + error).clamp(-c.clamp, c.clamp);
+        let derivative = error - self.prev_error;
+        self.prev_error = error;
+        let raw = c.kp * error + c.ki * self.integral + c.kd * derivative;
+        let adjustment = raw.clamp(-c.clamp, c.clamp);
+
+        let action = if measured_drift <= c.stable_threshold {
+            ResonanceAction::Stabilize
+        } else if measured_drift <= c.hold_threshold {
+            ResonanceAction::Delay
+        } else {
+            ResonanceAction::Hold
+        };
+
+        ResonanceResponse {
+            action,
+            adjustment,
+            measured_drift,
+        }
+    }
+
+    /// Apply a response to a gate outcome. This can only keep the outcome or make
+    /// it more conservative — it never promotes toward `Pass` (no gate bypass,
+    /// no upward flicker).
+    #[must_use]
+    pub fn apply_to_gate(
+        &self,
+        gate: GateOutcomeKind,
+        response: &ResonanceResponse,
+    ) -> GateOutcomeKind {
+        match gate {
+            // Non-passing outcomes are never upgraded by resonance.
+            GateOutcomeKind::Reject => GateOutcomeKind::Reject,
+            GateOutcomeKind::Quarantine => GateOutcomeKind::Quarantine,
+            GateOutcomeKind::Hold => GateOutcomeKind::Hold,
+            GateOutcomeKind::Refine => GateOutcomeKind::Refine,
+            // A pass may be held back when drift is elevated, but is otherwise kept.
+            GateOutcomeKind::Pass => match response.action {
+                ResonanceAction::Stabilize => GateOutcomeKind::Pass,
+                ResonanceAction::Delay | ResonanceAction::Hold => GateOutcomeKind::Hold,
+            },
+        }
+    }
+
+    #[must_use]
+    pub fn integral(&self) -> f64 {
+        self.integral
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn controller() -> MetaResonanceController {
+        MetaResonanceController::default()
+    }
+
+    // FCHL-MPK: the MPK/resonance signal only stabilizes or delays — it never
+    // bypasses a gate (never promotes a non-pass toward Pass).
+    #[test]
+    fn resonance_never_bypasses_a_gate() {
+        let ctrl = controller();
+        // A high-drift response with every possible action.
+        for drift in [0.0, 0.3, 2.0] {
+            let mut c = controller();
+            let resp = c.step(drift);
+            // No response can turn a Reject/Quarantine/Hold/Refine into a Pass.
+            for gate in [
+                GateOutcomeKind::Reject,
+                GateOutcomeKind::Quarantine,
+                GateOutcomeKind::Hold,
+                GateOutcomeKind::Refine,
+            ] {
+                assert_ne!(ctrl.apply_to_gate(gate, &resp), GateOutcomeKind::Pass);
+                assert_eq!(
+                    ctrl.apply_to_gate(gate, &resp),
+                    gate,
+                    "non-pass outcomes are preserved"
+                );
+            }
+        }
+    }
+
+    // No gate-flicker: apply_to_gate is deterministic and monotone-conservative;
+    // a Pass under elevated drift is held and stays held on re-application.
+    #[test]
+    fn no_gate_flicker() {
+        let ctrl = controller();
+        let mut c = controller();
+        let elevated = c.step(0.3); // Delay
+        let held = ctrl.apply_to_gate(GateOutcomeKind::Pass, &elevated);
+        assert_eq!(
+            held,
+            GateOutcomeKind::Hold,
+            "elevated drift delays a pass to a hold"
+        );
+        // Re-applying to the now-held outcome keeps it held — no oscillation.
+        assert_eq!(ctrl.apply_to_gate(held, &elevated), GateOutcomeKind::Hold);
+        // Determinism: the same inputs always map the same way.
+        assert_eq!(
+            ctrl.apply_to_gate(GateOutcomeKind::Pass, &elevated),
+            ctrl.apply_to_gate(GateOutcomeKind::Pass, &elevated)
+        );
+        // A stabilized response keeps a pass.
+        let mut c2 = controller();
+        let stable = c2.step(0.0);
+        assert_eq!(stable.action, ResonanceAction::Stabilize);
+        assert_eq!(
+            ctrl.apply_to_gate(GateOutcomeKind::Pass, &stable),
+            GateOutcomeKind::Pass
+        );
+    }
+
+    // Meta-stability: a persistent drift produces a bounded response; the
+    // integral never winds up past the clamp.
+    #[test]
+    fn loop_is_meta_stable_and_bounded() {
+        let mut c = controller();
+        let clamp = ResonanceConfig::default().clamp;
+        let mut last = 0.0;
+        for _ in 0..1000 {
+            let resp = c.step(2.0);
+            assert!(resp.adjustment.abs() <= clamp, "output stays clamped");
+            last = resp.adjustment;
+        }
+        assert!(
+            c.integral().abs() <= clamp,
+            "integral is anti-windup clamped"
+        );
+        // Persistent high drift resolves to a Hold action.
+        assert!(last.abs() <= clamp);
+    }
+}

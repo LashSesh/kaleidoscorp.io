@@ -28,6 +28,7 @@ members = [
   "crates/ssk-boundary",
   "crates/ssk-mpk",
   "crates/ssk-field-tensor",
+  "crates/ssk-meta-resonance",
   "crates/ssk-cli",
   "crates/ssk-ipc",
   "crates/ssk-daemon",

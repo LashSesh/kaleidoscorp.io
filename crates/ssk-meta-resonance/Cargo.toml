@@ -1,0 +1,19 @@
+[package]
+name = "ssk-meta-resonance"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# FCHL-MPK Band B: the MetaResonanceController — a PID + symmetry-feedback loop
+# over the FieldTensorSkin's δF drift signal. It can stabilize or delay, but its
+# output is clamped so it can NEVER promote a gate outcome toward Pass (no gate
+# bypass) and never flicker a decision. See FCHL_MPK_INTEGRATION_STRATEGY.md.
+
+[dependencies]
+ssk-types = { path = "../ssk-types", version = "0.1.0" }
+serde = { workspace = true }
+
+[dev-dependencies]
+
+[lints]
+workspace = true
