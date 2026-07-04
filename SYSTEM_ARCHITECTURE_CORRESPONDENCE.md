@@ -1,5 +1,32 @@
 # System Architecture Correspondence — full corpus ↔ SSK codebase
 
+> **IMPLEMENTATION STATUS (living).** Layers this correspondence marked "absent /
+> greenfield" have since been built as green, tested, `clippy -D warnings`-clean
+> crates on top of the proven Ω core:
+> - **`ssk-netcore`** — the real network data plane (TCP/SOCKS5/TLS/DNS), closing SSKΩ-7.
+> - **`ssk-signature`** — the Chameleon spectral substrate (spectrum-as-identity); the
+>   `CanonicalTrafficSurface`/SignatureLab feed. 73 tests.
+> - **`ssk-imdf`** — the Mirror Dome seed (IMDF-0..2): SelfAnchor≠Locator, authorized
+>   ObserverModels, aperture-before-focus, QLOGIC gate, 4π-closure, hash-chained
+>   SelfPerceptionAtlas. All 11 IMDF Appendix A tests. 13 tests.
+> - **`ssk-capture`** — SSCL SystemTrafficField (SSCL-2), payload-neutral
+>   CanonicalTrafficSurface with provenance + replay.
+> - **`ssk-boundary`** — the session-local system-wide kill-switch (SSCL-7): policy +
+>   hash-chained audit + rollback + authorized override.
+> - **`ssk-mpk`** — the FCHL-MPK finite-symmetry core (Band A): Canon/Orbit/Stab/Spec/
+>   Comp/Catalog + cospectral gate. FCHL-MPK invariants I3–I8 (incl. the Schwenk pair).
+> - **`ssk-field-tensor`** — the FieldTensorSkin (FTCSA, Band B): F = T_surface + T_res +
+>   C_coupling + δF, honestly typed as an observation surface.
+> - **`ssk-meta-resonance`** — the MetaResonanceController (Band B): PID feedback that
+>   stabilizes/delays but never bypasses a gate; no gate-flicker.
+>
+> All four capabilities the author named are implemented: spectrum-as-identity,
+> SystemTrafficField capture, session-local kill-switch, FieldTensorSkin. Remaining
+> greenfield: the rest of Band B (HostCellPlane, FunnelDAG, TFA, TopologyScalpel), the
+> SSCL Crown (ProfileManifold, ServiceHost/packaging/DeliveryEnvelope, CrownSupervisor),
+> binding the pure seams to real privileged backends, and the top rungs (…-9) of each
+> conformance ladder.
+
 **Deliverable "A": the complete architecture correspondence across the whole normative corpus, mapped onto the existing `ssk-*` workspace.** This subsumes and extends `FCHL_MPK_INTEGRATION_STRATEGY.md` (which was FCHL-MPK-scoped) to all seven source documents, unifies their conformance ladders into one, and gives one integration sequence.
 
 Every "exists" claim carries a `file:line`. Every normalization of an older/metaphorical term is taken verbatim from the two master specs' own mapping tables (SSCL ch. 2 Extraktionstabelle; FCHL-MPK Addendum Appendix B; IMDF ch. 2 + Quellenbindung), never invented. Boundaries in these documents are the author's own design decisions (configurable defaults), plus the lawful frame the author named — not agent-imposed limits (see `FCHL_MPK_INTEGRATION_STRATEGY.md` §1.3).
