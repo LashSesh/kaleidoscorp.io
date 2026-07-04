@@ -42,7 +42,7 @@ hex = "0.4"
 sha2 = "0.10"
 time = { version = "0.3", features = ["serde"] }
 proptest = "1"
-rand = "0.8"
+rand = "0.10"
 clap = { version = "4", features = ["derive"] }
 tempfile = "3"
 parking_lot = "0.12"
