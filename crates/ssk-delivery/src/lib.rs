@@ -203,19 +203,34 @@ impl Deployment {
         Ok(())
     }
 
-    /// Apply a whole plan in place — but only if its gate passed. This is the
-    /// deliberate, caller-side application; planning never mutates a deployment.
+    /// Apply a whole plan in place — but only if its gate passed AND `self` is
+    /// exactly the deployment the plan was planned from. This is the
+    /// deliberate, caller-side application; planning never mutates a
+    /// deployment. Atomic: steps are applied to a clone first, and `self` is
+    /// only overwritten if every step succeeds — a step failing partway
+    /// through never leaves `self` half-migrated (a plan's reversibility proof
+    /// only holds for the exact deployment it was planned from; applying it to
+    /// a look-alike deployment and failing partway would otherwise strand the
+    /// caller in a state neither the plan nor its rollback accounts for).
     ///
     /// # Errors
-    /// [`DeliveryError::NotApplicable`] if the plan did not gate `Pass`, or any
-    /// step error.
+    /// [`DeliveryError::NotApplicable`] if the plan did not gate `Pass` or
+    /// `self` does not match `plan.from_digest`, or any step error (in which
+    /// case `self` is left completely unmodified).
     pub fn apply_plan(&mut self, plan: &MigrationPlan) -> Result<(), DeliveryError> {
         if !plan.is_applicable() {
             return Err(DeliveryError::NotApplicable(plan.gate_reason.clone()));
         }
-        for step in &plan.steps {
-            self.apply_step(step)?;
+        if self.digest() != plan.from_digest {
+            return Err(DeliveryError::NotApplicable(
+                "deployment does not match the plan's source digest".to_owned(),
+            ));
         }
+        let mut work = self.clone();
+        for step in &plan.steps {
+            work.apply_step(step)?;
+        }
+        *self = work;
         Ok(())
     }
 }
@@ -647,5 +662,66 @@ mod tests {
         let a = planner.plan_install(&Deployment::empty(), &v1_envelope());
         let b = planner.plan_install(&Deployment::empty(), &v1_envelope());
         assert_eq!(a.id, b.id, "same source + target -> same plan id (replay)");
+    }
+
+    // Regression: applying a Pass plan to a look-alike deployment (not the one
+    // it was planned from) must be refused outright, not half-applied. Before
+    // the fix: source S={c0@v1,c1@v1}; plan_uninstall(&S) -> steps
+    // [Remove(c0@v1), Remove(c1@v1)]; applying that plan to a look-alike
+    // S2={c0@v1,c1@v2} would remove c0, then fail removing c1 (wrong version),
+    // leaving S2 half-migrated to {c1@v2} with neither the plan nor its
+    // rollback able to restore it.
+    #[test]
+    fn apply_plan_refuses_a_deployment_that_does_not_match_the_plan_source() {
+        let planner = DeliveryPlanner::new();
+        let source = v1_envelope().as_deployment();
+        let plan = planner.plan_uninstall(&source);
+        assert_eq!(plan.gate, GateOutcomeKind::Pass);
+
+        // A look-alike deployment: c0 unchanged, c1 rebuilt at a new version.
+        let mut look_alike = Deployment::empty();
+        look_alike
+            .installed
+            .insert("core".to_owned(), comp("core", "1.0.0", 1));
+        look_alike
+            .installed
+            .insert("capture".to_owned(), comp("capture", "9.9.9", 99));
+        let before = look_alike.clone();
+        assert_ne!(before.digest(), plan.from_digest);
+
+        assert_eq!(
+            look_alike.apply_plan(&plan).unwrap_err(),
+            DeliveryError::NotApplicable(
+                "deployment does not match the plan's source digest".to_owned()
+            )
+        );
+        // The look-alike deployment is completely unmodified, not half-migrated.
+        assert_eq!(look_alike, before);
+    }
+
+    // Regression: if a step fails partway through an otherwise-matching plan
+    // (only reachable via a hand-tampered plan, since a genuine plan's own
+    // gate already proves its steps apply cleanly to its source), `self` must
+    // be left completely unmodified rather than partially mutated.
+    #[test]
+    fn apply_plan_is_atomic_on_a_mid_plan_step_failure() {
+        let planner = DeliveryPlanner::new();
+        let source = v1_envelope().as_deployment();
+        let mut plan = planner.plan_uninstall(&source);
+        // Tamper the plan after gating: swap in a step that will fail
+        // (removing a component version that was never installed).
+        plan.steps.push(MigrationStep::RemoveComponent(comp(
+            "nonexistent",
+            "1.0.0",
+            77,
+        )));
+
+        let before = source.clone();
+        let mut work = source.clone();
+        assert!(work.apply_plan(&plan).is_err());
+        assert_eq!(
+            work, before,
+            "a mid-plan step failure must not leave a partially-migrated deployment"
+        );
     }
 }
