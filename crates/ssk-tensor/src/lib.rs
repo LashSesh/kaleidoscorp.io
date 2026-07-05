@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use serde::{de::DeserializeOwned, Serialize};
 use ssk_types::{
     digest_of, Accepted, BcikStitch, BoundaryResidue, Digest, EpochId, FaultKind, GateId,
@@ -8,6 +8,7 @@ use ssk_types::{
     StitchTensorEntry, TensorEntry,
 };
 use std::collections::HashMap;
+use std::io::Write;
 use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
 
@@ -45,6 +46,26 @@ pub trait LedgerBackend: GenericLedgerBackend<TensorEntry> {
     fn verify(&self) -> Result<(), TensorError> {
         verify_chain(&GenericLedgerBackend::entries(self)?)
     }
+
+    /// Verify the chain **and** that it matches a trusted `(len, head)`
+    /// checkpoint the caller persisted out-of-band. `verify()` alone only
+    /// proves prefix integrity — any prefix of a valid chain is itself a
+    /// valid chain, so silently deleting trailing entries still verifies.
+    /// Anchoring to an independently-recorded length and head is what
+    /// actually detects that truncation.
+    fn verify_against_head(
+        &self,
+        trusted_len: usize,
+        trusted_head: Digest,
+    ) -> Result<(), TensorError> {
+        let entries = GenericLedgerBackend::entries(self)?;
+        verify_chain(&entries)?;
+        let head = entries.last().map_or(Digest::GENESIS, |e| e.entry_hash);
+        if entries.len() != trusted_len || head != trusted_head {
+            return Err(TensorError::VerificationFailed);
+        }
+        Ok(())
+    }
 }
 
 impl<T: GenericLedgerBackend<TensorEntry>> LedgerBackend for T {}
@@ -74,6 +95,32 @@ pub trait StorageBackend: GenericLedgerBackend<StitchTensorEntry> {
             .ok()
             .and_then(|es| es.last().map(|e| e.entry_hash))
             .unwrap_or(Digest::GENESIS)
+    }
+
+    /// Verify the `StitchTensorEntry` hash chain (genesis-rooted, `prev_hash`
+    /// links, `entry_hash` recomputed over each entry). Unlike `TensorEntry`,
+    /// nothing previously validated this chain at all — `StitchTensor::open`
+    /// trusted `entries.last()` verbatim, so a forged or hand-edited entry was
+    /// accepted with no check.
+    fn verify(&self) -> Result<(), TensorError> {
+        verify_stitch_chain(&self.entries()?)
+    }
+
+    /// As [`LedgerBackend::verify_against_head`]: verify the chain and that it
+    /// matches a trusted `(len, head)` checkpoint, so trailing-entry deletion
+    /// (which chain-prefix verification alone cannot see) is detected too.
+    fn verify_against_head(
+        &self,
+        trusted_len: usize,
+        trusted_head: Digest,
+    ) -> Result<(), TensorError> {
+        let entries = self.entries()?;
+        verify_stitch_chain(&entries)?;
+        let head = entries.last().map_or(Digest::GENESIS, |e| e.entry_hash);
+        if entries.len() != trusted_len || head != trusted_head {
+            return Err(TensorError::VerificationFailed);
+        }
+        Ok(())
     }
 }
 
@@ -131,10 +178,13 @@ pub struct StitchTensor {
 }
 
 impl StitchTensor {
-    /// Rebuilds `graph`/`head` from whatever the backend already persists,
-    /// so re-opening a `StitchTensor` over an existing file backend resumes
-    /// with a correct in-memory graph rather than silently starting empty.
+    /// Rebuilds `graph`/`head` from whatever the backend already persists, so
+    /// re-opening a `StitchTensor` over an existing file backend resumes with
+    /// a correct in-memory graph rather than silently starting empty. The
+    /// persisted chain is verified first — a forged or hand-edited entry (or a
+    /// broken `prev_hash` link) is rejected rather than trusted verbatim.
     pub fn open(backend: Box<dyn StorageBackend>) -> Result<Self, FaultKind> {
+        backend.verify().map_err(|_| FaultKind::StorageFailure)?;
         let entries = backend.entries().map_err(|_| FaultKind::StorageFailure)?;
         let mut graph = StitchGraph::default();
         for e in &entries {
@@ -299,8 +349,29 @@ impl<E: Clone + Send + Sync> GenericLedgerBackend<E> for GenericMemoryBackend<E>
 /// existing `MemoryBackend::new()` call site keeps compiling unchanged.
 pub type MemoryBackend = GenericMemoryBackend<TensorEntry>;
 
+/// A file-backed ledger. Writes are **atomic**: each `append` serializes the
+/// whole entry list to a sibling temp file, `fsync`s it, then renames it onto
+/// the target path — `rename` is an atomic filesystem operation, so a
+/// concurrent reader (in this process or another) always sees either the
+/// complete pre-append file or the complete post-append file, never a
+/// truncated or half-written one. That kills the worst failure mode a naive
+/// truncate-and-rewrite has: a reader landing mid-write, seeing zero or
+/// partial bytes, and `verify()` reporting a false "ledger-ok" on what looks
+/// like an empty chain.
+///
+/// `write_lock` additionally serializes concurrent `append` calls **within
+/// this process** (e.g. two threads sharing one `Arc<GenericFileLedgerBackend<E>>`),
+/// so a same-process read-modify-write race cannot silently drop an entry.
+///
+/// Residual, disclosed limitation: two entirely separate **processes**
+/// appending to the same path at the same instant can still race the
+/// read-modify-write (both read N entries, both write N+1, one rename wins) —
+/// a lost *append*, not corruption or a false-positive verify. Closing that
+/// residual gap needs OS-level cross-process file locking, which this crate
+/// does not yet provide.
 pub struct GenericFileLedgerBackend<E> {
     path: PathBuf,
+    write_lock: Mutex<()>,
     _marker: PhantomData<E>,
 }
 
@@ -309,6 +380,7 @@ impl<E> GenericFileLedgerBackend<E> {
     pub fn new(path: impl AsRef<Path>) -> Self {
         Self {
             path: path.as_ref().to_path_buf(),
+            write_lock: Mutex::new(()),
             _marker: PhantomData,
         }
     }
@@ -328,7 +400,16 @@ impl<E: Serialize + DeserializeOwned + Clone + Send + Sync> GenericFileLedgerBac
 
     fn write_entries(&self, entries: &[E]) -> Result<(), TensorError> {
         let bytes = serde_json::to_vec_pretty(entries)?;
-        std::fs::write(&self.path, bytes)?;
+        let dir = self
+            .path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| PathBuf::from("."));
+        let mut tmp = tempfile::NamedTempFile::new_in(&dir)?;
+        tmp.write_all(&bytes)?;
+        tmp.as_file().sync_all()?;
+        tmp.persist(&self.path).map_err(|e| e.error)?;
         Ok(())
     }
 }
@@ -337,6 +418,7 @@ impl<E: Serialize + DeserializeOwned + Clone + Send + Sync> GenericLedgerBackend
     for GenericFileLedgerBackend<E>
 {
     fn append(&self, entry: E) -> Result<(), TensorError> {
+        let _guard = self.write_lock.lock();
         let mut entries = self.read_entries()?;
         entries.push(entry);
         self.write_entries(&entries)
@@ -371,6 +453,26 @@ pub fn make_entry(
 }
 
 fn verify_chain(entries: &[TensorEntry]) -> Result<(), TensorError> {
+    let mut prev = Digest::GENESIS;
+    for e in entries {
+        if e.prev_hash != prev {
+            return Err(TensorError::VerificationFailed);
+        }
+        let mut expected = e.clone();
+        expected.entry_hash = Digest::PENDING;
+        expected.entry_hash = digest_of(&expected, HashAlg::Blake3)?;
+        if expected.entry_hash != e.entry_hash {
+            return Err(TensorError::VerificationFailed);
+        }
+        prev = e.entry_hash;
+    }
+    Ok(())
+}
+
+/// `StitchTensorEntry`'s hash-chain check, mirroring [`verify_chain`] exactly
+/// (genesis-rooted, `prev_hash` links, `entry_hash` recomputed with the field
+/// reset to `PENDING`) but for the richer stitch-carrying entry type.
+fn verify_stitch_chain(entries: &[StitchTensorEntry]) -> Result<(), TensorError> {
     let mut prev = Digest::GENESIS;
     for e in entries {
         if e.prev_hash != prev {
@@ -459,26 +561,70 @@ mod tests {
         assert!(tensor.graph().is_empty());
     }
 
-    #[test]
-    fn open_rebuilds_graph_and_head_from_existing_entries() {
-        let backend: StitchMemoryBackend = GenericMemoryBackend::new();
-        let stitch = sample_stitch("x");
-        let entry = StitchTensorEntry {
+    /// Builds a genuinely chained `StitchTensorEntry` the same way
+    /// `StitchTensor::chain` does (entry_hash computed over the entry with
+    /// itself reset to `PENDING`), so it passes `verify_stitch_chain`.
+    fn chained_stitch_entry(id: &str, prev_hash: Digest) -> StitchTensorEntry {
+        let stitch = sample_stitch(id);
+        let mut entry = StitchTensorEntry {
             id: stitch.id.clone(),
             stitch,
-            gate_report: GateReportId::new("gr-x"),
+            gate_report: GateReportId::new(format!("gr-{id}")),
             accepted_at: ssk_types::Tick(0),
             epoch: EpochId(0),
             ttl: Ttl(100),
-            prev_hash: Digest::GENESIS,
-            entry_hash: digest_of(&"seed-entry", HashAlg::Blake3).expect("hash"),
+            prev_hash,
+            entry_hash: Digest::PENDING,
         };
+        entry.entry_hash = digest_of(&entry, HashAlg::Blake3).expect("hash");
+        entry
+    }
+
+    #[test]
+    fn open_rebuilds_graph_and_head_from_existing_entries() {
+        let backend: StitchMemoryBackend = GenericMemoryBackend::new();
+        let entry = chained_stitch_entry("x", Digest::GENESIS);
         backend.append(entry).expect("append");
 
         let reopened = StitchTensor::open(Box::new(backend)).expect("reopen");
         assert_eq!(reopened.graph().len(), 1);
         assert!(reopened.graph().contains(&StitchId::new("x")));
         assert_ne!(reopened.head(), Digest::GENESIS);
+    }
+
+    // StitchTensor::open must reject a chain a caller has tampered with,
+    // rather than trusting entries.last() verbatim.
+    #[test]
+    fn open_rejects_a_forged_entry() {
+        let backend: StitchMemoryBackend = GenericMemoryBackend::new();
+        let mut entry = chained_stitch_entry("x", Digest::GENESIS);
+        // Tamper with the payload after the hash was computed over the real
+        // stitch id — entry_hash no longer matches.
+        entry.stitch.id = StitchId::new("forged");
+        backend.append(entry).expect("append");
+
+        let result = StitchTensor::open(Box::new(backend));
+        assert!(
+            result.is_err(),
+            "a forged entry must be rejected, not accepted verbatim"
+        );
+    }
+
+    // A broken prev_hash link (mid-chain deletion/reordering) must also be
+    // rejected by open(), not silently trusted.
+    #[test]
+    fn open_rejects_a_broken_prev_hash_link() {
+        let backend: StitchMemoryBackend = GenericMemoryBackend::new();
+        let first = chained_stitch_entry("a", Digest::GENESIS);
+        let head_a = first.entry_hash;
+        backend.append(first).expect("append");
+        // "b" should chain from head_a, but instead (wrongly) claims GENESIS.
+        let second = chained_stitch_entry("b", Digest::GENESIS);
+        backend.append(second).expect("append");
+        assert_ne!(head_a, Digest::GENESIS);
+
+        let result = StitchTensor::open(Box::new(backend));
+        assert!(result.is_err(), "a broken prev_hash link must be rejected");
     }
 
     fn entry_with(id: &str, epoch: u64, ttl: u64) -> StitchTensorEntry {
@@ -601,6 +747,109 @@ mod tests {
         assert_eq!(
             reopened.entries().expect("entries"),
             vec![Toy { value: 1 }, Toy { value: 2 }]
+        );
+    }
+
+    #[test]
+    fn file_backend_leaves_no_temp_file_behind_after_append() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("ledger.json");
+        let file_backend: FileLedgerBackend = GenericFileLedgerBackend::new(&path);
+
+        let report = GateReport {
+            id: ssk_types::GateReportId::new("g1"),
+            outcome: ssk_types::GateOutcomeKind::Pass,
+            witnesses: Vec::new(),
+            residues: Vec::new(),
+        };
+        let entry = make_entry(
+            RunId::new("r1"),
+            StitchId::new("s1"),
+            &report,
+            true,
+            Digest::GENESIS,
+        )
+        .expect("entry");
+        file_backend.append(entry).expect("append");
+
+        // Only the target file exists in the directory -- the atomic-rename
+        // write leaves no stray .tmp artifact and no torn intermediate state.
+        let names: Vec<_> = std::fs::read_dir(dir.path())
+            .expect("read_dir")
+            .map(|e| e.expect("entry").file_name())
+            .collect();
+        assert_eq!(names, vec![std::ffi::OsString::from("ledger.json")]);
+        assert!(file_backend.verify().is_ok());
+    }
+
+    // verify() alone only proves prefix integrity -- a chain with its trailing
+    // entry deleted is still a valid (shorter) chain. verify_against_head must
+    // catch exactly that, by anchoring to an independently-recorded (len, head).
+    #[test]
+    fn verify_against_head_detects_trailing_truncation() {
+        let backend = MemoryBackend::new();
+        let report = GateReport {
+            id: ssk_types::GateReportId::new("g1"),
+            outcome: ssk_types::GateOutcomeKind::Pass,
+            witnesses: Vec::new(),
+            residues: Vec::new(),
+        };
+        let e1 = make_entry(
+            RunId::new("r1"),
+            StitchId::new("s1"),
+            &report,
+            true,
+            Digest::GENESIS,
+        )
+        .expect("entry");
+        backend.append(e1.clone()).expect("append");
+        let e2 = make_entry(
+            RunId::new("r1"),
+            StitchId::new("s2"),
+            &report,
+            true,
+            e1.entry_hash,
+        )
+        .expect("entry");
+        backend.append(e2.clone()).expect("append");
+
+        let trusted_len = backend.entries().unwrap().len();
+        let trusted_head = e2.entry_hash;
+        assert!(backend
+            .verify_against_head(trusted_len, trusted_head)
+            .is_ok());
+
+        // Truncate the trailing entry: verify() alone still passes (the
+        // remaining prefix is a genuinely valid chain), but the trusted
+        // checkpoint no longer matches.
+        backend.replace_all(vec![e1]);
+        assert!(
+            backend.verify().is_ok(),
+            "a valid prefix still verifies alone"
+        );
+        assert!(
+            backend
+                .verify_against_head(trusted_len, trusted_head)
+                .is_err(),
+            "verify_against_head must catch the truncated tail that verify() alone cannot"
+        );
+    }
+
+    #[test]
+    fn stitch_verify_against_head_detects_trailing_truncation() {
+        let backend: StitchMemoryBackend = GenericMemoryBackend::new();
+        let first = chained_stitch_entry("a", Digest::GENESIS);
+        let head_a = first.entry_hash;
+        backend.append(first).expect("append");
+        let second = chained_stitch_entry("b", head_a);
+        let head_b = second.entry_hash;
+        backend.append(second).expect("append");
+
+        assert!(backend.verify_against_head(2, head_b).is_ok());
+        backend.replace_all(vec![chained_stitch_entry("a", Digest::GENESIS)]);
+        assert!(
+            backend.verify_against_head(2, head_b).is_err(),
+            "trailing deletion of a StitchTensorEntry must be caught"
         );
     }
 }

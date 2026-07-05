@@ -174,6 +174,12 @@ impl<B: GenericLedgerBackend<ForensicEntry>> AuditLedger<B> {
     }
 
     /// Verify the integrity of the entire hash chain.
+    ///
+    /// This proves only *prefix* integrity: any prefix of a valid chain is
+    /// itself a valid chain, so a file an attacker truncated by deleting
+    /// trailing entries still verifies here. Use
+    /// [`AuditLedger::verify_against_head`] with an independently-persisted
+    /// checkpoint to also detect that.
     pub fn verify(&self) -> Result<(), NetAdminError> {
         let mut prev = "genesis".to_string();
         for e in self.backend.entries()? {
@@ -185,6 +191,29 @@ impl<B: GenericLedgerBackend<ForensicEntry>> AuditLedger<B> {
                 return Err(NetAdminError::AuditChainBroken(e.entry_id.clone()));
             }
             prev = e.entry_hash.clone();
+        }
+        Ok(())
+    }
+
+    /// Verify the chain **and** that it matches a trusted `(len, head)`
+    /// checkpoint persisted out-of-band by the caller (e.g. alongside the
+    /// ledger file, or in a separate integrity record). This is what actually
+    /// detects trailing-entry deletion, which [`AuditLedger::verify`] alone
+    /// cannot see.
+    pub fn verify_against_head(
+        &self,
+        trusted_len: usize,
+        trusted_head: &str,
+    ) -> Result<(), NetAdminError> {
+        let entries = self.backend.entries()?;
+        self.verify()?;
+        let head = entries
+            .last()
+            .map_or_else(|| "genesis".to_string(), |e| e.entry_hash.clone());
+        if entries.len() != trusted_len || head != trusted_head {
+            return Err(NetAdminError::AuditChainBroken(
+                "chain length/head does not match the trusted checkpoint".to_owned(),
+            ));
         }
         Ok(())
     }
@@ -255,6 +284,64 @@ mod tests {
         entries[0].entry_hash = "tampered".into();
         ledger.backend.replace_all(entries);
         assert!(ledger.verify().is_err());
+    }
+
+    // verify() alone only proves prefix integrity: deleting a trailing entry
+    // still leaves a valid (shorter) chain. verify_against_head, anchored to
+    // an independently-recorded checkpoint, must catch exactly that.
+    #[test]
+    fn trailing_truncation_passes_verify_but_fails_verify_against_head() {
+        let mut ledger = AuditLedger::new();
+        ledger
+            .record(
+                "e-0",
+                "f-0",
+                None,
+                None,
+                &RouteKind::Direct,
+                AuditOutcome::Dispatched,
+                1,
+            )
+            .expect("record");
+        ledger
+            .record(
+                "e-1",
+                "f-1",
+                None,
+                None,
+                &RouteKind::Direct,
+                AuditOutcome::Dispatched,
+                2,
+            )
+            .expect("record");
+
+        let trusted_len = ledger.len().expect("len");
+        let trusted_head = ledger
+            .entries()
+            .expect("entries")
+            .last()
+            .unwrap()
+            .entry_hash
+            .clone();
+        assert!(ledger
+            .verify_against_head(trusted_len, &trusted_head)
+            .is_ok());
+
+        // Truncate the trailing entry.
+        let mut entries = ledger.entries().expect("entries");
+        entries.truncate(1);
+        ledger.backend.replace_all(entries);
+
+        assert!(
+            ledger.verify().is_ok(),
+            "a valid prefix still verifies alone"
+        );
+        assert!(
+            ledger
+                .verify_against_head(trusted_len, &trusted_head)
+                .is_err(),
+            "verify_against_head must catch the truncated tail that verify() alone cannot"
+        );
     }
 
     #[test]
