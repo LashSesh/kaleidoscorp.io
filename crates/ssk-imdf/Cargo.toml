@@ -1,0 +1,23 @@
+[package]
+name = "ssk-imdf"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# The Immersive Mirror Dome Field layer (IMDF-0..2 seed): SelfAnchor (≠ Locator),
+# authorized ObserverModels, aperture-before-focus, birefringent split / parallax,
+# the QLOGIC gate, 4π-closure, and the hash-chained SelfPerceptionAtlas. Sits on
+# ssk-signature (the CanonicalTrafficSurface / spectrum substrate) and reuses the
+# Ω content-address / gate-outcome primitives from ssk-types. Pure, local,
+# read-only. See SYSTEM_ARCHITECTURE_CORRESPONDENCE.md (Block M).
+
+[dependencies]
+ssk-types = { path = "../ssk-types", version = "0.1.0" }
+ssk-signature = { path = "../ssk-signature", version = "0.1.0" }
+serde = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+
+[lints]
+workspace = true

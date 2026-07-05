@@ -15,6 +15,7 @@
 //! `ssk-tensor` would create — `ssk-gates` already depends on `ssk-core`, so
 //! the trait lives in the low crate and the implementation lives above it.
 
+use alloc::vec::Vec;
 use core::marker::PhantomData;
 use ssk_types::{FaultKind, GateOutcomeKind, GateReport, StitchCandidate, StitchId};
 

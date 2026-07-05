@@ -374,19 +374,26 @@ impl GateVector {
     }
 
     /// Evaluates every gate, always — the PDF's own pseudocode (ch. 11.2) has
-    /// no early `break`; resolution priority (Quarantine > Refine > Reject >
-    /// Pass) is applied only after the full loop, so a later gate's evidence
-    /// is never silently skipped by an earlier gate's failure.
+    /// no early `break`. Resolution priority is fail-closed and monotone:
+    /// `Quarantine > Reject > Refine/Hold > Pass` — a hard stop (Quarantine or
+    /// Reject) is never masked by a merely-recoverable Refine/Hold from another
+    /// gate, and `Refine`/`Hold` are kept as distinct outcomes rather than
+    /// folded together. Every non-pass gate's residue is retained in
+    /// `residues` regardless of which outcome wins the resolution (no silent
+    /// loss), not only the residue of the winning bucket.
     #[must_use]
     pub fn evaluate(&self, sc: &StitchCandidate) -> GateReport {
         let ctx = GateCtx;
         let mut witnesses = Vec::new();
-        let (mut refine, mut quarantine, mut reject) = (None, None, None);
+        let (mut hold, mut refine, mut quarantine, mut reject) = (None, None, None, None);
 
         for gate in &self.gates {
             match gate.evaluate(sc, &ctx) {
                 GateVerdict::Pass(w) => witnesses.push(w),
-                GateVerdict::Hold(r) | GateVerdict::Refine(r) => {
+                GateVerdict::Hold(r) => {
+                    hold.get_or_insert(r);
+                }
+                GateVerdict::Refine(r) => {
                     refine.get_or_insert(r);
                 }
                 GateVerdict::Quarantine(r) => {
@@ -398,15 +405,22 @@ impl GateVector {
             }
         }
 
-        let (outcome, residues) = if let Some(r) = quarantine {
-            (GateOutcomeKind::Quarantine, vec![r])
-        } else if let Some(r) = refine {
-            (GateOutcomeKind::Refine, vec![r])
-        } else if let Some(r) = reject {
-            (GateOutcomeKind::Reject, vec![r])
+        let outcome = if quarantine.is_some() {
+            GateOutcomeKind::Quarantine
+        } else if reject.is_some() {
+            GateOutcomeKind::Reject
+        } else if refine.is_some() {
+            GateOutcomeKind::Refine
+        } else if hold.is_some() {
+            GateOutcomeKind::Hold
         } else {
-            (GateOutcomeKind::Pass, Vec::new())
+            GateOutcomeKind::Pass
         };
+
+        let residues: Vec<BoundaryResidue> = [quarantine, reject, refine, hold]
+            .into_iter()
+            .flatten()
+            .collect();
 
         GateReport {
             id: GateReportId::new(format!("gate-report:{}", sc.id.0 .0)),
@@ -571,6 +585,76 @@ mod tests {
         sc.locator.risk_score = 60; // passes Locator (≤70) but fails Fiber (>50)
         let report = GateVector::with_all_default().evaluate(&sc);
         assert_eq!(report.outcome, GateOutcomeKind::Reject);
+    }
+
+    // Regression: a Reject must never be masked by a simultaneous Refine/Hold
+    // from another gate. risk_score=90 makes LocatorGate (>70) and FiberGate
+    // (>50) both Reject, while HypercubeGate's RiskProjector (ceiling 70) Holds
+    // on the same candidate — the resolution must still report Reject, and must
+    // not silently drop the Hold's residue.
+    #[test]
+    fn reject_is_never_masked_by_a_simultaneous_hold() {
+        let mut sc = candidate();
+        sc.locator.risk_score = 90;
+        let report = GateVector::with_all_default().evaluate(&sc);
+        assert_eq!(
+            report.outcome,
+            GateOutcomeKind::Reject,
+            "a hard Reject must win over a merely-recoverable Hold/Refine"
+        );
+        // No silent loss: the Hypercube Hold's residue is retained alongside the
+        // reject residues, not discarded because Reject won the resolution.
+        assert!(
+            report.residues.len() >= 2,
+            "residues from every non-pass gate must be retained, not only the winning outcome's: {:?}",
+            report.residues
+        );
+    }
+
+    // Monotonicity: a strictly riskier candidate must never resolve to a
+    // strictly less-severe outcome than a milder one. risk_score=60 already
+    // resolves to Reject (fiber-only failure); risk_score=90 adds a Hypercube
+    // Hold on top and must still resolve to Reject, not something milder.
+    #[test]
+    fn worsening_risk_never_produces_a_milder_outcome() {
+        let mut milder = candidate();
+        milder.locator.risk_score = 60;
+        let milder_outcome = GateVector::with_all_default().evaluate(&milder).outcome;
+
+        let mut worse = candidate();
+        worse.locator.risk_score = 90;
+        let worse_outcome = GateVector::with_all_default().evaluate(&worse).outcome;
+
+        assert_eq!(milder_outcome, GateOutcomeKind::Reject);
+        assert_eq!(
+            worse_outcome,
+            GateOutcomeKind::Reject,
+            "a strictly riskier candidate (90) must not resolve milder than a less risky one (60)"
+        );
+    }
+
+    // Hold and Refine are genuinely distinct outcomes: a GateVector containing
+    // only a gate that Holds must resolve to GateOutcomeKind::Hold, not be
+    // relabeled Refine.
+    #[test]
+    fn hypercube_hold_resolves_to_hold_not_refine() {
+        let mut sc = candidate();
+        sc.locator.risk_score = 71; // > RiskProjector's ceiling of 70 -> Hold
+        let verdict = HypercubeGate.evaluate(&sc, &GateCtx);
+        assert!(
+            matches!(verdict, GateVerdict::Hold(_)),
+            "RiskProjector over the ceiling must Hold: {verdict:?}"
+        );
+
+        let vector = GateVector {
+            gates: vec![Box::new(HypercubeGate) as Box<dyn Gate>],
+        };
+        let report = vector.evaluate(&sc);
+        assert_eq!(
+            report.outcome,
+            GateOutcomeKind::Hold,
+            "a Hold verdict must resolve to GateOutcomeKind::Hold, not be relabeled Refine"
+        );
     }
 
     /// A spy gate that always fails and counts its own invocations, used to

@@ -1,0 +1,24 @@
+[package]
+name = "ssk-service-host"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# SSCL Crown: the ServiceHost lifecycle controller and its PrivilegedHelper seam.
+# The controller is a pure, authorization-gated, audited state machine
+# (Uninstalled -> Installed -> Running -> Stopped) with a capability handshake and
+# rollback-on-uninstall. The actual privileged host (a system service / helper)
+# binds the PrivilegedHelper trait at the integration layer; tests inject a fake.
+# Fail-closed: no start without a completed handshake and every required
+# capability granted. Reuses the Omega Digest primitive and the ssk-signature
+# AuthorizationManifest.
+
+[dependencies]
+ssk-types = { path = "../ssk-types", version = "0.1.0" }
+ssk-signature = { path = "../ssk-signature", version = "0.1.0" }
+serde = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[lints]
+workspace = true

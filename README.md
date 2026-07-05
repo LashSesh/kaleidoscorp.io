@@ -36,13 +36,18 @@ ScorpioSync-Kaleidoscorp Ω (SSK Ω) is a deterministic, replay-verifiable runti
 - **Canonical wire format** — strict CBOR encoding with BLAKE3 content-addressing (SHA-256 compatibility available).
 - **Versioned interoperability** — explicit version/capability negotiation with strict decode guards.
 - **Production-grade CLI** — structured JSON output, unified exit-code taxonomy, and self-diagnostic tooling.
-- **In-process network administration** — policy-driven, cryptographically-audited traffic routing without third-party proxy software.
+- **In-process network administration** — policy-driven, cryptographically-audited (BLAKE3 hash-chained) traffic routing without third-party proxy software, with real Direct/SOCKS5/HTTP-CONNECT/TLS egress and DNS-override resolution (`ssk-netcore`) dispatched through the daemon (`sskd`).
+
+> **Honest maturity note.** The decision/audit/planning core (Intent→Orbit→Locator→BCIK→GateVector→Tensor→Focus→Replay) is real, deterministic, and heavily tested. Real network egress now exists (`ssk-netcore`) and is reachable via `ssk activate --dest host:port`, which the daemon dispatches through the real policy engine to a real adapter and holds open for as long as the profile stays `Protected`. What is **not yet** built: automatic traffic capture/classification of arbitrary local flows (`ssk-capture`), a desktop GUI, OS-level service integration (systemd/launchd units), and a system-wide kill-switch that blocks traffic at the network-stack level. See [`docs/OMEGA_CORE_CONFORMANCE_SPEC.md`](docs/OMEGA_CORE_CONFORMANCE_SPEC.md) for the rung-by-rung conformance status.
 
 ---
 
 ## Architecture
 
+Two distinct paths share this workspace, and the split is deliberate: the decision core stays deterministic and adapter-free; real network liveness lives only in the daemon/netcore layer below it.
+
 ```
+Deterministic core (ssk-runtime, no network I/O, no adapters):
 Intent → Orbit → Locator → BCIK → GateVector → Tensor → Focus → Replay
 ```
 
@@ -55,17 +60,25 @@ Intent → Orbit → Locator → BCIK → GateVector → Tensor → Focus → Re
 └──────────────────────┬──────────────────────────┘
                        │
          ┌─────────────▼────────────┐
-         │       ssk-netadmin       │  ← policy-driven traffic steering
-         │  Flow Intake → Policy    │
+         │       ssk-netadmin       │  ← policy-driven route *planning*
+         │  Flow Intake → Policy    │    (real, tested, adapter-free)
          │  Engine → Route Orchest. │
          │  Attestation → Audit     │
          └─────────────┬────────────┘
-                       │
-        ┌──────────────▼──────────────┐
-        │  Direct / SOCKS5 / HTTP     │
-        │  CONNECT / TLS / DNS        │
-        └─────────────────────────────┘
+                       │  RouteCandidate
+         ┌─────────────▼────────────┐
+         │        ssk-netcore       │  ← policy-planned route *execution*
+         │  RouteExecutor: real     │
+         │  Direct / SOCKS5 / HTTP  │
+         │  CONNECT / TLS / DNS     │
+         │  + real health probing   │
+         └─────────────┬────────────┘
+                       │  real socket
+                       ▼
+              (the actual destination)
 ```
+
+**User-reachable path**: `ssk activate --profile <p> --dest host:port` (`ssk-cli`) → real Unix-socket IPC → `sskd` (`ssk-daemon`) evaluates the real policy engine, plans a real route, and drives `ssk-netcore` to really connect. `Protected` is reported only after a real handshake succeeds; `FailClosed` is reported — with a real, typed reason — otherwise. `ssk deactivate` really tears the session down.
 
 **Observability path**: every run emits a structured event envelope carrying `run_id`, `replay_id`, `seeded`, and `epoch`. Local metrics counters (`run_count`, `gate_failures`, `replay_drifts`) accumulate without external dependencies.
 
@@ -96,8 +109,11 @@ See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the full diagram and modu
 | `ssk-interop` | Version/capability negotiation + strict canonical CBOR decode + signed attestation |
 | `ssk-runtime` | Run orchestration and deterministic observability events |
 | `ssk-sim` | Simulation harness |
-| `ssk-netadmin` | In-process network administration layer |
-| `ssk-cli` | Operator UX (`doctor`, `explain`, `--json`, config tooling, netadmin commands) |
+| `ssk-netadmin` | In-process network administration layer: policy-driven route **planning** (adapter-free, no network I/O) |
+| `ssk-netcore` | Real route **execution**: Direct/SOCKS5/HTTP-CONNECT/TLS egress, DNS-override resolution, health probing |
+| `ssk-ipc` | Unix-socket (Windows named-pipe path unverified) request/response protocol between `ssk-cli` and `sskd` |
+| `ssk-daemon` | `sskd` — the real local system service: state machine, policy-driven activation, real `ssk-netcore`-backed egress, persisted audit ledger |
+| `ssk-cli` | Operator UX (`doctor`, `explain`, `--json`, config tooling, `activate`/`deactivate`/`status`, netadmin commands) |
 
 > **`no_std` note**: `ssk-types` and `ssk-core` are `no_std`-friendly and verified in CI via `cargo check --no-default-features`.
 
@@ -196,8 +212,14 @@ ssk [--json] <command>
 | `net-admin flow-inspect` | Classify a flow and show policy decision + resolved route |
 | `net-admin route-trace` | Show full route plan including hop specs and adapter kinds |
 | `net-admin audit-dump` | Dump the forensic audit ledger; optionally verify hash chain |
+| `status` | Query the real daemon (`sskd`) state over its Unix-socket IPC |
+| `activate --profile <p> --dest <host:port>` | Ask `sskd` to really connect to `host:port` via the policy-decided route; `Protected` only on real success |
+| `deactivate` | Really tear down the live egress session and return to `Inactive` |
+| `list-profiles` | List profiles known to the daemon (currently one reference profile; a config-driven multi-profile model is future work) |
 
 Every error output includes a machine code, error class, exit code, and actionable next steps. Use `ssk explain <error>` for extended diagnostics.
+
+`status`/`activate`/`deactivate`/`list-profiles` require `sskd` to be running (`cargo run -p ssk-daemon --bin sskd`); they exit with a clear `IPC_CONNECT_FAILED`-class error otherwise, never a silent success.
 
 ---
 
@@ -258,37 +280,47 @@ See [`docs/INTEROP_SPEC.md`](docs/INTEROP_SPEC.md) and [`docs/COMPATIBILITY_MATR
 
 ## Network Administration Layer
 
-`ssk-netadmin` is the in-process replacement for external proxy software. It provides policy-driven, cryptographically-audited traffic steering controlled entirely through the SSK CLI and config system.
+`ssk-netadmin` + `ssk-netcore` together are the in-process replacement for external proxy software, controlled through `sskd` and the SSK CLI. The split is deliberate: `ssk-netadmin` **plans** (policy-driven, adapter-free, `no_std`-friendly); `ssk-netcore` **executes** (real sockets, real handshakes).
 
 ```
 ssk-runtime
     │
     ▼
 ┌─────────────────────────────────────────────────────┐
-│                    ssk-netadmin                     │
+│                    ssk-netadmin  (planning)         │
 │  Flow Intake ──► Policy Engine ──► Route Orchestr. │
 │       │               │                  │          │
 │       ▼               ▼                  ▼          │
-│  Attestation      Session Ledger    Data Plane      │
-│  Binder           (hash-chain)      Adapters        │
-│       │                                  │          │
+│  Attestation      Session Ledger    RouteCandidate  │
+│  Binder           (hash-chain)      (which adapter, │
+│       │                              which order)   │
 │       └──────── Audit Ledger ◄───────────┘          │
 │                  (hash-chain)                        │
-└─────────────────────────────────────────────────────┘
-    │               │              │
-    ▼               ▼              ▼
- Direct          SOCKS5      HTTP CONNECT / TLS / DNS
+└──────────────────────┬──────────────────────────────┘
+                       │  RouteCandidate
+                       ▼
+┌─────────────────────────────────────────────────────┐
+│                    ssk-netcore  (execution)         │
+│  RouteExecutor: real TCP connect, real SOCKS5/HTTP  │
+│  CONNECT handshake, real TLS handshake (OS trust    │
+│  store), real DNS query — chained per hop           │
+└──────────────────────┬──────────────────────────────┘
+                       │  real socket
+                       ▼
+              the real destination
 ```
 
 ### Data-plane adapters
 
-| Adapter | Protocol |
-|---------|---------|
-| `DirectAdapter` | Raw TCP |
-| `Socks5Adapter` | SOCKS5 |
-| `HttpConnectAdapter` | HTTP CONNECT tunnel |
-| `TlsTunnelAdapter` | TLS-wrapped tunnel with SNI override |
-| `DnsOverrideAdapter` | Split-horizon DNS resolution |
+| Adapter | Protocol | Real execution |
+|---------|---------|---------|
+| `DirectAdapter` | Raw TCP | `ssk-netcore::direct` — real `TcpStream::connect` |
+| `Socks5Adapter` | SOCKS5 | `ssk-netcore::socks5` — real RFC 1928/1929 client handshake |
+| `HttpConnectAdapter` | HTTP CONNECT tunnel | `ssk-netcore::http_connect` — real request/response handshake |
+| `TlsTunnelAdapter` | TLS-wrapped tunnel with SNI override | `ssk-netcore::tls` — real `rustls` handshake, OS-native trust store; mTLS client-cert wiring exists but has no config source yet |
+| `DnsOverrideAdapter` | Split-horizon DNS resolution | `ssk-netcore::dns` — real UDP/TCP DNS query against the configured resolver |
+
+`ssk-netadmin`'s adapter types remain descriptor-only by design (no network/async dependency, so the planning crate stays `no_std`-friendly); `ssk-netcore::RouteExecutor` is what actually dials out, given an `AdapterRegistry` mapping adapter ids to real transport config.
 
 ### Policy actions
 
@@ -299,6 +331,8 @@ ssk-runtime
 `Stable` · `Canary(percentage)` · `Shadow` · `Maintenance`
 
 Every traffic decision is BLAKE3 hash-chained into an immutable `AuditLedger`, enabling deterministic forensic replay of all routing decisions.
+
+**Not yet built**: automatic capture/classification of arbitrary local application traffic (that requires a separate, higher-privilege `ssk-capture` layer — OS-level traffic interception is a deliberately different, larger scope than adapter-level egress); true multi-hop proxy chaining beyond two hops is implemented but lightly exercised; a system-wide kill switch that blocks traffic at the OS network-stack level (today, "kill switch" tears down the one session the daemon holds — see `ssk-daemon`).
 
 See [`docs/NETADMIN_SPEC.md`](docs/NETADMIN_SPEC.md).
 

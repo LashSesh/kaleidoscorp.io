@@ -1,0 +1,30 @@
+[package]
+name = "ssk-crown"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# The SSCL System Surface Crown: the CrownSupervisor emission gate. It clamps the
+# whole stack together — signature gate, IMDF QLOGIC verdict, MetaResonance,
+# kill-switch state, open residue obligations — into a single fail-closed
+# emission decision, audited and replay-stable. See
+# SYSTEM_ARCHITECTURE_CORRESPONDENCE.md (SSCL Crown).
+
+[dependencies]
+ssk-types = { path = "../ssk-types", version = "0.1.0" }
+ssk-boundary = { path = "../ssk-boundary", version = "0.1.0" }
+ssk-meta-resonance = { path = "../ssk-meta-resonance", version = "0.1.0" }
+ssk-audit-store = { path = "../ssk-audit-store", version = "0.1.0" }
+serde = { workspace = true }
+ciborium = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+ssk-signature = { path = "../ssk-signature", version = "0.1.0" }
+ssk-imdf = { path = "../ssk-imdf", version = "0.1.0" }
+tempfile = { workspace = true }
+proptest = { workspace = true }
+
+[lints]
+workspace = true

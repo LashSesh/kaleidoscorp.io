@@ -1,0 +1,27 @@
+[package]
+name = "ssk-tfa"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# FCHL-MPK Band B: the Transduction / Field-Amplitude adapter (TFA). It turns the
+# FieldTensorSkin's dF observation signals into *bounded, gated, candidate-only*
+# actuation plans. It never silently amplifies (every clamp / deadband drop is a
+# recorded residue), never auto-passes a privileged effect, and only ever drives
+# an injected Effector for Pass-gated candidates. Pure and content-addressed;
+# reuses the Omega Digest / GateOutcomeKind / Residue primitives.
+
+[dependencies]
+ssk-types = { path = "../ssk-types", version = "0.1.0" }
+ssk-signature = { path = "../ssk-signature", version = "0.1.0" }
+ssk-field-tensor = { path = "../ssk-field-tensor", version = "0.1.0" }
+serde = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+ssk-capture = { path = "../ssk-capture", version = "0.1.0" }
+ssk-mpk = { path = "../ssk-mpk", version = "0.1.0" }
+proptest = { workspace = true }
+
+[lints]
+workspace = true

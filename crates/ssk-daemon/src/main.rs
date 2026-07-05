@@ -4,8 +4,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use ssk_daemon::config_load::load_daemon_config;
-use ssk_daemon::mock_dataplane::AlwaysUpMockDataPlane;
 use ssk_daemon::supervisor::Supervisor;
+use ssk_netadmin::adapter::{AdapterDescriptor, AdapterKind};
+use ssk_netcore::{AdapterRegistry, NetcoreDataPlane, RouteExecutor};
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() {
@@ -49,8 +50,23 @@ async fn main() {
         }
     }
 
+    // Real adapter registry matching `supervisor::reference_route_orchestrator`'s
+    // reference `socks5-exit` hop — the real dispatch counterpart to that
+    // reference route plan. A future config-driven profile model (Phase 5)
+    // will replace this with adapters sourced from validated config.
+    let mut registry = AdapterRegistry::new();
+    registry.register(AdapterDescriptor {
+        adapter_id: "socks5-exit".into(),
+        kind: AdapterKind::Socks5,
+        address: "proxy.corp.com".into(),
+        port: 1080,
+        metadata: vec![],
+    });
+    let executor = Arc::new(RouteExecutor::new(registry));
+    let data_plane = Box::new(NetcoreDataPlane::new(executor));
+
     let audit_path = dir.join("audit.json");
-    let supervisor = Arc::new(Supervisor::new(audit_path, Box::new(AlwaysUpMockDataPlane)));
+    let supervisor = Arc::new(Supervisor::new(audit_path, data_plane));
 
     let socket = ssk_ipc::paths::socket_path();
     tracing::info!(socket = %socket.display(), "sskd listening");

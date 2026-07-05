@@ -6,7 +6,7 @@ license.workspace = true
 
 [dependencies]
 serde.workspace = true
-ssk-types = { path = "../ssk-types" }
+ssk-types = { path = "../ssk-types", version = "0.1.0" }
 rand_pcg = "0.3"
 rand.workspace = true
 

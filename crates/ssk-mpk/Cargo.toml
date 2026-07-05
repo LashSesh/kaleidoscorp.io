@@ -1,0 +1,22 @@
+[package]
+name = "ssk-mpk"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# FCHL-MPK Band A: the deterministic finite-symmetry core over small (n<=8)
+# graph windows — Orbit / Canon / Stab / Spec / Complement / Catalog and the
+# Cospectral gate. Pure, content-addressed, replay-verifiable; reuses the Omega
+# Digest / GateOutcomeKind primitives. It is the projection plane the Band B
+# FieldTensorSkin sits on. See FCHL_MPK_INTEGRATION_STRATEGY.md.
+
+[dependencies]
+ssk-types = { path = "../ssk-types", version = "0.1.0" }
+serde = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }
+
+[lints]
+workspace = true

@@ -10,7 +10,7 @@ std = ["ssk-types/std"]
 
 [dependencies]
 serde.workspace = true
-ssk-types = { path = "../ssk-types", default-features = false }
+ssk-types = { path = "../ssk-types", version = "0.1.0", default-features = false }
 
 [dev-dependencies]
 proptest.workspace = true

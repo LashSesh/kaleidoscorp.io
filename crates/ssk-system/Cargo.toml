@@ -1,0 +1,32 @@
+[package]
+name = "ssk-system"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# The system composition layer: a SystemPipeline that wires the real SSK(Omega) /
+# FCHL-MPK / SSCL stack end to end — SystemTrafficField capture -> FieldTensorSkin
+# -> bounded transduction, MPK coupling, the signature gate, the IMDF QLOGIC gate,
+# the MetaResonance loop, ServiceHost health, and the fail-closed CrownSupervisor.
+# It is the integration seam where the pure crates' injected boundaries bind, and
+# where the cross-crate fail-closed priority is proven.
+
+[dependencies]
+ssk-types = { path = "../ssk-types", version = "0.1.0" }
+ssk-capture = { path = "../ssk-capture", version = "0.1.0" }
+ssk-signature = { path = "../ssk-signature", version = "0.1.0" }
+ssk-imdf = { path = "../ssk-imdf", version = "0.1.0" }
+ssk-mpk = { path = "../ssk-mpk", version = "0.1.0" }
+ssk-field-tensor = { path = "../ssk-field-tensor", version = "0.1.0" }
+ssk-tfa = { path = "../ssk-tfa", version = "0.1.0" }
+ssk-meta-resonance = { path = "../ssk-meta-resonance", version = "0.1.0" }
+ssk-boundary = { path = "../ssk-boundary", version = "0.1.0" }
+ssk-service-host = { path = "../ssk-service-host", version = "0.1.0" }
+ssk-crown = { path = "../ssk-crown", version = "0.1.0" }
+tracing = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }
+
+[lints]
+workspace = true

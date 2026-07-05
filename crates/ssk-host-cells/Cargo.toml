@@ -1,0 +1,21 @@
+[package]
+name = "ssk-host-cells"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# FCHL-MPK Band B: the HostCellPlane (Heavenly Hosts). Ephemeral, capability- and
+# scope-bound role cells with a logical TTL and explicit dissolution. A HostCell
+# is a transient role handle, never a public identity (HostCell != identity).
+# Pure and deterministic (logical time, no clock). See
+# FCHL_MPK_INTEGRATION_STRATEGY.md.
+
+[dependencies]
+ssk-types = { path = "../ssk-types", version = "0.1.0" }
+serde = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+
+[lints]
+workspace = true

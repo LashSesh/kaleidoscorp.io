@@ -1,0 +1,22 @@
+[package]
+name = "ssk-signature"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# Ported from the Chameleon Signature Kernel ("AlignAlign", v0.5), the seed
+# artifact of the SSK architecture. This crate is the spectral / signature
+# substrate the IMDF Mirror-Dome (SignatureLab / SelfPerceptionAtlas) sits on,
+# and the payload-neutral surface descriptor the SSCL CanonicalTrafficSurface
+# and FCHL field layer consume. See CHAMELEON_KERNEL_INTEGRATION_ASSESSMENT.md.
+
+[dependencies]
+ssk-types = { path = "../ssk-types", version = "0.1.0" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+
+[lints]
+workspace = true
