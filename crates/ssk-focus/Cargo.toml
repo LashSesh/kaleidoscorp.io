@@ -10,5 +10,8 @@ ssk-crypto = { path = "../ssk-crypto", version = "0.1.0" }
 ssk-privacy = { path = "../ssk-privacy", version = "0.1.0" }
 serde.workspace = true
 
+[dev-dependencies]
+serde_json.workspace = true
+
 [lints]
 workspace = true

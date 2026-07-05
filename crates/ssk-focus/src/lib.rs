@@ -6,7 +6,7 @@ use ssk_privacy::{ObservedSurface, SurfaceComponent, ThreatCtx};
 use ssk_types::{
     CoreId, CoreNode, Digest, FacetId, FiberType, LocatorId, ReplayReportRef, ResidueId, TraceId,
 };
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 
 /// Real backing check for `ssk-gates::FocusGate` — kept unchanged: a fast,
 /// structural gate-time check ("does this candidate's facet already belong
@@ -119,9 +119,14 @@ impl<'p> FocusEngine<'p> {
     /// Locator reuse across a session's responses is the observable
     /// correlation signal available at this layer (a `Response` carries no
     /// independent risk score of its own) — a locator seen `n` times
-    /// contributes `20 * (n - 1)` risk, capped at 100.
+    /// contributes `20 * (n - 1)` risk, capped at 100. A `BTreeMap` (not
+    /// `HashMap`) is used deliberately: its iteration order is the sorted key
+    /// order, so the resulting `components` list — and therefore the whole
+    /// `FocusReport`, which is `Serialize` + `PartialEq` and embedded in a
+    /// replay-compared `RunOutcome` — is a deterministic function of the
+    /// input, not of a per-process `HashMap` random seed.
     fn linkability_report(&self, responses: &[Response]) -> LinkabilityReport {
-        let mut counts: HashMap<LocatorId, u32> = HashMap::new();
+        let mut counts: BTreeMap<LocatorId, u32> = BTreeMap::new();
         for r in responses {
             *counts.entry(r.locator.clone()).or_insert(0) += 1;
         }
@@ -216,5 +221,50 @@ mod tests {
         let report = engine.reanalyze(&responses, &core(), &Policy);
         assert_eq!(report.verdict, FocusVerdict::ClassMismatch);
         assert!(!report.residues.is_empty());
+    }
+
+    // Regression: the linkability report's component order must be a
+    // deterministic function of the input, not of a HashMap's per-instance
+    // random seed. Several distinct, equally-reused locators make the
+    // nondeterminism observable if `counts` were ever a HashMap again — with
+    // enough distinct keys, two independently-built maps are near-certain to
+    // iterate in different orders.
+    #[test]
+    fn linkability_component_order_is_deterministic() {
+        let provider = Blake3HashProvider;
+        let engine = FocusEngine::new(&provider);
+        // Each of 5 distinct locators reused 5x: risk_score = 20*(5-1) = 80,
+        // clearing the >70 high-risk threshold, so all five show up in
+        // high_risk_components and their order is observable.
+        let locators = ["l_a", "l_b", "l_c", "l_d", "l_e"];
+        let responses: Vec<Response> = locators
+            .iter()
+            .flat_map(|loc| std::iter::repeat_n(response("f1", loc), 5))
+            .collect();
+
+        let a = engine.reanalyze(&responses, &core(), &Policy);
+        let b = engine.reanalyze(&responses, &core(), &Policy);
+
+        assert_eq!(
+            a.linkability, b.linkability,
+            "identical input must produce an identical (order-stable) linkability report"
+        );
+        assert_eq!(
+            serde_json::to_string(&a).unwrap(),
+            serde_json::to_string(&b).unwrap(),
+            "identical input must serialize identically across independent runs (replay)"
+        );
+        // Every locator was reused equally (2x), so all five are high-risk;
+        // their order must be the sorted LocatorId order, not insertion order.
+        assert_eq!(a.linkability.high_risk_components.len(), 5);
+        let ids: Vec<_> = a
+            .linkability
+            .high_risk_components
+            .iter()
+            .map(|c| c.locator.0 .0.clone())
+            .collect();
+        let mut sorted = ids.clone();
+        sorted.sort();
+        assert_eq!(ids, sorted, "components must be in sorted LocatorId order");
     }
 }
