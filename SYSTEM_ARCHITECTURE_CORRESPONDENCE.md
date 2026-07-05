@@ -26,13 +26,37 @@
 > - **`ssk-crown`** — the SSCL CrownSupervisor: the fail-closed emission gate that clamps
 >   signature gate + IMDF QLOGIC + kill-switch + MetaResonance + open obligations into one
 >   audited, replay-stable emission decision.
+> - **`ssk-profile-manifold`** — the SSCL ProfileManifold: content-addressed profiles with a
+>   substantive privacy-downgrade gate (transitions need control auth; downgrades need a
+>   second use), hash-chained audit of applied *and* rejected transitions.
+> - **`ssk-topology-scalpel`** — the FCHL-MPK Band B TopologyScalpel: candidate-only, gated,
+>   reversible topology-edit plans (never mutates a live topology; rollback-that-doesn't-
+>   restore → Reject; protected → Hold). 5 tests.
+> - **`ssk-tfa`** — the FCHL-MPK Band B Transduction / Field-Amplitude adapter: bounded,
+>   gated, candidate-only actuation from δF signals — no silent amplification (clamps and
+>   deadband drops are recorded residues), privileged effects never auto-pass, an injected
+>   Effector actuates only Pass candidates behind a hash-chained ledger. **Band B complete.**
+> - **`ssk-service-host`** — the SSCL Crown ServiceHost: a fail-closed, authorization-gated,
+>   audited lifecycle state machine (Uninstalled→Installed→Running→Stopped) with a capability
+>   handshake and rollback-on-uninstall, driving an injected PrivilegedHelper seam.
+> - **`ssk-delivery`** — the SSCL Crown DeliveryEnvelope: a content-addressed installable /
+>   upgradable / removable unit + a candidate-only, gated, reversible migration planner
+>   (minimal upgrade diff, exact rollback, protected-hold, reconstructible uninstall receipt).
+> - **`ssk-system`** — the end-to-end composition: a `SystemPipeline` wiring capture →
+>   field-tensor → transduction → signature gate → QLOGIC → MetaResonance → ServiceHost
+>   health → CrownSupervisor into one fail-closed, replay-stable evaluation. 5 cross-crate
+>   integration scenarios (each composing 10 real crates) prove the priority survives crate
+>   boundaries and that no subsystem can promote a decision.
 >
-> Whole workspace: **32 crates, 357 tests green**, `clippy -D warnings` clean, `cargo deny`
-> ok, `ssk-core` no_std intact. All four named capabilities are in. Remaining greenfield:
-> the rest of Band B (**TFA**, **TopologyScalpel**), the rest of the SSCL Crown
-> (**ProfileManifold**, **ServiceHost/PrivilegedHelper**, **DeliveryEnvelope/packaging**),
-> binding the pure seams to real privileged backends (OS capture, egress teardown), and the
-> top rungs (…-9) of each conformance ladder + productization (CI, release artifacts).
+> Whole workspace: **40 crates, 398 tests green**, `clippy -D warnings` clean, `cargo deny`
+> ok, `ssk-core` no_std intact. All four named capabilities are in. **Band B is complete**
+> (field-tensor, MPK, meta-resonance, host-cells, funnel-dag, topology-scalpel, TFA) and the
+> **SSCL Crown surface is in** (capture, boundary, profile-manifold, crown, service-host,
+> delivery), composed end to end in `ssk-system`. Remaining greenfield (honest): binding the
+> pure seams to **real privileged backends** (OS-level traffic capture, egress teardown, a
+> real system service / installer for `ServiceHost`/`PrivilegedHelper` and `DeliveryEnvelope`);
+> the **top rungs (…-9)** of each conformance ladder; and productization (signed release
+> artifacts, durable on-disk audit stores, packaging binaries rather than source).
 
 **Deliverable "A": the complete architecture correspondence across the whole normative corpus, mapped onto the existing `ssk-*` workspace.** This subsumes and extends `FCHL_MPK_INTEGRATION_STRATEGY.md` (which was FCHL-MPK-scoped) to all seven source documents, unifies their conformance ladders into one, and gives one integration sequence.
 
