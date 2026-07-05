@@ -287,8 +287,46 @@ impl TransductionField {
         }
 
         let raw = magnitude * self.config.responsivity;
-        let clamped = raw > self.config.envelope;
-        let amplitude = round6(raw.min(self.config.envelope));
+
+        // A non-finite computed amplitude (e.g. a NaN/infinite responsivity)
+        // is rejected outright, mirroring the invalid-magnitude path above —
+        // it is never silently coerced into a bounded value.
+        if !raw.is_finite() {
+            let actuation = Actuation {
+                kind,
+                amplitude: 0.0,
+                source_signal: signal.kind,
+                window: signal.window,
+                detail: format!("non-finite computed amplitude for {}", signal.kind.as_str()),
+            };
+            return Transduced::ActuationWithResidue(
+                GatedActuation {
+                    actuation,
+                    gate: GateOutcomeKind::Reject,
+                    gate_reason: "invalid_computed_amplitude".to_owned(),
+                },
+                Residue {
+                    surface: "transduction".to_owned(),
+                    severity: ResidueSeverity::High,
+                    message: format!(
+                        "rejected {} at window {}: responsivity produced a non-finite amplitude",
+                        signal.kind.as_str(),
+                        signal.window
+                    ),
+                },
+            );
+        }
+
+        // Bound to [0, envelope] on BOTH sides — a negative or zero
+        // responsivity must not slip a negative amplitude past the lower
+        // bound the same way an oversized one is capped at the upper bound.
+        // `.max(0.0).min(envelope)` (rather than `f64::clamp`, which panics if
+        // `envelope` were ever misconfigured negative) also normalizes a
+        // reachable -0.0 (deadband=0, magnitude=0, negative responsivity) to
+        // +0.0, keeping `to_bits()` — and so `plan_id` — replay-stable.
+        let bounded = raw.max(0.0).min(self.config.envelope);
+        let clamped = raw != bounded;
+        let amplitude = round6(bounded);
 
         let actuation = Actuation {
             kind,
@@ -307,7 +345,7 @@ impl TransductionField {
         } else if clamped {
             (
                 GateOutcomeKind::Hold,
-                "amplitude_clamped_to_envelope".to_owned(),
+                "amplitude_bounded_to_envelope".to_owned(),
             )
         } else {
             (GateOutcomeKind::Pass, "within_envelope".to_owned())
@@ -326,7 +364,7 @@ impl TransductionField {
                     surface: "transduction".to_owned(),
                     severity: ResidueSeverity::Medium,
                     message: format!(
-                        "clamped {} at window {}: raw {} -> envelope {} (no silent amplification)",
+                        "bounded {} at window {}: raw {} -> [0, {}] (no silent amplification, no negative amplitude)",
                         signal.kind.as_str(),
                         signal.window,
                         round6(raw),
@@ -745,7 +783,7 @@ mod tests {
         assert!(plan
             .residues
             .iter()
-            .any(|r| r.message.contains("clamped") && r.message.contains("route_change")));
+            .any(|r| r.message.contains("bounded") && r.message.contains("route_change")));
         // The tiny OS blip dropped below the deadband but is recorded, not lost.
         assert!(plan
             .residues
@@ -771,6 +809,45 @@ mod tests {
         assert_eq!(backoff.gate, GateOutcomeKind::Reject);
         assert_eq!(backoff.actuation.amplitude, 0.0);
         assert!(plan.residues.iter().any(|r| r.message.contains("rejected")));
+    }
+
+    // Regression: a negative (or zero) responsivity must never produce an
+    // amplitude outside [0, envelope]. Before the fix, only the upper bound
+    // was enforced (`raw.min(envelope)`), so a negative `raw` gated Pass with
+    // a negative amplitude — outside the documented [0, envelope] contract.
+    #[test]
+    fn negative_responsivity_is_bounded_not_passed_through() {
+        let cfg = TransductionConfig {
+            responsivity: -1.0,
+            envelope: 1.0,
+            deadband: 0.02,
+        };
+        let mut s = skin();
+        s = s.with_signal(DeltaSignalKind::RouteChange, 0.5, "route change", 1);
+        let plan = TransductionField::new(cfg).transduce(&s);
+
+        let reprobe = plan
+            .actuations
+            .iter()
+            .find(|g| g.actuation.kind == ActuationKind::Reprobe)
+            .unwrap();
+        assert_eq!(
+            reprobe.actuation.amplitude, 0.0,
+            "a negative computed amplitude must be bounded up to 0.0, not passed through negative"
+        );
+        assert!(
+            reprobe.actuation.amplitude >= 0.0,
+            "amplitude must never be negative"
+        );
+        assert_ne!(
+            reprobe.gate,
+            GateOutcomeKind::Pass,
+            "a bounded (out-of-range) amplitude must never auto-pass"
+        );
+        assert!(plan
+            .residues
+            .iter()
+            .any(|r| r.message.contains("bounded") && r.message.contains("route_change")));
     }
 
     #[test]
