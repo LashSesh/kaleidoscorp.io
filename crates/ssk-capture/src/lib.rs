@@ -5,9 +5,12 @@
 //! Observes traffic from a **pluggable local source** and canonicalizes each
 //! window into a [`CanonicalTrafficSurface`] (SSCL 5): a **payload-neutral**
 //! descriptor that keeps structure (method, status, header *names*, sizes,
-//! timing) and a replay-stable *digest* of the payload, but never the payload
-//! bytes or header values themselves. Every surface carries [`Provenance`]
-//! (source, mode, scope, sequence).
+//! timing, and a URL's scheme/host/port/path) and a replay-stable *digest* of
+//! the payload — but never the payload bytes, header values, or a URL's query
+//! string (redacted to a content-addressed marker by [`redact_url_query`]:
+//! query strings routinely carry access tokens, session ids, and other
+//! payload-equivalent secrets). Every surface carries [`Provenance`] (source,
+//! mode, scope, sequence).
 //!
 //! These surfaces are the input the rest of the system consumes:
 //! [`CanonicalTrafficSurface::to_surface_object`] yields an
@@ -128,9 +131,40 @@ pub struct CanonicalTrafficSurface {
     pub provenance: Provenance,
 }
 
+/// Redacts a URL's query string to a short content-addressed marker, keeping
+/// scheme/host/port/path intact. Query strings routinely carry access tokens,
+/// session ids, and other payload-equivalent secrets — exactly the class of
+/// value "payload-neutral" promises are stripped, but which (unlike header
+/// *values*, already dropped, and the body, already digest-only) the raw URL
+/// previously retained verbatim. Two different queries redact to different
+/// markers (so drift/linkability signals over the URL shape are preserved);
+/// the underlying secret is not recoverable from the marker.
+fn redact_url_query(url: &str) -> String {
+    let parsed = ssk_signature::urlparse(url);
+    let mut out = String::new();
+    if !parsed.scheme.is_empty() {
+        out.push_str(&parsed.scheme);
+        out.push_str("://");
+    }
+    out.push_str(&parsed.hostname);
+    if let Some(port) = parsed.port {
+        out.push(':');
+        out.push_str(&port.to_string());
+    }
+    out.push_str(&parsed.path);
+    if !parsed.query.is_empty() {
+        let digest =
+            digest_of(&parsed.query, HashAlg::Blake3).expect("query string is serializable");
+        out.push_str("?q=");
+        out.push_str(&digest.to_hex()[..16]);
+    }
+    out
+}
+
 impl CanonicalTrafficSurface {
-    /// Canonicalize a raw window: drop the payload bytes and header values,
-    /// keep the structure and a replay-stable payload digest.
+    /// Canonicalize a raw window: drop the payload bytes, header values, and
+    /// URL query string (see [`redact_url_query`]), keep the structure and a
+    /// replay-stable payload digest.
     #[must_use]
     pub fn from_window(window: &TrafficWindow, provenance: Provenance) -> Self {
         let payload_digest =
@@ -138,7 +172,7 @@ impl CanonicalTrafficSurface {
         CanonicalTrafficSurface {
             protocol: window.protocol.clone(),
             method: window.method.clone(),
-            url: window.url.clone(),
+            url: window.url.as_deref().map(redact_url_query),
             request_header_names: header_names(&window.request_headers),
             response_header_names: header_names(&window.response_headers),
             status: window.status,
@@ -359,6 +393,69 @@ mod tests {
         assert!(!surface_json.contains(SECRET_TOKEN));
         // But the payload is committed by digest for replay.
         assert_ne!(s.payload_digest, Digest::GENESIS);
+    }
+
+    // Regression: a URL query string is payload-equivalent (access tokens,
+    // session ids, PII) and must not survive into the surface verbatim, even
+    // though the raw URL was previously kept whole.
+    #[test]
+    fn url_query_string_is_redacted() {
+        const SECRET_QUERY: &str = "access_token=SECRET123&ssn=555-00-1234";
+        struct QueryLeakSource;
+        impl TrafficSource for QueryLeakSource {
+            fn source_id(&self) -> String {
+                "tap".to_owned()
+            }
+            fn windows(&self, _scope: &CaptureScope) -> Vec<TrafficWindow> {
+                let mut w = TrafficWindow::http("http");
+                w.method = Some("GET".to_owned());
+                w.url = Some(format!("https://example.local/callback?{SECRET_QUERY}"));
+                w.status = Some(200);
+                vec![w]
+            }
+        }
+
+        let f = SystemTrafficField::capture(
+            &QueryLeakSource,
+            &CaptureScope::new("local", ["lo0"]),
+            CaptureMode::PassiveLocal,
+        );
+        let s = &f.surfaces[0];
+        let url = s.url.as_deref().expect("url present");
+        // Scheme/host/path are kept for structural signal...
+        assert!(url.starts_with("https://example.local/callback"));
+        // ...but the secret query string itself never appears anywhere.
+        assert!(!url.contains(SECRET_QUERY));
+        assert!(!url.contains("SECRET123"));
+        assert!(!url.contains("555-00-1234"));
+        let json = serde_json::to_string(s).unwrap();
+        assert!(!json.contains("SECRET123"));
+        assert!(!json.contains("555-00-1234"));
+        let surface_json = format!("{:?}", s.to_surface_object());
+        assert!(!surface_json.contains("SECRET123"));
+        assert!(!surface_json.contains("555-00-1234"));
+
+        // A different query redacts to a different marker (structure/drift
+        // signal is preserved; it isn't just blanked to a constant).
+        struct OtherQuerySource;
+        impl TrafficSource for OtherQuerySource {
+            fn source_id(&self) -> String {
+                "tap".to_owned()
+            }
+            fn windows(&self, _scope: &CaptureScope) -> Vec<TrafficWindow> {
+                let mut w = TrafficWindow::http("http");
+                w.method = Some("GET".to_owned());
+                w.url = Some("https://example.local/callback?access_token=OTHER".to_owned());
+                w.status = Some(200);
+                vec![w]
+            }
+        }
+        let f2 = SystemTrafficField::capture(
+            &OtherQuerySource,
+            &CaptureScope::new("local", ["lo0"]),
+            CaptureMode::PassiveLocal,
+        );
+        assert_ne!(f.surfaces[0].url, f2.surfaces[0].url);
     }
 
     #[test]
