@@ -174,13 +174,21 @@ impl QLogicGate {
     /// Evaluate the six axes from typed evidence.
     #[must_use]
     pub fn evaluate(&self, input: &QLogicInput) -> QLogicVector {
-        let kappa = if input.coherence < self.thresholds.coherence_fail {
-            QOutcome::Fail
-        } else if input.coherence < self.thresholds.coherence_pass {
-            QOutcome::Hold
-        } else {
-            QOutcome::Pass
-        };
+        // Non-finite coherence (e.g. a 0/0 zero-aperture measurement) must fail
+        // conservatively, not fall through to Pass. `is_finite` is checked
+        // explicitly rather than relying on `<` alone: unlike H/Delta below
+        // (which test the *pass* side, so a NaN double-false falls to their
+        // final Fail arm), kappa tests the *fail* side first, and `NaN < x` is
+        // always false — a naive `< fail` / `< pass` chain would let NaN slip
+        // through both comparisons to the final `else` arm, which here is Pass.
+        let kappa =
+            if !input.coherence.is_finite() || input.coherence < self.thresholds.coherence_fail {
+                QOutcome::Fail
+            } else if input.coherence < self.thresholds.coherence_pass {
+                QOutcome::Hold
+            } else {
+                QOutcome::Pass
+            };
         // Entropy: within bound passes; up to twice the bound holds; beyond fails.
         let h = if input.entropy <= input.entropy_bound {
             QOutcome::Pass
@@ -277,5 +285,36 @@ mod tests {
         let vh = gate.evaluate(&held);
         assert_eq!(vh.verdict(), QOutcome::Hold);
         assert_eq!(vh.to_ssk(), GateOutcomeKind::Hold);
+    }
+
+    // Regression: non-finite coherence (e.g. 0/0 from a zero-aperture
+    // measurement) must fail the kappa axis, not bypass it to Pass. Before the
+    // fix, `NaN < fail` and `NaN < pass` were both false, falling through to
+    // the final `else` arm, which was Pass — the worst possible input ranked
+    // better than a merely-bad coherence of 0.0.
+    #[test]
+    fn non_finite_coherence_fails_kappa_not_bypasses_it() {
+        let gate = QLogicGate::default();
+
+        let mut nan_input = clean();
+        nan_input.coherence = f64::NAN;
+        let v_nan = gate.evaluate(&nan_input);
+        assert_eq!(
+            v_nan.kappa,
+            QOutcome::Fail,
+            "NaN coherence must fail the kappa axis"
+        );
+        assert_eq!(v_nan.verdict(), QOutcome::Fail);
+
+        // NaN must not rank better than an ordinary bad coherence value.
+        let mut zero_input = clean();
+        zero_input.coherence = 0.0;
+        let v_zero = gate.evaluate(&zero_input);
+        assert_eq!(v_zero.kappa, QOutcome::Fail);
+
+        let mut inf_input = clean();
+        inf_input.coherence = f64::NEG_INFINITY;
+        let v_inf = gate.evaluate(&inf_input);
+        assert_eq!(v_inf.kappa, QOutcome::Fail);
     }
 }
