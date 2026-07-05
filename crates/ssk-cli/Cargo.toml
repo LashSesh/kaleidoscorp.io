@@ -29,6 +29,12 @@ ssk-interop = { path = "../ssk-interop", version = "0.1.0", features = ["insecur
 ssk-netadmin = { path = "../ssk-netadmin", version = "0.1.0" }
 ssk-faultscan = { path = "../ssk-faultscan", version = "0.1.0" }
 ssk-ipc = { path = "../ssk-ipc", version = "0.1.0" }
+ssk-system = { path = "../ssk-system", version = "0.1.0" }
+ssk-capture = { path = "../ssk-capture", version = "0.1.0" }
+ssk-mpk = { path = "../ssk-mpk", version = "0.1.0" }
+ssk-service-host = { path = "../ssk-service-host", version = "0.1.0" }
+ssk-boundary = { path = "../ssk-boundary", version = "0.1.0" }
+ssk-crown = { path = "../ssk-crown", version = "0.1.0" }
 # Only "rt" + "net" + "macros": one-shot current-thread runtime for the new
 # daemon-backed commands (status/activate/deactivate/list-profiles). `run` /
 # `replay-verify` / `doctor` / etc. remain fully synchronous and local.

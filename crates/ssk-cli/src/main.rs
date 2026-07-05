@@ -2,10 +2,14 @@
 
 use clap::{Parser, Subcommand};
 use serde::Serialize;
+use ssk_boundary::KillSwitchState;
+use ssk_capture::{CaptureMode, CaptureScope, SystemTrafficField, TrafficSource, TrafficWindow};
+use ssk_crown::EmissionDecision;
 use ssk_faultscan::{run_playbook, ChaosFaultKind};
 use ssk_gates::GateVector;
 use ssk_interop::{Blake3KeyedVerifier, CompatibilityPolicy, ConformanceSuite};
 use ssk_locator::StaticLocatorPool;
+use ssk_mpk::Graph;
 use ssk_netadmin::{
     audit::{AuditLedger, AuditOutcome},
     flow::{FlowDescriptor, FlowRecord, ProtocolKind, RiskLevel},
@@ -15,6 +19,8 @@ use ssk_netadmin::{
 };
 use ssk_replay::{DeterministicReplayEngine, ReplayEngine};
 use ssk_runtime::{sample_intent, DeterminismContext, Runtime, RuntimeEvent, RuntimeMetrics};
+use ssk_service_host::ServiceHealth;
+use ssk_system::{SystemInputs, SystemPipeline};
 use ssk_tensor::{FileLedgerBackend, LedgerBackend, MemoryBackend};
 use ssk_types::{GateId, GateOutcomeKind, LocatorId, ReplayVerdict};
 use std::io::Read;
@@ -114,6 +120,36 @@ enum Command {
     },
     /// List profiles known to the daemon.
     ListProfiles,
+    /// Run the SSCL Crown SystemPipeline (capture -> field-tensor ->
+    /// transduction -> signature gate -> QLOGIC -> MetaResonance ->
+    /// ServiceHost health -> CrownSupervisor) over a deterministic fixture and
+    /// print the fail-closed verdict. This is the library stack
+    /// (`ssk-system`) made runnable, not a new decision path.
+    System {
+        #[command(subcommand)]
+        command: SystemCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum SystemCommand {
+    /// Evaluate one fixture through the pipeline and print the verdict.
+    Run {
+        /// Which built-in fixture to capture: "clean" (no sensitive surface)
+        /// or "sensitive" (carries an Authorization header, so the signature
+        /// gate holds and no privileged effect auto-passes).
+        #[arg(long, default_value = "clean")]
+        fixture: String,
+        /// Simulate the session kill-switch being engaged.
+        #[arg(long, default_value_t = false)]
+        engage_kill_switch: bool,
+        /// Simulate this many open residue/boundary obligations.
+        #[arg(long, default_value_t = 0)]
+        open_obligations: usize,
+        /// Simulate the privileged ServiceHost being unhealthy (degraded).
+        #[arg(long, default_value_t = false)]
+        host_unhealthy: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -195,6 +231,10 @@ enum ErrorClass {
     Interop,
     Chaos,
     NetAdmin,
+    /// The SSCL Crown SystemPipeline denied emission (`EmissionDecision::Deny`)
+    /// — a fail-closed verdict, not a tool malfunction, but still a non-zero
+    /// exit so the decision is observable in `$?`/scripts.
+    System,
 }
 
 impl ErrorClass {
@@ -210,6 +250,7 @@ impl ErrorClass {
             Self::Interop => 17,
             Self::Chaos => 18,
             Self::NetAdmin => 19,
+            Self::System => 20,
         }
     }
 }
@@ -355,6 +396,7 @@ fn run(cli: &Cli) -> Result<(), AppError> {
             release_kill_switch,
         } => deactivate_command(*release_kill_switch, cli.json),
         Command::ListProfiles => list_profiles_command(cli.json),
+        Command::System { command } => system_command(command, cli.json),
     }
 }
 
@@ -443,6 +485,147 @@ fn list_profiles_command(json: bool) -> Result<(), AppError> {
         ssk_ipc::Response::Err(err) => Err(AppError::from(err)),
         other => Err(unexpected_response(&other)),
     }
+}
+
+/// A deterministic in-process fixture for `ssk system run`. This CLI has no OS-
+/// level capture privilege (and needs none to demonstrate the pipeline): it
+/// yields the same shape of synthetic-but-realistic windows the `ssk-system`
+/// test doubles (`CleanSource`/`DriftingSource`) use — a clean GET, plus (when
+/// `sensitive`) a second POST carrying an `Authorization` header.
+struct CliFixtureSource {
+    sensitive: bool,
+}
+
+impl TrafficSource for CliFixtureSource {
+    fn source_id(&self) -> String {
+        "ssk-cli-fixture".to_owned()
+    }
+
+    fn windows(&self, _scope: &CaptureScope) -> Vec<TrafficWindow> {
+        let mut clean = TrafficWindow::http("http");
+        clean.method = Some("GET".to_owned());
+        clean.url = Some("https://example.local/health".to_owned());
+        clean.status = Some(200);
+        clean.response_headers = vec![("Content-Type".to_owned(), "application/json".to_owned())];
+        clean.payload = b"{}".to_vec();
+
+        if !self.sensitive {
+            return vec![clean];
+        }
+
+        let mut sensitive = TrafficWindow::http("http");
+        sensitive.method = Some("POST".to_owned());
+        sensitive.url = Some("https://example.local/login".to_owned());
+        sensitive.status = Some(401);
+        sensitive.request_headers = vec![("Authorization".to_owned(), "Bearer secret".to_owned())];
+        sensitive.response_headers =
+            vec![("Content-Type".to_owned(), "application/json".to_owned())];
+        sensitive.payload = b"{\"user\":\"x\"}".to_vec();
+
+        vec![clean, sensitive]
+    }
+}
+
+fn system_command(command: &SystemCommand, json: bool) -> Result<(), AppError> {
+    let SystemCommand::Run {
+        fixture,
+        engage_kill_switch,
+        open_obligations,
+        host_unhealthy,
+    } = command;
+
+    let sensitive = match fixture.as_str() {
+        "clean" => false,
+        "sensitive" => true,
+        other => {
+            return Err(AppError::new(
+                ErrorClass::Usage,
+                "INVALID_FIXTURE",
+                format!("`{other}` is not a known fixture"),
+                vec!["Pass --fixture clean or --fixture sensitive.".into()],
+            ))
+        }
+    };
+
+    let source = CliFixtureSource { sensitive };
+    let scope = CaptureScope::new("local", ["lo0"]);
+    let traffic = SystemTrafficField::capture(&source, &scope, CaptureMode::PassiveLocal);
+
+    let windows = [Graph::from_edges(3, &[(0, 1), (1, 2)]).map_err(|e| {
+        AppError::new(
+            ErrorClass::Runtime,
+            "MPK_WINDOW_BUILD_FAILED",
+            e.to_string(),
+            vec![],
+        )
+    })?];
+
+    let inputs = SystemInputs {
+        traffic: &traffic,
+        windows: &windows,
+        host_health: if *host_unhealthy {
+            ServiceHealth::Degraded
+        } else {
+            ServiceHealth::Healthy
+        },
+        kill_switch: if *engage_kill_switch {
+            KillSwitchState::Engaged
+        } else {
+            KillSwitchState::Armed
+        },
+        open_obligations: *open_obligations,
+        parallax_consistent: true,
+        replay_equal: true,
+    };
+
+    let mut pipeline = SystemPipeline::new();
+    let verdict = pipeline.evaluate(&inputs);
+    let ledger_ok = pipeline.verify_ledger();
+
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "status": "ok",
+                "decision": verdict.decision.as_str(),
+                "reasons": verdict.reasons,
+                "signature_gate": verdict.signature_gate,
+                "qlogic_gate": verdict.qlogic_gate,
+                "resonance_action": verdict.resonance_action,
+                "host_downgraded": verdict.host_downgraded,
+                "field_digest": verdict.field_digest.to_hex(),
+                "crown_head": pipeline.crown_head().to_hex(),
+                "ledger_ok": ledger_ok,
+            }))
+            .map_err(|e| AppError::new(
+                ErrorClass::Runtime,
+                "JSON_OUTPUT_FAILED",
+                e.to_string(),
+                vec![]
+            ))?
+        );
+    } else {
+        println!("decision: {}", verdict.decision.as_str());
+        println!("reasons: {:?}", verdict.reasons);
+        println!("signature_gate: {:?}", verdict.signature_gate);
+        println!("qlogic_gate: {:?}", verdict.qlogic_gate);
+        println!("resonance_action: {:?}", verdict.resonance_action);
+        println!("host_downgraded: {}", verdict.host_downgraded);
+        println!("field_digest: {}", verdict.field_digest.to_hex());
+        println!("crown_head: {}", pipeline.crown_head().to_hex());
+        println!("ledger_ok: {ledger_ok}");
+    }
+
+    if verdict.decision == EmissionDecision::Deny {
+        return Err(AppError::new(
+            ErrorClass::System,
+            "EMISSION_DENIED",
+            "the SystemPipeline denied emission (fail-closed)",
+            vec!["Inspect the printed `reasons` for the contributing gate(s).".into()],
+        ));
+    }
+
+    Ok(())
 }
 
 fn print_status(status: &ssk_ipc::StatusDto, json: bool) -> Result<(), AppError> {
