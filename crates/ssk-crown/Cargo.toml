@@ -24,6 +24,7 @@ tracing = { workspace = true }
 ssk-signature = { path = "../ssk-signature", version = "0.1.0" }
 ssk-imdf = { path = "../ssk-imdf", version = "0.1.0" }
 tempfile = { workspace = true }
+proptest = { workspace = true }
 
 [lints]
 workspace = true

@@ -598,4 +598,73 @@ mod tests {
         tampered.ledger[0].event.actor = "someone-else".to_owned();
         assert!(!tampered.verify_audit());
     }
+
+    // --- Ledger tamper-depth (property-based) -------------------------------
+
+    mod ledger_tamper_properties {
+        use super::*;
+        use proptest::prelude::*;
+
+        // 0 = engage, 1 = release, 2 = override_engage.
+        fn ops_strategy() -> impl Strategy<Value = Vec<u8>> {
+            proptest::collection::vec(0u8..3, 1..12)
+        }
+
+        proptest! {
+            #![proptest_config(ProptestConfig::with_cases(300))]
+
+            // Whatever sequence of engage/release/override_engage produced the
+            // ledger, mutating any single field of any single entry -- not
+            // just the most recent one -- must always be caught by
+            // `verify_audit`, proving tamper-detection has no blind depth into
+            // the chain's history (mirrors the same property proven for
+            // ssk-crown's emission ledger).
+            #[test]
+            fn mid_chain_tamper_is_always_caught(
+                ops in ops_strategy(),
+                tamper_index in 0usize..12,
+                tamper_field in 0u8..4,
+            ) {
+                let mut ks = switch();
+                let enforcer = FakeEnforcer::new();
+                for op in ops {
+                    match op {
+                        0 => {
+                            let _ = ks.engage(&control_auth(), &enforcer);
+                        }
+                        1 => {
+                            let _ = ks.release(&control_auth(), &enforcer);
+                        }
+                        _ => {
+                            let _ = ks.override_engage(&override_auth(), "prop", &enforcer);
+                        }
+                    }
+                }
+                prop_assume!(!ks.audit_entries().is_empty());
+                prop_assert!(ks.verify_audit());
+
+                let index = tamper_index % ks.audit_entries().len();
+                let mut tampered = ks.clone();
+                match tamper_field % 4 {
+                    0 => tampered.ledger[index].seq = tampered.ledger[index].seq.wrapping_add(1),
+                    1 => tampered.ledger[index].prev_hash = Digest::GENESIS,
+                    2 => {
+                        tampered.ledger[index].event.actor =
+                            format!("{}-tampered", tampered.ledger[index].event.actor);
+                    }
+                    _ => tampered.ledger[index].entry_hash = Digest::GENESIS,
+                }
+                // A mutation that happens to reproduce the exact original
+                // bytes (e.g. prev_hash was already GENESIS) is not a real
+                // tamper.
+                if tampered.ledger[index] == ks.ledger[index] {
+                    return Ok(());
+                }
+                prop_assert!(
+                    !tampered.verify_audit(),
+                    "tampering entry {index} field-group {tamper_field} went undetected"
+                );
+            }
+        }
+    }
 }

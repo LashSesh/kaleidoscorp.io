@@ -25,5 +25,8 @@ ssk-service-host = { path = "../ssk-service-host", version = "0.1.0" }
 ssk-crown = { path = "../ssk-crown", version = "0.1.0" }
 tracing = { workspace = true }
 
+[dev-dependencies]
+proptest = { workspace = true }
+
 [lints]
 workspace = true

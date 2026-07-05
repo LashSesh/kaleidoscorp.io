@@ -615,4 +615,364 @@ mod tests {
         assert_eq!(crown.ledger().len(), 1);
         assert!(crown.verify_ledger());
     }
+
+    // --- Exhaustive fail-closed cascade ------------------------------------
+    //
+    // `evaluate`'s decision is a sequential if/else priority chain over a
+    // small finite input space (2 gates x 5 outcomes, kill-switch x 3 states,
+    // resonance x 3 actions, obligations bucketed to {0, >0}: 450 combinations
+    // total). Small enough to enumerate exactly, which lets these tests prove
+    // something the worked examples above cannot: that the *whole* space is
+    // covered correctly, not just the handful of cases someone thought to
+    // write down.
+
+    fn all_gate_outcomes() -> [GateOutcomeKind; 5] {
+        [
+            GateOutcomeKind::Pass,
+            GateOutcomeKind::Hold,
+            GateOutcomeKind::Refine,
+            GateOutcomeKind::Reject,
+            GateOutcomeKind::Quarantine,
+        ]
+    }
+
+    fn all_kill_switch_states() -> [KillSwitchState; 3] {
+        [
+            KillSwitchState::Armed,
+            KillSwitchState::Released,
+            KillSwitchState::Engaged,
+        ]
+    }
+
+    fn all_resonance_actions() -> [ResonanceAction; 3] {
+        [
+            ResonanceAction::Stabilize,
+            ResonanceAction::Delay,
+            ResonanceAction::Hold,
+        ]
+    }
+
+    /// 0 = clean, 1 = hold-class, 2 = hard-stop-class -- the three classes
+    /// `is_hold`/`is_hard_stop` actually distinguish; `Hold`/`Refine` are
+    /// equally bad, as are `Reject`/`Quarantine`.
+    fn gate_rank(g: GateOutcomeKind) -> u8 {
+        if is_hard_stop(g) {
+            2
+        } else if is_hold(g) {
+            1
+        } else {
+            0
+        }
+    }
+
+    fn decision_rank(d: EmissionDecision) -> u8 {
+        match d {
+            EmissionDecision::Emit => 0,
+            EmissionDecision::Hold => 1,
+            EmissionDecision::Deny => 2,
+        }
+    }
+
+    fn resonance_of(action: ResonanceAction) -> ResonanceResponse {
+        ResonanceResponse {
+            action,
+            adjustment: 0.0,
+            measured_drift: 0.0,
+        }
+    }
+
+    fn decide(
+        signature_gate: GateOutcomeKind,
+        qlogic_gate: GateOutcomeKind,
+        kill_switch: KillSwitchState,
+        resonance_action: ResonanceAction,
+        open_obligations: usize,
+    ) -> EmissionDecision {
+        CrownSupervisor::new()
+            .evaluate(&EmissionInputs {
+                signature_gate,
+                qlogic_gate,
+                kill_switch,
+                resonance: resonance_of(resonance_action),
+                open_obligations,
+            })
+            .decision
+    }
+
+    /// An oracle formulated independently of `evaluate`'s sequential if/else
+    /// chain: an OR-composition of every deny condition, then every hold
+    /// condition. Agreement between this and the real implementation across
+    /// the whole space proves the sequential ordering never lets an earlier,
+    /// weaker branch mask a later, stronger one -- exactly the class of bug
+    /// already found and fixed in `ssk-gates`' resolution order.
+    fn oracle_decision(
+        signature_gate: GateOutcomeKind,
+        qlogic_gate: GateOutcomeKind,
+        kill_switch: KillSwitchState,
+        resonance_action: ResonanceAction,
+        open_obligations: usize,
+    ) -> EmissionDecision {
+        let deny = kill_switch == KillSwitchState::Engaged
+            || gate_rank(signature_gate) == 2
+            || gate_rank(qlogic_gate) == 2;
+        if deny {
+            return EmissionDecision::Deny;
+        }
+        let hold = open_obligations > 0
+            || gate_rank(signature_gate) == 1
+            || gate_rank(qlogic_gate) == 1
+            || resonance_action != ResonanceAction::Stabilize;
+        if hold {
+            EmissionDecision::Hold
+        } else {
+            EmissionDecision::Emit
+        }
+    }
+
+    #[test]
+    fn exhaustive_fail_closed_cascade_matches_an_independent_oracle() {
+        let mut checked = 0usize;
+        for &signature_gate in &all_gate_outcomes() {
+            for &qlogic_gate in &all_gate_outcomes() {
+                for &kill_switch in &all_kill_switch_states() {
+                    for &resonance_action in &all_resonance_actions() {
+                        for &open_obligations in &[0usize, 1usize] {
+                            let actual = decide(
+                                signature_gate,
+                                qlogic_gate,
+                                kill_switch,
+                                resonance_action,
+                                open_obligations,
+                            );
+                            let expected = oracle_decision(
+                                signature_gate,
+                                qlogic_gate,
+                                kill_switch,
+                                resonance_action,
+                                open_obligations,
+                            );
+                            assert_eq!(
+                                actual, expected,
+                                "sig={signature_gate:?} qlogic={qlogic_gate:?} \
+                                 kill_switch={kill_switch:?} resonance={resonance_action:?} \
+                                 obligations={open_obligations}"
+                            );
+                            checked += 1;
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(checked, 5 * 5 * 3 * 3 * 2);
+    }
+
+    /// Every entry of the finite input space, classified once by
+    /// `is_hard_stop`/`is_hold`, falls into exactly one of the three classes
+    /// -- the classification is total and the classes never overlap.
+    #[test]
+    fn gate_classification_is_total_and_disjoint() {
+        for &g in &all_gate_outcomes() {
+            let classes = [is_hard_stop(g), is_hold(g), !is_hard_stop(g) && !is_hold(g)];
+            assert_eq!(
+                classes.iter().filter(|c| **c).count(),
+                1,
+                "{g:?} must land in exactly one of {{hard_stop, hold, clean}}"
+            );
+        }
+    }
+
+    /// No subsystem may *promote* a decision: worsening any single axis,
+    /// holding every other axis fixed, must never lower the resulting
+    /// decision's rank (Emit < Hold < Deny). Checked over the entire space,
+    /// not sampled.
+    #[test]
+    fn exhaustive_worsening_never_lowers_the_decision() {
+        let gates = all_gate_outcomes();
+        let obligations = [0usize, 1usize, 2usize];
+
+        for &signature_gate in &gates {
+            for &qlogic_gate in &gates {
+                for &kill_switch in &all_kill_switch_states() {
+                    for &resonance_action in &all_resonance_actions() {
+                        for &open_obligations in &obligations {
+                            let base_rank = decision_rank(decide(
+                                signature_gate,
+                                qlogic_gate,
+                                kill_switch,
+                                resonance_action,
+                                open_obligations,
+                            ));
+
+                            for &worse_sig in &gates {
+                                if gate_rank(worse_sig) > gate_rank(signature_gate) {
+                                    let worse_rank = decision_rank(decide(
+                                        worse_sig,
+                                        qlogic_gate,
+                                        kill_switch,
+                                        resonance_action,
+                                        open_obligations,
+                                    ));
+                                    assert!(
+                                        worse_rank >= base_rank,
+                                        "worsening signature_gate {signature_gate:?}->{worse_sig:?} lowered the decision"
+                                    );
+                                }
+                            }
+                            for &worse_qlogic in &gates {
+                                if gate_rank(worse_qlogic) > gate_rank(qlogic_gate) {
+                                    let worse_rank = decision_rank(decide(
+                                        signature_gate,
+                                        worse_qlogic,
+                                        kill_switch,
+                                        resonance_action,
+                                        open_obligations,
+                                    ));
+                                    assert!(
+                                        worse_rank >= base_rank,
+                                        "worsening qlogic_gate {qlogic_gate:?}->{worse_qlogic:?} lowered the decision"
+                                    );
+                                }
+                            }
+                            if kill_switch != KillSwitchState::Engaged {
+                                let worse_rank = decision_rank(decide(
+                                    signature_gate,
+                                    qlogic_gate,
+                                    KillSwitchState::Engaged,
+                                    resonance_action,
+                                    open_obligations,
+                                ));
+                                assert!(
+                                    worse_rank >= base_rank,
+                                    "engaging the kill-switch lowered the decision"
+                                );
+                            }
+                            if resonance_action == ResonanceAction::Stabilize {
+                                for &worse_res in &[ResonanceAction::Delay, ResonanceAction::Hold] {
+                                    let worse_rank = decision_rank(decide(
+                                        signature_gate,
+                                        qlogic_gate,
+                                        kill_switch,
+                                        worse_res,
+                                        open_obligations,
+                                    ));
+                                    assert!(
+                                        worse_rank >= base_rank,
+                                        "worsening resonance {resonance_action:?}->{worse_res:?} lowered the decision"
+                                    );
+                                }
+                            }
+                            let worse_rank = decision_rank(decide(
+                                signature_gate,
+                                qlogic_gate,
+                                kill_switch,
+                                resonance_action,
+                                open_obligations + 1,
+                            ));
+                            assert!(
+                                worse_rank >= base_rank,
+                                "adding an open obligation lowered the decision"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // --- Ledger tamper-depth (property-based) -------------------------------
+
+    mod ledger_tamper_properties {
+        use super::*;
+        use proptest::prelude::*;
+
+        fn gate_strategy() -> impl Strategy<Value = GateOutcomeKind> {
+            prop_oneof![
+                Just(GateOutcomeKind::Pass),
+                Just(GateOutcomeKind::Hold),
+                Just(GateOutcomeKind::Refine),
+                Just(GateOutcomeKind::Reject),
+                Just(GateOutcomeKind::Quarantine),
+            ]
+        }
+
+        fn kill_switch_strategy() -> impl Strategy<Value = KillSwitchState> {
+            prop_oneof![
+                Just(KillSwitchState::Armed),
+                Just(KillSwitchState::Released),
+                Just(KillSwitchState::Engaged),
+            ]
+        }
+
+        fn resonance_action_strategy() -> impl Strategy<Value = ResonanceAction> {
+            prop_oneof![
+                Just(ResonanceAction::Stabilize),
+                Just(ResonanceAction::Delay),
+                Just(ResonanceAction::Hold),
+            ]
+        }
+
+        fn inputs_strategy() -> impl Strategy<Value = EmissionInputs> {
+            (
+                gate_strategy(),
+                gate_strategy(),
+                kill_switch_strategy(),
+                resonance_action_strategy(),
+                0usize..3,
+            )
+                .prop_map(
+                    |(signature_gate, qlogic_gate, kill_switch, action, open_obligations)| {
+                        EmissionInputs {
+                            signature_gate,
+                            qlogic_gate,
+                            kill_switch,
+                            resonance: resonance_of(action),
+                            open_obligations,
+                        }
+                    },
+                )
+        }
+
+        proptest! {
+            #![proptest_config(ProptestConfig::with_cases(300))]
+
+            // A ledger built from any sequence of evaluations verifies; mutating
+            // any single field of any single entry -- not just the most recent
+            // one -- must always be caught, proving tamper-detection has no
+            // blind depth into the chain's history.
+            #[test]
+            fn mid_chain_tamper_is_always_caught(
+                steps in proptest::collection::vec(inputs_strategy(), 1..12),
+                tamper_index in 0usize..12,
+                tamper_field in 0u8..5,
+            ) {
+                let mut crown = CrownSupervisor::new();
+                for step in &steps {
+                    crown.evaluate(step);
+                }
+                prop_assert!(crown.verify_ledger());
+
+                let index = tamper_index % steps.len();
+                let mut tampered = crown.clone();
+                match tamper_field % 5 {
+                    0 => tampered.ledger[index].seq = tampered.ledger[index].seq.wrapping_add(1),
+                    1 => tampered.ledger[index].prev_hash = Digest::GENESIS,
+                    2 => {
+                        tampered.ledger[index].decision =
+                            format!("{}-tampered", tampered.ledger[index].decision);
+                    }
+                    3 => tampered.ledger[index].reasons.push("injected".to_owned()),
+                    _ => tampered.ledger[index].entry_hash = Digest::GENESIS,
+                }
+                // A mutation that happens to reproduce the exact original bytes
+                // (e.g. prev_hash was already GENESIS) is not a real tamper.
+                if tampered.ledger[index] == crown.ledger[index] {
+                    return Ok(());
+                }
+                prop_assert!(
+                    !tampered.verify_ledger(),
+                    "tampering entry {index} field-group {tamper_field} went undetected"
+                );
+            }
+        }
+    }
 }
