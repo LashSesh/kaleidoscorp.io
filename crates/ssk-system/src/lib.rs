@@ -387,6 +387,66 @@ mod tests {
         assert!(executor.verify_ledger());
     }
 
+    // A window that leaks a session cookie and a client IP, but never carries an
+    // Authorization header. Regression for the silent-loss bug where the
+    // field-tensor only detected `has_authorization`: a cookie/IP leak must hold
+    // the whole stack end to end exactly like an authorization leak does.
+    struct CookieLeakSource;
+    impl TrafficSource for CookieLeakSource {
+        fn source_id(&self) -> String {
+            "tap".to_owned()
+        }
+        fn windows(&self, _scope: &CaptureScope) -> Vec<TrafficWindow> {
+            let mut clean = TrafficWindow::http("http");
+            clean.method = Some("GET".to_owned());
+            clean.url = Some("https://example.local/a".to_owned());
+            clean.status = Some(200);
+            clean.response_headers =
+                vec![("Content-Type".to_owned(), "application/json".to_owned())];
+            clean.payload = b"{}".to_vec();
+
+            let mut leaking = TrafficWindow::http("http");
+            leaking.method = Some("GET".to_owned());
+            leaking.url = Some("https://example.local/profile".to_owned());
+            leaking.status = Some(200);
+            leaking.request_headers = vec![
+                ("Cookie".to_owned(), "session=abc123".to_owned()),
+                ("X-Forwarded-For".to_owned(), "203.0.113.7".to_owned()),
+            ];
+            leaking.response_headers =
+                vec![("Content-Type".to_owned(), "application/json".to_owned())];
+            leaking.payload = b"{}".to_vec();
+
+            vec![clean, leaking]
+        }
+    }
+
+    #[test]
+    fn cookie_leak_holds_end_to_end_without_an_authorization_header() {
+        let traffic = field(&CookieLeakSource);
+        let ws = windows();
+        let mut pipeline = SystemPipeline::new();
+        let verdict = pipeline.evaluate(&clean_inputs(&traffic, &ws));
+
+        assert_eq!(
+            verdict.signature_gate,
+            GateOutcomeKind::Hold,
+            "a cookie/IP leak must hold the signature gate just like an authorization leak"
+        );
+        assert_ne!(
+            verdict.decision,
+            EmissionDecision::Emit,
+            "a cookie/IP leak must never silently emit"
+        );
+        let tighten = verdict
+            .transduction
+            .actuations
+            .iter()
+            .find(|g| g.actuation.kind == ActuationKind::TightenBoundary)
+            .expect("a cookie/IP impulse must still propose a boundary tighten");
+        assert_eq!(tighten.gate, GateOutcomeKind::Hold);
+    }
+
     #[test]
     fn fail_closed_priority_holds_across_crates() {
         let traffic = field(&CleanSource);

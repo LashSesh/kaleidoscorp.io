@@ -110,11 +110,42 @@ pub struct FieldTensorSkin {
     pub delta: Vec<DeltaSignal>,
 }
 
-fn has_authorization(sig: &SpectralSignature) -> bool {
+// The linkability dimension's sensitive-surface indicators (ssk-signature
+// features.rs): `sensitive_field_count` is the superset covering
+// authorization/cookie/IP-surface/token/session/etc, so it is the one flag that
+// must gate a residue — keying on `has_authorization` alone misses every other
+// sensitive surface the signature layer already detects.
+fn linkability_flag(sig: &SpectralSignature, key: &str) -> bool {
     sig.dimensions
         .get("linkability")
-        .and_then(|d| d.get("has_authorization"))
-        == Some(&FeatureValue::Num(1.0))
+        .and_then(|d| d.get(key))
+        .map(|v| !matches!(v, FeatureValue::Num(n) if *n == 0.0))
+        .unwrap_or(false)
+}
+
+fn has_sensitive_surface(sig: &SpectralSignature) -> bool {
+    linkability_flag(sig, "sensitive_field_count")
+}
+
+// A human-readable label of which sensitive surfaces were present, so the
+// residue message names the actual leak rather than a generic "linkability".
+fn sensitive_surface_labels(sig: &SpectralSignature) -> Vec<&'static str> {
+    let mut labels = Vec::new();
+    if linkability_flag(sig, "has_authorization") {
+        labels.push("authorization");
+    }
+    if linkability_flag(sig, "has_cookie") {
+        labels.push("cookie");
+    }
+    if linkability_flag(sig, "has_ip_surface") {
+        labels.push("ip_surface");
+    }
+    if labels.is_empty() && has_sensitive_surface(sig) {
+        // sensitive_field_count > 0 but none of the named flags fired: some
+        // other sensitive field hint (token/session/user_id/device_id/...).
+        labels.push("other_sensitive_field");
+    }
+    labels
 }
 
 impl FieldTensorSkin {
@@ -138,13 +169,19 @@ impl FieldTensorSkin {
         let mut delta = Vec::new();
 
         for (index, sig) in surface_tensor.iter().enumerate() {
-            // T_res: a captured surface carrying a sensitive header is a
-            // linkability residue — recorded, never dropped silently.
-            if has_authorization(sig) {
+            // T_res: a captured surface carrying ANY sensitive linkability
+            // surface (authorization, cookie, client-IP, token/session/etc — the
+            // whole family the signature layer's `sensitive_field_count`
+            // detects, not authorization alone) is a linkability residue —
+            // recorded, never dropped silently.
+            if has_sensitive_surface(sig) {
                 residue_tensor.push(Residue {
                     surface: "linkability".to_owned(),
                     severity: ResidueSeverity::Medium,
-                    message: format!("authorization surface present at window {index}"),
+                    message: format!(
+                        "sensitive surface present at window {index}: {}",
+                        sensitive_surface_labels(sig).join(",")
+                    ),
                 });
             }
             // δF drift: distance from the previous window's spectrum.
@@ -158,12 +195,17 @@ impl FieldTensorSkin {
                         window: index,
                     });
                 }
-                // δF linkability impulse: authorization appearing where it was absent.
-                if has_authorization(sig) && !has_authorization(&surface_tensor[index - 1]) {
+                // δF linkability impulse: a sensitive surface appearing where it
+                // was absent (any of authorization/cookie/IP/other-sensitive).
+                if has_sensitive_surface(sig) && !has_sensitive_surface(&surface_tensor[index - 1])
+                {
                     delta.push(DeltaSignal {
                         kind: DeltaSignalKind::LinkabilityImpulse,
                         magnitude: 1.0,
-                        detail: "authorization surface appeared".to_owned(),
+                        detail: format!(
+                            "sensitive surface appeared: {}",
+                            sensitive_surface_labels(sig).join(",")
+                        ),
                         window: index,
                     });
                 }
@@ -359,6 +401,66 @@ mod tests {
             a.digest(),
             b.digest(),
             "same inputs -> same field digest (replay)"
+        );
+    }
+
+    // A source that leaks a session cookie and a client IP header, but carries no
+    // Authorization header at all. Regression for the silent-loss bug where only
+    // `has_authorization` gated a residue: a cookie/IP-surface leak must still be
+    // recorded as a linkability residue and impulse, or it emits with no trace.
+    struct CookieLeakSource;
+    impl TrafficSource for CookieLeakSource {
+        fn source_id(&self) -> String {
+            "tap".to_owned()
+        }
+        fn windows(&self, _scope: &CaptureScope) -> Vec<TrafficWindow> {
+            let mut clean = TrafficWindow::http("http");
+            clean.method = Some("GET".to_owned());
+            clean.url = Some("https://example.local/a".to_owned());
+            clean.status = Some(200);
+            clean.response_headers =
+                vec![("Content-Type".to_owned(), "application/json".to_owned())];
+            clean.payload = b"{}".to_vec();
+
+            let mut leaking = TrafficWindow::http("http");
+            leaking.method = Some("GET".to_owned());
+            leaking.url = Some("https://example.local/profile".to_owned());
+            leaking.status = Some(200);
+            leaking.request_headers = vec![
+                ("Cookie".to_owned(), "session=abc123".to_owned()),
+                ("X-Forwarded-For".to_owned(), "203.0.113.7".to_owned()),
+            ];
+            leaking.response_headers =
+                vec![("Content-Type".to_owned(), "application/json".to_owned())];
+            leaking.payload = b"{}".to_vec();
+
+            vec![clean, leaking]
+        }
+    }
+
+    #[test]
+    fn cookie_and_ip_leaks_produce_a_residue_and_impulse_without_authorization() {
+        let field = SystemTrafficField::capture(
+            &CookieLeakSource,
+            &CaptureScope::new("local", ["lo0"]),
+            CaptureMode::PassiveLocal,
+        );
+        let skin = FieldTensorSkin::from_field(&field, &windows());
+        assert!(
+            !skin.residue_tensor.is_empty(),
+            "a cookie/IP-surface leak must be recorded as a residue, not silently lost"
+        );
+        assert_eq!(skin.residue_tensor[0].surface, "linkability");
+        assert!(
+            skin.residue_tensor[0].message.contains("cookie")
+                || skin.residue_tensor[0].message.contains("ip_surface"),
+            "the residue must name the actual sensitive surface: {}",
+            skin.residue_tensor[0].message
+        );
+        assert_eq!(
+            skin.signals(DeltaSignalKind::LinkabilityImpulse).len(),
+            1,
+            "a cookie/IP leak must fire a linkability impulse just like an authorization leak"
         );
     }
 }
