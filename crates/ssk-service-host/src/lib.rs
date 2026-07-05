@@ -355,7 +355,7 @@ impl ServiceHost {
             from_state: from.as_str().to_owned(),
             to_state: to.as_str().to_owned(),
             actor: actor.to_owned(),
-            detail,
+            detail: detail.clone(),
         };
         let seq = self.ledger.len() as u64;
         let prev_hash = self.ledger.last().map_or(Digest::GENESIS, |e| e.entry_hash);
@@ -366,6 +366,18 @@ impl ServiceHost {
             event,
             entry_hash,
         });
+
+        tracing::info!(
+            target: "ssk.lifecycle",
+            event = "lifecycle_transition",
+            host = %self.manifest.host_id.to_hex(),
+            kind,
+            from = from.as_str(),
+            to = to.as_str(),
+            actor,
+            detail = ?detail,
+            health = self.health().as_str(),
+        );
     }
 
     fn require_control(&self, authorization: &AuthorizationManifest) -> Result<(), ServiceError> {

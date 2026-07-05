@@ -242,7 +242,7 @@ impl KillSwitch {
             from_state: from.as_str().to_owned(),
             to_state: to.as_str().to_owned(),
             actor: actor.to_owned(),
-            reason,
+            reason: reason.clone(),
         };
         let seq = self.ledger.len() as u64;
         let prev_hash = self.ledger.last().map_or(Digest::GENESIS, |e| e.entry_hash);
@@ -253,6 +253,21 @@ impl KillSwitch {
             event,
             entry_hash,
         });
+
+        // A kill-switch transition is a security-critical event by definition
+        // (it severs or restores egress) — always logged at warn, regardless
+        // of direction, so it is never lost in routine info-level noise.
+        tracing::warn!(
+            target: "ssk.killswitch",
+            event = "kill_switch_transition",
+            kind,
+            from = from.as_str(),
+            to = to.as_str(),
+            actor,
+            reason = ?reason,
+            session = %self.session.0 .0,
+            entry_hash = %entry_hash.to_hex(),
+        );
     }
 
     /// Engage the switch: sever egress. Requires a control authorization.

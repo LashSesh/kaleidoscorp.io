@@ -18,6 +18,7 @@ ssk-audit-store = { path = "../ssk-audit-store", version = "0.1.0" }
 serde = { workspace = true }
 ciborium = { workspace = true }
 thiserror = { workspace = true }
+tracing = { workspace = true }
 
 [dev-dependencies]
 ssk-signature = { path = "../ssk-signature", version = "0.1.0" }

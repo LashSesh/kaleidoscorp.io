@@ -275,6 +275,51 @@ impl CrownSupervisor {
         }
         self.ledger.push(entry);
 
+        // Structured, runtime-observable projection of the decision. The
+        // hash-chained ledger (in-memory, and durably via an attached sink)
+        // remains the tamper-evident record; this is what lets an operator
+        // build alerts (e.g. on emission_decision=deny) without holding the
+        // live CrownSupervisor. Severity escalates with the decision itself —
+        // never a scalar collapse, the full vector is carried as fields.
+        match decision {
+            EmissionDecision::Emit => tracing::info!(
+                target: "ssk.emission",
+                event = "emission_decision",
+                decision = decision.as_str(),
+                reasons = ?reasons,
+                signature_gate = ?inputs.signature_gate,
+                qlogic_gate = ?inputs.qlogic_gate,
+                kill_switch = inputs.kill_switch.as_str(),
+                open_obligations = inputs.open_obligations,
+                seq,
+                ledger_head = %entry_hash.to_hex(),
+            ),
+            EmissionDecision::Hold => tracing::warn!(
+                target: "ssk.emission",
+                event = "emission_decision",
+                decision = decision.as_str(),
+                reasons = ?reasons,
+                signature_gate = ?inputs.signature_gate,
+                qlogic_gate = ?inputs.qlogic_gate,
+                kill_switch = inputs.kill_switch.as_str(),
+                open_obligations = inputs.open_obligations,
+                seq,
+                ledger_head = %entry_hash.to_hex(),
+            ),
+            EmissionDecision::Deny => tracing::error!(
+                target: "ssk.emission",
+                event = "emission_decision",
+                decision = decision.as_str(),
+                reasons = ?reasons,
+                signature_gate = ?inputs.signature_gate,
+                qlogic_gate = ?inputs.qlogic_gate,
+                kill_switch = inputs.kill_switch.as_str(),
+                open_obligations = inputs.open_obligations,
+                seq,
+                ledger_head = %entry_hash.to_hex(),
+            ),
+        }
+
         EmissionReport { decision, reasons }
     }
 

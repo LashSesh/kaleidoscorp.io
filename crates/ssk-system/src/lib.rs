@@ -201,6 +201,22 @@ impl SystemPipeline {
             (crown_report.decision, false)
         };
 
+        // Structured, runtime-observable projection of the whole composed
+        // verdict (severity escalates with the decision; the underlying
+        // ssk-crown emission event already logged its own view of just the
+        // Crown's inputs — this is the end-to-end view including the
+        // host-health downgrade). The full vector is carried as fields, never
+        // collapsed to a single number.
+        log_system_verdict(
+            decision,
+            host_downgraded,
+            signature_gate,
+            qlogic_gate,
+            resonance.action,
+            &reasons,
+            field_digest,
+        );
+
         SystemVerdict {
             decision,
             crown_report,
@@ -224,6 +240,41 @@ impl SystemPipeline {
     #[must_use]
     pub fn verify_ledger(&self) -> bool {
         self.crown.verify_ledger()
+    }
+}
+
+/// Emits the `ssk.system` / `system_verdict` structured event, at a severity
+/// matching the decision (Emit=info, Hold=warn, Deny=error) — the runtime-
+/// observable projection of one [`SystemPipeline::evaluate`] call.
+#[allow(clippy::too_many_arguments)]
+fn log_system_verdict(
+    decision: EmissionDecision,
+    host_downgraded: bool,
+    signature_gate: GateOutcomeKind,
+    qlogic_gate: GateOutcomeKind,
+    resonance_action: ResonanceAction,
+    reasons: &[String],
+    field_digest: Digest,
+) {
+    macro_rules! emit {
+        ($level:ident) => {
+            tracing::$level!(
+                target: "ssk.system",
+                event = "system_verdict",
+                decision = decision.as_str(),
+                host_downgraded,
+                signature_gate = ?signature_gate,
+                qlogic_gate = ?qlogic_gate,
+                resonance_action = ?resonance_action,
+                reasons = ?reasons,
+                field_digest = %field_digest.to_hex(),
+            )
+        };
+    }
+    match decision {
+        EmissionDecision::Emit => emit!(info),
+        EmissionDecision::Hold => emit!(warn),
+        EmissionDecision::Deny => emit!(error),
     }
 }
 

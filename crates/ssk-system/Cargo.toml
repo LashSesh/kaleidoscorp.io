@@ -23,6 +23,7 @@ ssk-meta-resonance = { path = "../ssk-meta-resonance", version = "0.1.0" }
 ssk-boundary = { path = "../ssk-boundary", version = "0.1.0" }
 ssk-service-host = { path = "../ssk-service-host", version = "0.1.0" }
 ssk-crown = { path = "../ssk-crown", version = "0.1.0" }
+tracing = { workspace = true }
 
 [lints]
 workspace = true
