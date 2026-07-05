@@ -6,13 +6,18 @@
 //! [`ssk_host_cells::HostCellId`], with dependency ordering, a logical TTL,
 //! explicit dissolution, and a hash-chained trace.
 //!
-//! Two things are structural:
+//! Three things are structural:
 //!
 //! * **It is a DAG.** A node may only depend on nodes that already exist, so
 //!   edges always point backward in creation order — a cycle is impossible by
 //!   construction and [`FunnelDag::topological_order`] always succeeds.
 //! * **Temporal-window replay.** Every mutation is appended to a hash-chained
 //!   trace, so the same sequence of operations produces the same trace head.
+//! * **The host-cell binding is enforced, not decorative.** [`FunnelDag::ready`]
+//!   and [`FunnelDag::complete`] take the [`HostCellPlane`] and require it to
+//!   agree the bound cell is still active — a node whose cell has dissolved or
+//!   expired is never runnable, even if the node's own (independent) TTL clock
+//!   still calls it pending.
 //!
 //! This is **not** the Ω locator funnel-DAG (`ssk-locator`'s `LocatorGraph`) —
 //! a different object over a different plane. FunnelDAG nodes carry host cells
@@ -21,7 +26,7 @@
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
-use ssk_host_cells::HostCellId;
+use ssk_host_cells::{HostCellId, HostCellPlane};
 use ssk_types::{digest_of, Digest, HashAlg};
 
 /// Errors the funnel DAG can return.
@@ -170,17 +175,25 @@ impl FunnelDag {
         self.nodes.get(&id.0)
     }
 
-    fn is_live(&self, node: &FunnelNode) -> bool {
-        node.state == NodeState::Pending && self.now < node.expires_at()
+    /// A node is live only if it is pending, its OWN ttl has not elapsed, AND
+    /// the [`HostCellPlane`] agrees the bound host cell is still active. A
+    /// node's binding to a `HostCellId` is not just a label: work must not run
+    /// under a capability whose cell has been dissolved or whose TTL elapsed,
+    /// even if the node's own (independent) clock still calls it pending.
+    fn is_live(&self, node: &FunnelNode, plane: &HostCellPlane) -> bool {
+        node.state == NodeState::Pending
+            && self.now < node.expires_at()
+            && plane.is_active(node.host_cell)
     }
 
-    /// The nodes ready to run: pending, unexpired, with all dependencies done.
+    /// The nodes ready to run: pending, unexpired, host-cell-active, with all
+    /// dependencies done.
     #[must_use]
-    pub fn ready(&self) -> Vec<FunnelNodeId> {
+    pub fn ready(&self, plane: &HostCellPlane) -> Vec<FunnelNodeId> {
         self.nodes
             .values()
             .filter(|n| {
-                self.is_live(n)
+                self.is_live(n, plane)
                     && n.deps.iter().all(|d| {
                         self.nodes
                             .get(&d.0)
@@ -191,14 +204,15 @@ impl FunnelDag {
             .collect()
     }
 
-    /// Mark a node done. It must be live and all its dependencies done.
+    /// Mark a node done. It must be live (including its host cell still being
+    /// active in `plane`) and all its dependencies done.
     ///
     /// # Errors
     /// [`FunnelError::NotFound`] or [`FunnelError::NotRunnable`].
-    pub fn complete(&mut self, id: FunnelNodeId) -> Result<(), FunnelError> {
+    pub fn complete(&mut self, id: FunnelNodeId, plane: &HostCellPlane) -> Result<(), FunnelError> {
         let deps_done = {
             let node = self.nodes.get(&id.0).ok_or(FunnelError::NotFound)?;
-            if !self.is_live(node) {
+            if !self.is_live(node, plane) {
                 return Err(FunnelError::NotRunnable);
             }
             node.deps.iter().all(|d| {
@@ -322,13 +336,16 @@ mod tests {
         let a = dag.add_node("a", cell(&mut plane, "a"), &[], 100).unwrap();
         let b = dag.add_node("b", cell(&mut plane, "b"), &[a], 100).unwrap();
         // Only a is ready (b depends on a).
-        assert_eq!(dag.ready(), vec![a]);
+        assert_eq!(dag.ready(&plane), vec![a]);
         // b cannot complete before a.
-        assert_eq!(dag.complete(b).unwrap_err(), FunnelError::NotRunnable);
-        dag.complete(a).unwrap();
-        assert_eq!(dag.ready(), vec![b]);
-        dag.complete(b).unwrap();
-        assert!(dag.ready().is_empty());
+        assert_eq!(
+            dag.complete(b, &plane).unwrap_err(),
+            FunnelError::NotRunnable
+        );
+        dag.complete(a, &plane).unwrap();
+        assert_eq!(dag.ready(&plane), vec![b]);
+        dag.complete(b, &plane).unwrap();
+        assert!(dag.ready(&plane).is_empty());
     }
 
     #[test]
@@ -339,7 +356,49 @@ mod tests {
         assert!(dag.tick().is_empty()); // now 1
         assert_eq!(dag.tick(), vec![a]); // now 2 == expiry
         assert_eq!(dag.get(a).unwrap().state, NodeState::Dissolved);
-        assert!(dag.ready().is_empty());
+        assert!(dag.ready(&plane).is_empty());
+    }
+
+    // Regression: a node bound to a dissolved/expired host cell must not be
+    // ready or completable, even though the node's OWN ttl clock is
+    // independent and still calls it pending — the plane's liveness must gate
+    // the work, not just be a label on the node.
+    #[test]
+    fn dissolved_host_cell_makes_a_node_unready_even_if_its_own_ttl_has_not_elapsed() {
+        let mut plane = HostCellPlane::new();
+        let mut dag = FunnelDag::new();
+        // Cell ttl=2 (short); node ttl=100 (long, independent clock).
+        let short_cell = plane.spawn("scanner", ["scan"], "session-1", 2);
+        let a = dag.add_node("scan", short_cell, &[], 100).unwrap();
+        assert_eq!(dag.ready(&plane), vec![a]);
+
+        plane.tick();
+        plane.tick(); // now == 2 == the cell's expiry -> dissolved
+        assert!(!plane.is_active(short_cell));
+        // The funnel node's own clock never advanced, so by its own TTL it
+        // would still be "pending" and unexpired -- but its cell is gone.
+        assert_eq!(dag.get(a).unwrap().state, NodeState::Pending);
+        assert!(
+            dag.ready(&plane).is_empty(),
+            "a node bound to a dissolved cell must not be ready"
+        );
+        assert_eq!(
+            dag.complete(a, &plane).unwrap_err(),
+            FunnelError::NotRunnable,
+            "a node bound to a dissolved cell must not be completable"
+        );
+
+        // Explicit dissolution (not just TTL) must be honored the same way.
+        let mut plane2 = HostCellPlane::new();
+        let mut dag2 = FunnelDag::new();
+        let cell2 = plane2.spawn("scanner", ["scan"], "session-1", 100);
+        let n2 = dag2.add_node("scan", cell2, &[], 100).unwrap();
+        plane2.dissolve(cell2).unwrap();
+        assert!(dag2.ready(&plane2).is_empty());
+        assert_eq!(
+            dag2.complete(n2, &plane2).unwrap_err(),
+            FunnelError::NotRunnable
+        );
     }
 
     #[test]
@@ -349,8 +408,8 @@ mod tests {
             let mut dag = FunnelDag::new();
             let a = dag.add_node("a", cell(&mut plane, "a"), &[], 100).unwrap();
             let b = dag.add_node("b", cell(&mut plane, "b"), &[a], 100).unwrap();
-            dag.complete(a).unwrap();
-            dag.complete(b).unwrap();
+            dag.complete(a, &plane).unwrap();
+            dag.complete(b, &plane).unwrap();
             dag
         };
         let x = build();
