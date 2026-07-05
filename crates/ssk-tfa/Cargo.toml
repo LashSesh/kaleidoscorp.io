@@ -21,6 +21,7 @@ thiserror = { workspace = true }
 [dev-dependencies]
 ssk-capture = { path = "../ssk-capture", version = "0.1.0" }
 ssk-mpk = { path = "../ssk-mpk", version = "0.1.0" }
+proptest = { workspace = true }
 
 [lints]
 workspace = true
