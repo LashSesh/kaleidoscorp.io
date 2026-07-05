@@ -243,10 +243,17 @@ fn permute(cur: &mut Vec<usize>, k: usize, out: &mut Vec<Vec<usize>>) {
     }
 }
 
-/// `n!`.
+/// `n!`, saturating at `u64::MAX` rather than overflowing. The orbit-
+/// stabilizer identity `|Orb| * |Aut| == n!` this crate proves only holds for
+/// `n <= 8` (`MAX_VERTICES`) in the first place — `21!` already exceeds
+/// `u64::MAX`, so any caller passing a larger `n` gets a saturated, honestly-
+/// wrong-but-non-panicking sentinel rather than a debug-build abort or a
+/// silently-wrapped (also wrong) release-build value.
 #[must_use]
 pub fn factorial(n: usize) -> u64 {
-    (1..=n as u64).product::<u64>().max(1)
+    (1..=n as u64)
+        .try_fold(1u64, |acc, k| acc.checked_mul(k))
+        .unwrap_or(u64::MAX)
 }
 
 // Characteristic polynomial coefficients via Newton's identities from the power
@@ -522,5 +529,23 @@ mod tests {
         let s = MpkFieldSample::of(&star_k14());
         assert_eq!(a.spectrum, s.spectrum);
         assert_ne!(a.id, s.id);
+    }
+
+    // Regression: factorial(n) is a public fn taking an arbitrary usize; for
+    // n >= 21 the true value exceeds u64::MAX. It must saturate, not panic
+    // (debug/overflow-checks builds) or silently wrap to a wrong value
+    // (release builds).
+    #[test]
+    fn factorial_saturates_instead_of_overflowing() {
+        assert_eq!(factorial(0), 1);
+        assert_eq!(factorial(1), 1);
+        assert_eq!(factorial(5), 120);
+        assert_eq!(factorial(20), 2_432_902_008_176_640_000);
+        assert_eq!(
+            factorial(21),
+            u64::MAX,
+            "21! exceeds u64::MAX -> saturate, don't panic or wrap"
+        );
+        assert_eq!(factorial(100), u64::MAX);
     }
 }
