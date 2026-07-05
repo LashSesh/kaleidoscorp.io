@@ -1,0 +1,25 @@
+[package]
+name = "ssk-audit-store"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# Enterprise durability gap (adversarial audit finding "ent-durability"): every
+# hash-chained audit ledger in this workspace (crown/boundary/service-host/tfa/
+# profile-manifold/funnel-dag/imdf-atlas) is in-memory Vec only, destroyed on
+# restart. This crate is the injected durability SINK those pure crates can
+# optionally persist through, without giving up their own determinism: a real,
+# crash-safe, append-only file store (one length-prefixed frame per record,
+# fsync'd per append -- an atomic durability barrier, not just page-cache-and-
+# hope) with recover-on-load that bounds a torn tail to the last good record
+# instead of corrupting the whole log.
+
+[dependencies]
+ssk-types = { path = "../ssk-types", version = "0.1.0" }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+[lints]
+workspace = true
