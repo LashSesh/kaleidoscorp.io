@@ -315,6 +315,13 @@ impl KillSwitch {
     /// Force engagement via the authorized override path (e.g., to engage from an
     /// unexpected state). Requires an override authorization and is audited.
     ///
+    /// If the switch is already `Engaged`, this does **not** re-engage via the
+    /// enforcer or overwrite the held receipt: doing so would capture the
+    /// already-severed boundary as the receipt's `prior_state`, destroying the
+    /// only record of the true pre-engagement state and making a later
+    /// [`KillSwitch::release`] restore to the wrong place. Re-engaging is a
+    /// no-op that only appends an audit entry documenting the override request.
+    ///
     /// # Errors
     /// [`BoundaryError::Unauthorized`] or [`BoundaryError::Enforcement`].
     pub fn override_engage(
@@ -326,8 +333,19 @@ impl KillSwitch {
         if !authorization.is_valid_for(&self.policy.override_use) {
             return Err(BoundaryError::Unauthorized);
         }
-        let receipt = enforcer.engage(&self.scope)?;
         let from = self.state;
+        let reason = reason.into();
+        if self.state == KillSwitchState::Engaged {
+            self.record(
+                "override_engage",
+                from,
+                self.state,
+                &authorization.source_name,
+                Some(format!("{reason} (already engaged; receipt preserved)")),
+            );
+            return Ok(());
+        }
+        let receipt = enforcer.engage(&self.scope)?;
         self.state = KillSwitchState::Engaged;
         self.receipt = Some(receipt);
         self.record(
@@ -335,7 +353,7 @@ impl KillSwitch {
             from,
             self.state,
             &authorization.source_name,
-            Some(reason.into()),
+            Some(reason),
         );
         Ok(())
     }
@@ -479,6 +497,76 @@ mod tests {
         let last = ks.audit_entries().last().unwrap();
         assert_eq!(last.event.kind, "override_engage");
         assert_eq!(last.event.reason.as_deref(), Some("incident-42"));
+    }
+
+    /// An enforcer that actually honors `EnforcementReceipt::prior_state` on
+    /// release, unlike `FakeEnforcer` (which always sets `severed = false`
+    /// regardless of the receipt). This is the enforcer needed to detect a
+    /// wrong or lost receipt — a faithful enforcer restores to whatever the
+    /// receipt says, not to a hardcoded "flowing".
+    struct FaithfulEnforcer {
+        state: Cell<&'static str>,
+    }
+    impl FaithfulEnforcer {
+        fn new() -> Self {
+            FaithfulEnforcer {
+                state: Cell::new("flowing"),
+            }
+        }
+    }
+    impl BoundaryEnforcer for FaithfulEnforcer {
+        fn engage(&self, scope: &BoundaryScope) -> Result<EnforcementReceipt, BoundaryError> {
+            let receipt = EnforcementReceipt::new(scope, self.state.get());
+            self.state.set("severed");
+            Ok(receipt)
+        }
+        fn release(&self, receipt: &EnforcementReceipt) -> Result<(), BoundaryError> {
+            self.state.set(match receipt.prior_state.as_str() {
+                "flowing" => "flowing",
+                _ => "severed",
+            });
+            Ok(())
+        }
+    }
+
+    // Regression: overriding an already-Engaged switch must not clobber the
+    // receipt captured by the original engage(). Before the fix, override_engage
+    // re-called enforcer.engage() unconditionally, capturing the already-severed
+    // boundary as the new receipt's prior_state; a later release() then restored
+    // to "severed" instead of the true pre-engagement "flowing".
+    #[test]
+    fn override_while_engaged_preserves_the_original_receipt() {
+        let mut ks = switch();
+        let enforcer = FaithfulEnforcer::new();
+
+        ks.engage(&control_auth(), &enforcer).unwrap();
+        assert_eq!(enforcer.state.get(), "severed");
+
+        // Overriding while already Engaged must not touch the receipt.
+        ks.override_engage(&override_auth(), "re-assert", &enforcer)
+            .unwrap();
+        assert_eq!(ks.state(), KillSwitchState::Engaged);
+        assert_eq!(
+            enforcer.state.get(),
+            "severed",
+            "override_engage while already engaged must not re-invoke the enforcer"
+        );
+
+        ks.release(&control_auth(), &enforcer).unwrap();
+        assert_eq!(
+            enforcer.state.get(),
+            "flowing",
+            "release must restore the TRUE pre-engagement state, not the \
+             intermediate state an overwritten receipt would have captured"
+        );
+        assert!(ks.verify_audit());
+        // The override was still audited, just without mutating the receipt.
+        assert!(ks
+            .audit_entries()
+            .iter()
+            .any(|e| e.event.kind == "override_engage"
+                && e.event.reason.as_deref()
+                    == Some("re-assert (already engaged; receipt preserved)")));
     }
 
     #[test]
