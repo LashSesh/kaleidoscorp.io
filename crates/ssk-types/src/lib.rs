@@ -918,6 +918,109 @@ impl ResidueRegister {
     }
 }
 
+/// The closed set of **origin edges** of the field (IMRT A4, Def 11.6): the
+/// structural boundary a residue arose at. The residue cloud X partitions
+/// disjointly over these classes; any residue that cannot be attributed to an
+/// origin edge escalates to the ρ\* meta-residue instead of silently belonging
+/// nowhere.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub enum EdgeClass {
+    /// The self/identity edge (L0–L1).
+    SelfEdge,
+    /// The observer edge (L2 perception).
+    Observer,
+    /// The aperture/focus edge (L2–L3 projection).
+    Aperture,
+    /// The gate edge (L5 decision).
+    Gate,
+    /// The boundary/seam edge (L9 crossing).
+    Boundary,
+    /// The replay/reanalysis edge (L6).
+    Replay,
+}
+
+impl EdgeClass {
+    /// The origin edge a residue is attributed to, or `None` (→ ρ\*) if the
+    /// residue lacks a real origin trace. Total over the taxonomy K.
+    #[must_use]
+    pub fn of(residue: &BoundaryResidue) -> Option<EdgeClass> {
+        // A residue with no real origin trace cannot be placed on an edge — it is
+        // a ρ* candidate (Inv 11.7).
+        if residue.origin.0 .0.is_empty() {
+            return None;
+        }
+        Some(match residue.kind {
+            ResidueKind::Identity => EdgeClass::SelfEdge,
+            ResidueKind::Locator | ResidueKind::Boundary => EdgeClass::Boundary,
+            ResidueKind::Correlation | ResidueKind::Timing => EdgeClass::Observer,
+            ResidueKind::Focus | ResidueKind::FieldProjection => EdgeClass::Aperture,
+            ResidueKind::Capability | ResidueKind::Protocol | ResidueKind::Cospectral => {
+                EdgeClass::Gate
+            }
+            ResidueKind::Replay => EdgeClass::Replay,
+        })
+    }
+}
+
+/// A read-only view over a [`ResidueRegister`] that partitions its residue
+/// cloud X into disjoint origin-edge classes plus the ρ\* meta-residue catch-all
+/// (IMRT A4, Def 11.6 / Inv 11.7). Guarantees the partition is total and
+/// disjoint: every residue lands in exactly one edge class, or in ρ\*.
+pub struct ResidueCloud<'a> {
+    entries: &'a [BoundaryResidue],
+}
+
+impl<'a> ResidueCloud<'a> {
+    #[must_use]
+    pub fn of(register: &'a ResidueRegister) -> Self {
+        ResidueCloud {
+            entries: register.entries(),
+        }
+    }
+
+    #[must_use]
+    pub fn from_slice(entries: &'a [BoundaryResidue]) -> Self {
+        ResidueCloud { entries }
+    }
+
+    /// The disjoint edge-class partition of X: each edge class mapped to the
+    /// residues attributed to it. Residues with no origin edge are excluded
+    /// (they appear in [`rho_star`](Self::rho_star)).
+    #[must_use]
+    pub fn partition(&self) -> alloc::collections::BTreeMap<EdgeClass, Vec<&'a BoundaryResidue>> {
+        let mut map: alloc::collections::BTreeMap<EdgeClass, Vec<&'a BoundaryResidue>> =
+            alloc::collections::BTreeMap::new();
+        for r in self.entries {
+            if let Some(edge) = EdgeClass::of(r) {
+                map.entry(edge).or_default().push(r);
+            }
+        }
+        map
+    }
+
+    /// The ρ\* meta-residue: every residue that lacks an origin edge. A
+    /// non-empty ρ\* is a critical error signal (residues must be attributable),
+    /// but it is *kept*, never dropped — it is the closure-guaranteeing catch-all.
+    #[must_use]
+    pub fn rho_star(&self) -> Vec<&'a BoundaryResidue> {
+        self.entries
+            .iter()
+            .filter(|r| EdgeClass::of(r).is_none())
+            .collect()
+    }
+
+    /// Whether the partition is total and disjoint: the edge classes and ρ\*
+    /// together account for every residue in X exactly once.
+    #[must_use]
+    pub fn is_total_disjoint_partition(&self) -> bool {
+        let partitioned: usize = self.partition().values().map(Vec::len).sum();
+        let rho = self.rho_star().len();
+        // Disjoint (edge classes are exclusive by construction) + total: every
+        // residue is either on exactly one edge or in ρ*.
+        partitioned + rho == self.entries.len()
+    }
+}
+
 /// The class of foundation object a `CoreObject` impl identifies as (Master
 /// Spec Ω+1 ch. 3.2). Additive — grows as later phases add object types
 /// (`BcikStitch`, `CapabilityWitness`, `StitchEdge`, ...).
@@ -1422,6 +1525,70 @@ mod tests {
             "H maps every residue to a complete (class, status, next_action) triple"
         );
         assert_eq!(horizon.len(), reg.len(), "H is defined for every entry");
+    }
+
+    // G8 (A4, Def 11.6 / Inv 11.7): the residue cloud X partitions disjointly
+    // over origin-edge classes, with any origin-less residue escalated to the
+    // ρ* meta-residue — union == X, pairwise disjoint, nothing dropped.
+    #[test]
+    fn residue_cloud_partitions_disjointly_with_rho_star_catch_all() {
+        let mut reg = ResidueRegister::new();
+        // Residues on distinct edges (each with a real origin trace).
+        let placed = [
+            (ResidueKind::Identity, EdgeClass::SelfEdge),
+            (ResidueKind::Boundary, EdgeClass::Boundary),
+            (ResidueKind::Correlation, EdgeClass::Observer),
+            (ResidueKind::Focus, EdgeClass::Aperture),
+            (ResidueKind::Capability, EdgeClass::Gate),
+            (ResidueKind::Replay, EdgeClass::Replay),
+        ];
+        for (i, (kind, _edge)) in placed.iter().enumerate() {
+            reg.emit(BoundaryResidue::new(
+                ResidueId::new(format!("p{i}")),
+                *kind,
+                GateId::Focus,
+                "reason",
+                Severity::Low,
+                TraceId::new(format!("origin-{i}")),
+                true,
+            ));
+        }
+        // A residue with NO real origin trace → ρ*.
+        reg.emit(BoundaryResidue::new(
+            ResidueId::new("orphan"),
+            ResidueKind::Identity,
+            GateId::Focus,
+            "no origin edge",
+            Severity::High,
+            TraceId::new(""), // empty origin
+            true,
+        ));
+
+        let cloud = ResidueCloud::of(&reg);
+        let partition = cloud.partition();
+        let rho = cloud.rho_star();
+
+        // Every placed residue landed on its expected edge.
+        for (kind, edge) in placed {
+            assert!(
+                partition
+                    .get(&edge)
+                    .is_some_and(|rs| rs.iter().any(|r| r.kind == kind)),
+                "{kind:?} must be attributed to {edge:?}"
+            );
+        }
+        // The orphan is in ρ*, not in any edge class.
+        assert_eq!(rho.len(), 1, "the origin-less residue escalates to ρ*");
+        assert_eq!(rho[0].id, ResidueId::new("orphan"));
+
+        // Total + disjoint: the six edges + ρ* account for all seven residues.
+        assert!(cloud.is_total_disjoint_partition());
+        let partitioned: usize = partition.values().map(Vec::len).sum();
+        assert_eq!(partitioned + rho.len(), reg.len());
+        assert_eq!(partitioned, 6);
+
+        // ρ* is kept, never dropped — a non-empty ρ* is visible.
+        assert!(!rho.is_empty(), "ρ* is a visible catch-all, not silence");
     }
 
     #[test]

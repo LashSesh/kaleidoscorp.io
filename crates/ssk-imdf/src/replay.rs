@@ -263,6 +263,20 @@ impl ImdfReplayManifest {
     }
 }
 
+/// The typed verdict of reanalysis (IMDF, IMRT A8): the class-recovery outcome.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReanalysisVerdict {
+    /// The self-class was recovered, the verdict matches, and the manifest is
+    /// internally consistent — the run reanalyzes cleanly.
+    Pass,
+    /// The manifest is consistent but the recovered self-anchor class does not
+    /// match the committed one — the identity class drifted (`[S]≠[S_committed]`).
+    ClassMismatch,
+    /// The manifest is inconsistent or the gate verdict disagrees — reanalysis
+    /// cannot decide the class (fail-closed: not a Pass).
+    Ambiguous,
+}
+
 /// The outcome of reanalyzing a run against its manifest.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ReanalysisReport {
@@ -270,6 +284,23 @@ pub struct ReanalysisReport {
     pub recovered_anchor: SelfAnchorId,
     pub verdict_matches: bool,
     pub manifest_consistent: bool,
+}
+
+impl ReanalysisReport {
+    /// Fold the report into a single typed verdict. Fail-closed ordering: an
+    /// inconsistent manifest or a disagreeing verdict is `Ambiguous` (the class
+    /// cannot be trusted at all); a consistent-but-unrecovered class is a
+    /// `ClassMismatch`; only a fully-clean reanalysis is a `Pass`.
+    #[must_use]
+    pub fn verdict(&self) -> ReanalysisVerdict {
+        if !self.manifest_consistent || !self.verdict_matches {
+            ReanalysisVerdict::Ambiguous
+        } else if !self.self_anchor_recovered {
+            ReanalysisVerdict::ClassMismatch
+        } else {
+            ReanalysisVerdict::Pass
+        }
+    }
 }
 
 /// Re-derive the self-anchor from the descriptor's recorded identity fields and
@@ -360,6 +391,54 @@ mod tests {
         let mut wrong = manifest.clone();
         wrong.self_anchor_id = SelfAnchorId(digest_of(&"someone-else", HashAlg::Blake3).unwrap());
         assert!(!reanalyze(&wrong, &d).self_anchor_recovered);
+    }
+
+    // G18 (A8): reanalysis yields a typed {Pass, ClassMismatch, Ambiguous}
+    // verdict and is class-idempotent — reanalyzing the recovered class again
+    // yields the same class (`[Reanalyse∘Reanalyse]_can = [Reanalyse]_can`).
+    #[test]
+    fn reanalysis_verdict_is_typed_and_class_idempotent() {
+        let d = descriptor();
+        let manifest = ImdfReplayManifest::of(&d);
+
+        // Clean run → Pass.
+        let r1 = reanalyze(&manifest, &d);
+        assert_eq!(r1.verdict(), ReanalysisVerdict::Pass);
+
+        // Class-idempotence: reanalysis recovers the canonical self-class; a
+        // second reanalysis over that recovered class yields the same class.
+        let d2 = RunDescriptor::new(
+            d.self_anchor.clone(),
+            d.observer,
+            d.source_digest,
+            d.wavefront_digest,
+            QOutcome::Pass,
+        );
+        let r2 = reanalyze(&ImdfReplayManifest::of(&d2), &d2);
+        assert_eq!(
+            r2.recovered_anchor, r1.recovered_anchor,
+            "[Reanalyse∘Reanalyse]_can == [Reanalyse]_can"
+        );
+        assert_eq!(r2.verdict(), ReanalysisVerdict::Pass);
+
+        // Consistent manifest, but a committed anchor that does not match the
+        // descriptor's recoverable class → ClassMismatch (not Ambiguous).
+        let mut mismatched = manifest.clone();
+        mismatched.self_anchor_id =
+            SelfAnchorId(digest_of(&"other-class", HashAlg::Blake3).unwrap());
+        mismatched.manifest_digest = mismatched.recompute_digest(); // keep it consistent
+        let rmm = reanalyze(&mismatched, &d);
+        assert!(rmm.manifest_consistent && rmm.verdict_matches);
+        assert_eq!(rmm.verdict(), ReanalysisVerdict::ClassMismatch);
+
+        // A tampered (inconsistent) manifest → Ambiguous, never a Pass.
+        let mut tampered = manifest.clone();
+        tampered.source_digest = digest_of(&"tampered", HashAlg::Blake3).unwrap();
+        assert!(!tampered.is_consistent());
+        assert_eq!(
+            reanalyze(&tampered, &d).verdict(),
+            ReanalysisVerdict::Ambiguous
+        );
     }
 
     // G2 (Vertrag 8.3): drift past bound forks a new run that back-references the
