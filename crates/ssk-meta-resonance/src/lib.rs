@@ -55,6 +55,73 @@ pub enum DriftMode {
     Neu,
 }
 
+/// The version ratchet `ℓ` and reset operator `ϱ` of the run-transition
+/// machinery (IMRT A8, Satz 16.12/16.13, Inv 16.15).
+///
+/// * `ℓ` (the *stage*) is monotone non-decreasing — the reset `ϱ` is an
+///   **idempotent max-projection**: `ϱ(ℓ, c) = max(ℓ, c)`, so `ϱ∘ϱ = ϱ`
+///   (Satz 16.12) and `ℓ_{k+1} ≥ ℓ_k` (Satz 16.13). There is no way to lower `ℓ`.
+/// * `ϱ` is triggered at the `Komp → Neu` transition — the moment a new run
+///   supersedes the compensated one.
+/// * Marks carry a **past-vs-future asymmetry** (Inv 16.15): a mark at or before
+///   the current stage weighs full; a future mark is preloaded at half weight.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VersionRatchet {
+    stage: u64,
+}
+
+impl VersionRatchet {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Start at an explicit stage (e.g. read off the append-only ledger head).
+    #[must_use]
+    pub fn at(stage: u64) -> Self {
+        VersionRatchet { stage }
+    }
+
+    /// The current monotone stage `ℓ`.
+    #[must_use]
+    pub fn stage(&self) -> u64 {
+        self.stage
+    }
+
+    /// The reset operator `ϱ`: an idempotent max-projection. Advances `ℓ` to
+    /// `max(ℓ, candidate)` and returns whether it advanced. Never lowers `ℓ`.
+    pub fn reset(&mut self, candidate: u64) -> bool {
+        if candidate > self.stage {
+            self.stage = candidate;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Apply `ϱ` only at a `Komp → Neu` transition (a genuine run supersession);
+    /// any other transition leaves `ℓ` untouched. Returns whether `ℓ` advanced.
+    pub fn on_transition(&mut self, from: DriftMode, to: DriftMode, candidate: u64) -> bool {
+        if from == DriftMode::Komp && to == DriftMode::Neu {
+            self.reset(candidate)
+        } else {
+            false
+        }
+    }
+
+    /// The weight a mark stamped at `mark_stage` carries when evaluated at the
+    /// current stage (Inv 16.15): a past-or-present mark weighs `1.0`; a future
+    /// mark (`mark_stage > ℓ`) is preloaded at `0.5`.
+    #[must_use]
+    pub fn mark_weight(&self, mark_stage: u64) -> f64 {
+        if mark_stage <= self.stage {
+            1.0
+        } else {
+            0.5
+        }
+    }
+}
+
 /// The controller's response for one step.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ResonanceResponse {
@@ -359,5 +426,50 @@ mod tests {
         );
         // Persistent high drift resolves to a Hold action.
         assert!(last.abs() <= clamp);
+    }
+
+    // G16 (A8, Satz 16.12/16.13, Inv 16.15): the reset ϱ is an idempotent
+    // max-projection, the stage ℓ ratchets (never falls), ϱ fires only at the
+    // Komp→Neu transition, and marks carry the past-vs-future weight asymmetry.
+    #[test]
+    fn version_ratchet_reset_is_idempotent_monotone_and_asymmetric() {
+        let mut r = VersionRatchet::new();
+        assert_eq!(r.stage(), 0);
+
+        // ϱ is a max-projection: advancing to a higher stage moves ℓ...
+        assert!(r.reset(3));
+        assert_eq!(r.stage(), 3);
+        // ...idempotence ϱ∘ϱ=ϱ: re-applying the same candidate does not move ℓ.
+        assert!(!r.reset(3));
+        assert_eq!(r.stage(), 3);
+        // Ratchet ℓ_{k+1} ≥ ℓ_k: a lower candidate is refused, ℓ never falls.
+        assert!(!r.reset(1));
+        assert_eq!(r.stage(), 3, "the stage never decreases");
+        assert!(r.reset(7));
+        assert_eq!(r.stage(), 7);
+
+        // ϱ fires ONLY at the Komp→Neu transition.
+        let mut t = VersionRatchet::at(2);
+        assert!(
+            !t.on_transition(DriftMode::Komp, DriftMode::Komp, 9),
+            "no fire"
+        );
+        assert!(
+            !t.on_transition(DriftMode::Neu, DriftMode::Komp, 9),
+            "no fire"
+        );
+        assert_eq!(t.stage(), 2, "non-transitions leave ℓ untouched");
+        assert!(t.on_transition(DriftMode::Komp, DriftMode::Neu, 9), "fires");
+        assert_eq!(t.stage(), 9);
+        // Even at the transition, the ratchet still refuses to fall.
+        assert!(!t.on_transition(DriftMode::Komp, DriftMode::Neu, 4));
+        assert_eq!(t.stage(), 9);
+
+        // Past-vs-future asymmetry (Inv 16.15): past/present full weight, future
+        // preloaded at half.
+        let g = VersionRatchet::at(5);
+        assert_eq!(g.mark_weight(3), 1.0, "a past mark weighs full");
+        assert_eq!(g.mark_weight(5), 1.0, "the present mark weighs full");
+        assert_eq!(g.mark_weight(6), 0.5, "a future mark is half-preloaded");
     }
 }
