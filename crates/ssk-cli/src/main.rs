@@ -22,7 +22,7 @@ use ssk_runtime::{sample_intent, DeterminismContext, Runtime, RuntimeEvent, Runt
 use ssk_service_host::{HostManifest, InstallReceipt, PrivilegedHelper, ServiceHealth};
 use ssk_system::{SystemInputs, SystemPipeline};
 use ssk_tensor::{FileLedgerBackend, LedgerBackend, MemoryBackend};
-use ssk_types::{GateId, GateOutcomeKind, LocatorId, ReplayVerdict};
+use ssk_types::{digest_of, GateId, GateOutcomeKind, HashAlg, LocatorId, ReplayVerdict};
 use ssk_winhost::{WindowsConnectionSource, WindowsFirewallEnforcer, WindowsServiceHelper};
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -756,16 +756,21 @@ fn winhost_state_dir() -> Result<PathBuf, AppError> {
     Ok(dir)
 }
 
-fn winhost_sanitize_component(s: &str) -> String {
-    s.chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect()
+/// The kill-switch receipt path for a scope, keyed on the scope's *content
+/// digest* — the same digest that determines the firewall rule name — not on a
+/// lossy sanitization of the label. This guarantees distinct scopes never
+/// collide onto the same receipt file (which would let one engage silently
+/// clobber another's rollback receipt).
+fn winhost_killswitch_receipt_path(scope: &BoundaryScope) -> Result<PathBuf, AppError> {
+    let digest = digest_of(scope, HashAlg::Blake3).map_err(|e| {
+        AppError::new(
+            ErrorClass::Runtime,
+            "WINHOST_STATE_DIGEST",
+            e.to_string(),
+            vec![],
+        )
+    })?;
+    Ok(winhost_state_dir()?.join(format!("killswitch-{}.json", digest.to_hex())))
 }
 
 /// The deterministic host manifest the service subcommands share, so `install`,
@@ -890,15 +895,25 @@ fn winhost_capture(json: bool) -> Result<(), AppError> {
 
 fn winhost_killswitch_engage(scope_label: &str, json: bool) -> Result<(), AppError> {
     let scope = BoundaryScope::new(scope_label, ["*"]);
+    let path = winhost_killswitch_receipt_path(&scope)?;
+
+    // Refuse to overwrite an existing engaged receipt: a second engage would
+    // otherwise clobber the first's rollback receipt, orphaning its rule.
+    if path.exists() {
+        return Err(winhost_err(
+            "KILLSWITCH_ALREADY_ENGAGED",
+            format!(
+                "scope '{scope_label}' already has an engaged receipt at {}; release it first",
+                path.display()
+            ),
+        ));
+    }
+
     let enforcer = WindowsFirewallEnforcer::new();
     let receipt = enforcer
         .engage(&scope)
         .map_err(|e| winhost_err("KILLSWITCH_ENGAGE_FAILED", e.to_string()))?;
 
-    let path = winhost_state_dir()?.join(format!(
-        "killswitch-{}.json",
-        winhost_sanitize_component(scope_label)
-    ));
     let bytes = serde_json::to_vec_pretty(&receipt).map_err(winhost_json_err)?;
     std::fs::write(&path, bytes).map_err(|e| {
         AppError::new(
@@ -934,10 +949,8 @@ fn winhost_killswitch_engage(scope_label: &str, json: bool) -> Result<(), AppErr
 }
 
 fn winhost_killswitch_release(scope_label: &str, json: bool) -> Result<(), AppError> {
-    let path = winhost_state_dir()?.join(format!(
-        "killswitch-{}.json",
-        winhost_sanitize_component(scope_label)
-    ));
+    let scope = BoundaryScope::new(scope_label, ["*"]);
+    let path = winhost_killswitch_receipt_path(&scope)?;
     let bytes = std::fs::read(&path).map_err(|e| {
         winhost_err(
             "KILLSWITCH_NO_RECEIPT",
@@ -985,21 +998,47 @@ fn winhost_service_install(exe: Option<&str>, json: bool) -> Result<(), AppError
         Some(p) => PathBuf::from(p),
         None => winhost_default_svc_path()?,
     };
+
+    // Prepare the durable receipt path BEFORE the privileged effect, so a
+    // state-dir failure cannot leave a created service with no receipt.
+    let path = winhost_state_dir()?.join("service-install.json");
+
+    // Refuse to overwrite an existing install receipt. Re-running install would
+    // otherwise find the service already present, record prior_state=Installed,
+    // and downgrade the authoritative "we created it" receipt — after which
+    // uninstall would skip deleting a service this tool actually created,
+    // orphaning it. The first receipt is authoritative about the pre-SSK state.
+    if path.exists() {
+        return Err(winhost_err(
+            "SERVICE_ALREADY_TRACKED",
+            format!(
+                "an install receipt already exists at {}; run `ssk winhost service uninstall` first",
+                path.display()
+            ),
+        ));
+    }
+
     let helper = WindowsServiceHelper::new(&exe_path);
     let receipt = helper
         .install(&manifest)
         .map_err(|e| winhost_err("SERVICE_INSTALL_FAILED", e.to_string()))?;
 
-    let path = winhost_state_dir()?.join("service-install.json");
+    // Persist the receipt. If this fails after a fresh create, compensate by
+    // uninstalling the just-created service rather than leaking an orphaned,
+    // untracked privileged service (the receipt records prior_state ==
+    // Uninstalled, so uninstall will actually delete it).
     let bytes = serde_json::to_vec_pretty(&receipt).map_err(winhost_json_err)?;
-    std::fs::write(&path, bytes).map_err(|e| {
-        AppError::new(
+    if let Err(e) = std::fs::write(&path, bytes) {
+        if receipt.prior_state == ssk_service_host::ServiceState::Uninstalled.as_str() {
+            let _ = helper.uninstall(&receipt);
+        }
+        return Err(AppError::new(
             ErrorClass::Runtime,
             "WINHOST_STATE_WRITE",
-            e.to_string(),
+            format!("failed to persist install receipt (created service rolled back): {e}"),
             vec![],
-        )
-    })?;
+        ));
+    }
 
     if json {
         let value = serde_json::json!({
@@ -2586,5 +2625,27 @@ mod tests {
         let output = explain_target("config").expect("config explanation exists");
         assert_eq!(output.category, "error");
         assert!(!output.details.is_empty());
+    }
+
+    // The kill-switch receipt path is keyed on the scope content digest, so
+    // distinct scopes never collide onto one receipt file (finding #3), and the
+    // same scope always resolves to the same file (engage/release must agree).
+    #[test]
+    fn killswitch_receipt_path_is_scope_digest_keyed() {
+        let a = BoundaryScope::new("all-egress", ["*"]);
+        let b = BoundaryScope::new("tenant-7", ["*"]);
+        let a2 = BoundaryScope::new("all-egress", ["*"]);
+        let pa = winhost_killswitch_receipt_path(&a).expect("path a");
+        let pb = winhost_killswitch_receipt_path(&b).expect("path b");
+        let pa2 = winhost_killswitch_receipt_path(&a2).expect("path a2");
+        assert_ne!(pa, pb, "distinct scopes must not share a receipt file");
+        assert_eq!(
+            pa, pa2,
+            "the same scope must resolve to the same receipt file"
+        );
+        assert!(pa
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.starts_with("killswitch-") && n.ends_with(".json")));
     }
 }

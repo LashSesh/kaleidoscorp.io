@@ -248,11 +248,35 @@ mod sys {
 /// Capture every observable IPv4 flow (TCP + UDP) on the current platform.
 /// Real IP Helper enumeration on Windows; an empty list on other targets (the
 /// crate is inert off-Windows — callers gate on [`crate::platform_supported`]).
+///
+/// A failed IP Helper query is **surfaced** at `warn` (never silently swallowed
+/// into an empty list): the trait returns `Vec` so it cannot propagate a
+/// `Result`, but an operator watching `ssk.winhost.capture` can distinguish a
+/// genuinely-empty capture from one where a query failed. The pipeline treats an
+/// empty capture as a fail-closed hold, so a swallowed error is never permissive
+/// — but it must not be *invisible*.
 fn platform_capture_flows() -> Vec<FlowRow> {
     #[cfg(windows)]
     {
-        let mut flows = sys::capture_tcp_flows().unwrap_or_default();
-        flows.extend(sys::capture_udp_flows().unwrap_or_default());
+        let mut flows = Vec::new();
+        match sys::capture_tcp_flows() {
+            Ok(f) => flows.extend(f),
+            Err(e) => tracing::warn!(
+                target: "ssk.winhost.capture",
+                event = "capture_query_failed",
+                protocol = "tcp",
+                error = %e,
+            ),
+        }
+        match sys::capture_udp_flows() {
+            Ok(f) => flows.extend(f),
+            Err(e) => tracing::warn!(
+                target: "ssk.winhost.capture",
+                event = "capture_query_failed",
+                protocol = "udp",
+                error = %e,
+            ),
+        }
         flows
     }
     #[cfg(not(windows))]

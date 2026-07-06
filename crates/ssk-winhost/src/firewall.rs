@@ -393,6 +393,18 @@ pub fn rule_from_prior_state(prior_state: &str) -> Option<String> {
         .filter(|r| !r.is_empty())
 }
 
+/// Recover whether the rule already existed *before* this engagement, from the
+/// receipt's `prior_state` (the `severed`/`flowing` tag [`encode_prior_state`]
+/// wrote). `true` means the block rule was already present, so this engagement
+/// did not create it — and a faithful release must therefore *not* delete it.
+#[must_use]
+pub fn prior_existed_from_prior_state(prior_state: &str) -> bool {
+    prior_state
+        .split_once(RULE_TAG)
+        .map(|(flag, _)| flag == "severed")
+        .unwrap_or(false)
+}
+
 // ---------------------------------------------------------------------------
 // Thin Windows syscall layer: the ONLY code that spawns netsh.
 // ---------------------------------------------------------------------------
@@ -463,8 +475,13 @@ fn platform_release(rule_name: &str) -> Result<u32, KillSwitchError> {
 ///
 /// Multi-session note: the rule name is scope-scoped, not session-scoped (the
 /// `BoundaryEnforcer::engage` contract only receives the scope). Two sessions
-/// severing the same scope therefore share one rule; `release` removes it. Cross-
-/// session reference counting is a higher-tier concern beyond this enforcer.
+/// severing the same scope share one rule name. `engage` records whether the
+/// rule already existed, and `release` honors it: only the engagement that
+/// actually *created* the rule (prior state `flowing`) deletes it; an engagement
+/// that found it already present (prior state `severed`) leaves it in place on
+/// release, so it never over-removes a rule it did not create. Full cross-session
+/// reference counting (N engagements needing N releases) is a higher-tier concern
+/// beyond this enforcer, but the "undo only what you created" invariant holds.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct WindowsFirewallEnforcer;
 
@@ -500,6 +517,21 @@ impl BoundaryEnforcer for WindowsFirewallEnforcer {
                     .into(),
             )
         })?;
+
+        // Exact rollback (mirrors the service seam): if the block rule already
+        // existed when we engaged, this engagement did not create it, so a
+        // faithful release must NOT delete it — the prior state was already
+        // "severed", and restoring the prior state means leaving it in place.
+        // Deleting it would over-remove another party's rule (fail-open).
+        if prior_existed_from_prior_state(&receipt.prior_state) {
+            tracing::warn!(
+                target: "ssk.winhost.firewall",
+                event = "kill_switch_release_skipped_preexisting",
+                rule = %rule,
+            );
+            return Ok(());
+        }
+
         let removed =
             platform_release(&rule).map_err(|e| BoundaryError::Enforcement(e.to_string()))?;
 
@@ -822,6 +854,58 @@ mod tests {
         match enforcer.release(&foreign) {
             Err(BoundaryError::Enforcement(msg)) => assert!(msg.contains("does not carry")),
             other => panic!("expected an Enforcement error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn prior_existed_flag_round_trips() {
+        let created = EngageReceipt {
+            rule_name: "SSK-KillSwitch-x".into(),
+            prior_existed: false,
+        };
+        let preexisting = EngageReceipt {
+            rule_name: "SSK-KillSwitch-x".into(),
+            prior_existed: true,
+        };
+        assert!(!prior_existed_from_prior_state(&encode_prior_state(
+            &created
+        )));
+        assert!(prior_existed_from_prior_state(&encode_prior_state(
+            &preexisting
+        )));
+        // A foreign / tagless receipt is treated as "we created it" only if it
+        // carries a rule; the flag parse itself defaults to false (not severed).
+        assert!(!prior_existed_from_prior_state("flowing"));
+        assert!(!prior_existed_from_prior_state("garbage"));
+    }
+
+    // Releasing a receipt whose rule PRE-EXISTED must not attempt any deletion —
+    // even off-Windows it returns Ok WITHOUT reaching the platform layer (which
+    // would otherwise report Unsupported). This proves "undo only what you
+    // created": a pre-existing rule is never over-removed.
+    #[test]
+    fn release_of_a_preexisting_rule_is_a_no_op() {
+        let enforcer = WindowsFirewallEnforcer::new();
+        let scope = BoundaryScope::all_egress();
+        let receipt = EnforcementReceipt::new(&scope, "severed;rule=SSK-KillSwitch-shared");
+        assert!(
+            enforcer.release(&receipt).is_ok(),
+            "releasing a pre-existing rule must be a no-op success, not a deletion"
+        );
+    }
+
+    // Conversely, a rule WE created (flowing) must actually be released — which
+    // off-Windows means it reaches the platform layer and reports Unsupported
+    // (never a silent success).
+    #[cfg(not(windows))]
+    #[test]
+    fn release_of_a_created_rule_reaches_the_platform() {
+        let enforcer = WindowsFirewallEnforcer::new();
+        let scope = BoundaryScope::all_egress();
+        let receipt = EnforcementReceipt::new(&scope, "flowing;rule=SSK-KillSwitch-ours");
+        match enforcer.release(&receipt) {
+            Err(BoundaryError::Enforcement(msg)) => assert!(msg.contains("requires Windows")),
+            other => panic!("expected a platform Enforcement error, got {other:?}"),
         }
     }
 }
