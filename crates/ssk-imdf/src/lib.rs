@@ -53,7 +53,7 @@ pub use observer::{
 pub use qlogic::{QAxis, QLogicGate, QLogicInput, QLogicThresholds, QLogicVector, QOutcome};
 pub use replay::{
     reanalyze, ImdfReplayManifest, ReanalysisReport, ReanalysisVerdict, RunDescriptor,
-    RunTransition,
+    RunTransition, StabilityCertificate,
 };
 pub use self_anchor::{
     BcikCrossing, DomeLocator, LocatorAddressId, NullAnchor, SelfAnchor, SelfAnchorId,

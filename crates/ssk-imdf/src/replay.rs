@@ -326,6 +326,48 @@ pub fn reanalyze(manifest: &ImdfReplayManifest, descriptor: &RunDescriptor) -> R
     }
 }
 
+/// The Wiederkehrstabilität certificate `w(Φ)` (IMRT A8): a run is *stable on
+/// return* iff its replay is deterministic, its reanalysis passes, AND its
+/// self-anchor is invariant across the return. `w(Φ)=1` iff all three conjuncts
+/// hold; any single failure yields `w(Φ)=0` (fail-closed — an anchor drift
+/// forces a new run rather than a silent stable verdict).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StabilityCertificate {
+    /// The run re-executes bit-exactly against its manifest.
+    pub replay_deterministic: bool,
+    /// Reanalysis returned a clean `Pass`.
+    pub reanalysis_passed: bool,
+    /// The self-anchor class is unchanged across the return.
+    pub anchor_invariant: bool,
+}
+
+impl StabilityCertificate {
+    /// Build the certificate from a replay-determinism bit and a reanalysis
+    /// report. `reanalysis_passed` is the typed `Pass` verdict; `anchor_invariant`
+    /// is the report's anchor-recovery bit.
+    #[must_use]
+    pub fn evaluate(replay_deterministic: bool, report: &ReanalysisReport) -> Self {
+        StabilityCertificate {
+            replay_deterministic,
+            reanalysis_passed: report.verdict() == ReanalysisVerdict::Pass,
+            anchor_invariant: report.self_anchor_recovered,
+        }
+    }
+
+    /// The stability weight `w(Φ) ∈ {0,1}` — the conjunction of all three
+    /// conjuncts.
+    #[must_use]
+    pub fn w(&self) -> u8 {
+        u8::from(self.replay_deterministic && self.reanalysis_passed && self.anchor_invariant)
+    }
+
+    /// Whether the run is stable on return (`w(Φ)=1`).
+    #[must_use]
+    pub fn is_stable(&self) -> bool {
+        self.w() == 1
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -523,5 +565,52 @@ mod tests {
         assert!(names.contains(&"run_id"));
         assert!(names.contains(&"prior_trace"));
         assert!(new_manifest.is_consistent());
+    }
+
+    // G17 (A8): w(Φ)=1 iff replay-determinism ∧ reanalysis-Pass ∧
+    // anchor-invariance all hold; any single failed conjunct yields w(Φ)=0.
+    // Enumerate all 2^3 combinations.
+    #[test]
+    fn stability_certificate_is_the_conjunction_of_three_conjuncts() {
+        for replay in [false, true] {
+            for reanalysis in [false, true] {
+                for anchor in [false, true] {
+                    // Synthesize a report with the desired reanalysis/anchor bits.
+                    let report = ReanalysisReport {
+                        self_anchor_recovered: anchor,
+                        recovered_anchor: SelfAnchorId(digest_of(&"c", HashAlg::Blake3).unwrap()),
+                        // A Pass verdict needs manifest_consistent && verdict_matches
+                        // && self_anchor_recovered; drive the first two together.
+                        verdict_matches: reanalysis,
+                        manifest_consistent: reanalysis,
+                    };
+                    let reanalysis_passed = report.verdict() == ReanalysisVerdict::Pass;
+                    let cert = StabilityCertificate::evaluate(replay, &report);
+                    assert_eq!(cert.reanalysis_passed, reanalysis_passed);
+                    let expected = u8::from(replay && reanalysis_passed && anchor);
+                    assert_eq!(
+                        cert.w(),
+                        expected,
+                        "w(Φ) is the conjunction (replay={replay}, reanalysis={reanalysis}, anchor={anchor})"
+                    );
+                    assert_eq!(cert.is_stable(), expected == 1);
+                }
+            }
+        }
+
+        // The fully-clean run is stable; a real anchor drift breaks it.
+        let d = descriptor();
+        let manifest = ImdfReplayManifest::of(&d);
+        let clean = StabilityCertificate::evaluate(true, &reanalyze(&manifest, &d));
+        assert!(clean.is_stable(), "a clean, deterministic run is stable");
+
+        let mut drifted = manifest.clone();
+        drifted.self_anchor_id = SelfAnchorId(digest_of(&"drifted", HashAlg::Blake3).unwrap());
+        drifted.manifest_digest = drifted.recompute_digest();
+        let unstable = StabilityCertificate::evaluate(true, &reanalyze(&drifted, &d));
+        assert!(
+            !unstable.is_stable(),
+            "an anchor drift breaks stability even with deterministic replay"
+        );
     }
 }
