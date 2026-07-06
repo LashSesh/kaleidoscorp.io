@@ -7,15 +7,24 @@
 //! confirms it matches the committed id: the anchor is *recovered*, not trusted.
 
 use serde::{Deserialize, Serialize};
-use ssk_types::{digest_of, Digest, HashAlg};
+use ssk_types::{digest_of, Digest, HashAlg, RunId};
 
 use crate::observer::ObserverId;
 use crate::qlogic::QOutcome;
 use crate::self_anchor::{SelfAnchor, SelfAnchorId};
 
-/// Everything needed to re-run and reanalyze an observation.
+/// Everything needed to re-run and reanalyze an observation. Carries its own
+/// `run_id` and, when it supersedes an earlier run under anchor-drift, a
+/// `prior_trace` back-reference to the committed trace it replaced (Vertrag
+/// 8.3). A run is never mutated in place; a drift past bound *forks* a new run.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RunDescriptor {
+    /// Content-derived identity of this run — a function of every input plus the
+    /// `prior_trace`, so a fork always yields a distinct id.
+    pub run_id: RunId,
+    /// The committed trace digest of the run this one superseded, or `None` for
+    /// a fresh (non-forked) run.
+    pub prior_trace: Option<Digest>,
     pub self_anchor: SelfAnchor,
     pub observer: ObserverId,
     pub source_digest: Digest,
@@ -23,7 +32,52 @@ pub struct RunDescriptor {
     pub gate_verdict: String,
 }
 
+/// The decision at a run boundary under measured drift: stay in the current run
+/// (compensate) or fork a fresh successor (Vertrag 8.3).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RunTransition {
+    /// Drift is within bound — keep observing in the same run.
+    Compensate,
+    /// Drift exceeded bound — a new run supersedes, back-referencing the old.
+    Fork(Box<RunDescriptor>),
+}
+
 impl RunDescriptor {
+    /// Derive the content-addressed run id from every input plus `prior_trace`.
+    fn derive_run_id(
+        self_anchor: &SelfAnchor,
+        observer: &ObserverId,
+        source_digest: &Digest,
+        wavefront_digest: &Digest,
+        gate_verdict: &str,
+        prior_trace: Option<&Digest>,
+    ) -> RunId {
+        #[derive(Serialize)]
+        struct RunIdForm<'a> {
+            domain: &'a str,
+            self_anchor: &'a SelfAnchorId,
+            observer: &'a ObserverId,
+            source_digest: &'a Digest,
+            wavefront_digest: &'a Digest,
+            gate_verdict: &'a str,
+            prior_trace: Option<&'a Digest>,
+        }
+        let d = digest_of(
+            &RunIdForm {
+                domain: "imdf/run-id/v1",
+                self_anchor: &self_anchor.id,
+                observer,
+                source_digest,
+                wavefront_digest,
+                gate_verdict,
+                prior_trace,
+            },
+            HashAlg::Blake3,
+        )
+        .expect("run-id form is serializable");
+        RunId::new(d.to_hex())
+    }
+
     #[must_use]
     pub fn new(
         self_anchor: SelfAnchor,
@@ -32,12 +86,82 @@ impl RunDescriptor {
         wavefront_digest: Digest,
         gate_verdict: QOutcome,
     ) -> Self {
+        let verdict = gate_verdict.as_str().to_owned();
+        let run_id = Self::derive_run_id(
+            &self_anchor,
+            &observer,
+            &source_digest,
+            &wavefront_digest,
+            &verdict,
+            None,
+        );
         RunDescriptor {
+            run_id,
+            prior_trace: None,
             self_anchor,
             observer,
             source_digest,
             wavefront_digest,
-            gate_verdict: gate_verdict.as_str().to_owned(),
+            gate_verdict: verdict,
+        }
+    }
+
+    /// Fork a successor run that supersedes this one, back-referencing
+    /// `superseded_trace` (the committed trace digest of the run being replaced —
+    /// e.g. the old [`ImdfReplayManifest::manifest_digest`]). `self` is **not**
+    /// mutated; the successor carries a fresh, distinct `run_id` and the same
+    /// self-anchor observed under the drifted `source`/`wavefront`/`verdict`.
+    #[must_use]
+    pub fn fork(
+        &self,
+        superseded_trace: Digest,
+        source_digest: Digest,
+        wavefront_digest: Digest,
+        gate_verdict: QOutcome,
+    ) -> RunDescriptor {
+        let verdict = gate_verdict.as_str().to_owned();
+        let prior = Some(superseded_trace);
+        let run_id = Self::derive_run_id(
+            &self.self_anchor,
+            &self.observer,
+            &source_digest,
+            &wavefront_digest,
+            &verdict,
+            prior.as_ref(),
+        );
+        RunDescriptor {
+            run_id,
+            prior_trace: prior,
+            self_anchor: self.self_anchor.clone(),
+            observer: self.observer,
+            source_digest,
+            wavefront_digest,
+            gate_verdict: verdict,
+        }
+    }
+
+    /// The Vertrag 8.3 decision: if `drift <= drift_bound` (finite), compensate
+    /// in place; otherwise fork a successor superseding `superseded_trace`. A
+    /// non-finite drift always forks (fail toward a fresh run).
+    #[must_use]
+    pub fn advance_under_drift(
+        &self,
+        drift: f64,
+        drift_bound: f64,
+        superseded_trace: Digest,
+        source_digest: Digest,
+        wavefront_digest: Digest,
+        gate_verdict: QOutcome,
+    ) -> RunTransition {
+        if drift.is_finite() && drift <= drift_bound {
+            RunTransition::Compensate
+        } else {
+            RunTransition::Fork(Box::new(self.fork(
+                superseded_trace,
+                source_digest,
+                wavefront_digest,
+                gate_verdict,
+            )))
         }
     }
 }
@@ -45,6 +169,8 @@ impl RunDescriptor {
 /// A compact commitment to every input of a run.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ImdfReplayManifest {
+    pub run_id: RunId,
+    pub prior_trace: Option<Digest>,
     pub self_anchor_id: SelfAnchorId,
     pub observer: ObserverId,
     pub source_digest: Digest,
@@ -55,6 +181,8 @@ pub struct ImdfReplayManifest {
 
 #[derive(Serialize)]
 struct ManifestForm<'a> {
+    run_id: &'a RunId,
+    prior_trace: Option<&'a Digest>,
     self_anchor_id: &'a SelfAnchorId,
     observer: &'a ObserverId,
     source_digest: &'a Digest,
@@ -69,6 +197,8 @@ impl ImdfReplayManifest {
         let self_anchor_id = descriptor.self_anchor.id;
         let manifest_digest = digest_of(
             &ManifestForm {
+                run_id: &descriptor.run_id,
+                prior_trace: descriptor.prior_trace.as_ref(),
                 self_anchor_id: &self_anchor_id,
                 observer: &descriptor.observer,
                 source_digest: &descriptor.source_digest,
@@ -79,6 +209,8 @@ impl ImdfReplayManifest {
         )
         .expect("manifest form is serializable");
         ImdfReplayManifest {
+            run_id: descriptor.run_id.clone(),
+            prior_trace: descriptor.prior_trace,
             self_anchor_id,
             observer: descriptor.observer,
             source_digest: descriptor.source_digest,
@@ -92,6 +224,11 @@ impl ImdfReplayManifest {
     #[must_use]
     pub fn committed_inputs(&self) -> Vec<(&'static str, String)> {
         vec![
+            ("run_id", self.run_id.0 .0.clone()),
+            (
+                "prior_trace",
+                self.prior_trace.map(|d| d.to_hex()).unwrap_or_default(),
+            ),
             ("self_anchor", self.self_anchor_id.0.to_hex()),
             ("observer", self.observer.0.to_hex()),
             ("source", self.source_digest.to_hex()),
@@ -106,6 +243,8 @@ impl ImdfReplayManifest {
     pub fn recompute_digest(&self) -> Digest {
         digest_of(
             &ManifestForm {
+                run_id: &self.run_id,
+                prior_trace: self.prior_trace.as_ref(),
                 self_anchor_id: &self.self_anchor_id,
                 observer: &self.observer,
                 source_digest: &self.source_digest,
@@ -221,5 +360,89 @@ mod tests {
         let mut wrong = manifest.clone();
         wrong.self_anchor_id = SelfAnchorId(digest_of(&"someone-else", HashAlg::Blake3).unwrap());
         assert!(!reanalyze(&wrong, &d).self_anchor_recovered);
+    }
+
+    // G2 (Vertrag 8.3): drift past bound forks a new run that back-references the
+    // superseded run's committed trace, with a distinct RunId — and the old
+    // descriptor is left byte-unchanged (no in-place mutation).
+    #[test]
+    fn drift_past_bound_forks_a_new_run_without_mutating_the_old() {
+        let old = descriptor();
+        assert!(old.prior_trace.is_none(), "a fresh run has no prior trace");
+
+        // Snapshot the old descriptor's bytes before any transition.
+        let old_bytes = serde_json::to_vec(&old).unwrap();
+        let committed_trace = ImdfReplayManifest::of(&old).manifest_digest;
+
+        let drifted_source = digest_of(&"drifted-source", HashAlg::Blake3).unwrap();
+        let drifted_wavefront = digest_of(&"drifted-wavefront", HashAlg::Blake3).unwrap();
+
+        // Within bound: compensate — no new run.
+        assert_eq!(
+            old.advance_under_drift(
+                0.1,
+                0.5,
+                committed_trace,
+                drifted_source,
+                drifted_wavefront,
+                QOutcome::Pass
+            ),
+            RunTransition::Compensate
+        );
+
+        // Past bound: fork.
+        let transition = old.advance_under_drift(
+            0.9,
+            0.5,
+            committed_trace,
+            drifted_source,
+            drifted_wavefront,
+            QOutcome::Hold,
+        );
+        let RunTransition::Fork(new) = transition else {
+            panic!("drift past bound must fork a new run");
+        };
+
+        // Distinct RunId.
+        assert_ne!(new.run_id, old.run_id, "a fork must have a distinct run id");
+        // Back-reference equals the old run's committed trace digest.
+        assert_eq!(
+            new.prior_trace,
+            Some(committed_trace),
+            "the successor back-references the superseded committed trace"
+        );
+        // Same self-anchor, drifted measurement.
+        assert_eq!(new.self_anchor, old.self_anchor);
+        assert_eq!(new.source_digest, drifted_source);
+        // A non-finite drift always forks.
+        assert!(matches!(
+            old.advance_under_drift(
+                f64::NAN,
+                0.5,
+                committed_trace,
+                drifted_source,
+                drifted_wavefront,
+                QOutcome::Pass
+            ),
+            RunTransition::Fork(_)
+        ));
+
+        // The old descriptor is byte-unchanged — no in-place mutation.
+        assert_eq!(
+            serde_json::to_vec(&old).unwrap(),
+            old_bytes,
+            "forking must not mutate the superseded run"
+        );
+
+        // The fork's prior_trace is committed in its manifest (no silent loss).
+        let new_manifest = ImdfReplayManifest::of(&new);
+        let names: Vec<&str> = new_manifest
+            .committed_inputs()
+            .iter()
+            .map(|(n, _)| *n)
+            .collect();
+        assert!(names.contains(&"run_id"));
+        assert!(names.contains(&"prior_trace"));
+        assert!(new_manifest.is_consistent());
     }
 }
