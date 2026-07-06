@@ -41,9 +41,16 @@ The theory's normative core is: 10 axioms **A1..A10** (§10), ~30 base objects w
 
 ### Corpus roll-up (63 verified rows)
 
+This is the **as-audited baseline** (the state at spec authoring time):
+
 | Realized | Partial | Divergent | Absent | Total |
 |---:|---:|---:|---:|---:|
 | 24 | 22 | 8 | 9 | 63 |
+
+**Implementation pass 1** has since closed 21 of the ranked gaps (G1, G2, G3, G5, G6, G7, G8, G9, G10, G11,
+G15, G17, G18, G24, G26/G27, G28, G29, G30, G31, G34, G36), each with a discharging test on a green workspace —
+see the §5a Resolution Log for the per-gap status and evidence. The baseline table above is intentionally left
+unchanged as the audit-time snapshot; §5a is authoritative for current status.
 
 ---
 
@@ -308,6 +315,46 @@ Layers L0..L9 + operators + boundary. `theory_element | axioms | codebase_locati
 
 Every Partial/Divergent/Absent row → a numbered implementation item. **Ranked by axiom-criticality
 (A1/A4/A6/A7 highest) then verdict severity (Absent/Divergent before Partial) then blast radius.**
+
+### 5a. Resolution Log (implementation pass 1)
+
+The following gaps have been **closed** in this pass — each with a proof-obligation test, verified against a
+green workspace (build + fmt + clippy `-D warnings` + full test suite). Gaps not listed remain open per §5b.
+This log is authoritative over the per-tier "verdict" lines below where they disagree; the tier text is kept
+as the original problem statement.
+
+| Gap | Axiom | Status | Crate | Discharging test(s) |
+|---|---|---|---|---|
+| **G1** NullAnchor Z (L0 fixpoint) | A1 | ✅ Realized | `ssk-imdf::self_anchor` | `null_anchor_commitment_is_deterministic_and_domain_separated`, `null_anchor_orders_the_self_anchor_without_emitting_z`, `same_null_anchor_binds_anchors_to_the_same_recovery_root` (structural: `NullAnchor` derives no `Serialize`) |
+| **G2** Anchor-Stability drift-fork | A1,A8 | ✅ Realized | `ssk-imdf::replay` | `drift_past_bound_forks_a_new_run_without_mutating_the_old` |
+| **G3** GateVector six-axis semantics (Π/R/B) | A6 | ✅ Realized (re-map, not §3.2 divergence) | `ssk-imdf::qlogic`, `ssk-system` | `each_axis_binds_to_its_theory_quantity`, `non_finite_projection_and_residue_fail_closed`, `parallax_and_replay_evidence_genuinely_gate_the_pipeline` |
+| **G5** FourPi ℤ/2 orientation rotor | A7 | ✅ Realized | `ssk-imdf::closure` | `orientation_is_zz2_graded` |
+| **G6** FourPiClosure 2nd conjunct + Gegenhorizontmasse | A7 | ✅ Realized | `ssk-imdf::closure` | `four_pi_requires_second_orientation_pass`, `drifted_self_class_yields_gegenhorizontmasse_not_closure`, `inconsistent_second_pass_does_not_close` |
+| **G7** HostAuthority residue | A4 | ✅ Realized | `ssk-host-cells` | `under_capability_denial_conserves_a_host_authority_residue` |
+| **G8** ResidueCloud X edge-partition + ρ* | A4 | ✅ Realized | `ssk-types` | `residue_cloud_partitions_disjointly_with_rho_star_catch_all` |
+| **G9** Residue 5-tuple + taxonomy K (11 kinds) | A4 | ✅ Realized | `ssk-types` | `residue_is_the_complete_five_tuple_over_taxonomy_k` |
+| **G10** CounterHorizon H register triple | A4 | ✅ Realized | `ssk-types` | `counter_horizon_register_is_append_only_and_h_is_total` |
+| **G11** Kospektral Hold residue payload | A4,A5 | ✅ Realized | `ssk-mpk` | `cospectral_hold_carries_a_conserved_residue_payload` |
+| **G15** Drift-Hysterese double-threshold | A8 | ✅ Realized | `ssk-meta-resonance` | `drift_mode_is_bistable_in_the_band`, `drift_mode_flips_only_at_thresholds` |
+| **G17** Wiederkehrstabilität w(Φ)=1 | A8 | ✅ Realized | `ssk-imdf::replay` | `stability_certificate_is_the_conjunction_of_three_conjuncts` |
+| **G18** ReanalysisOperator verdict/idempotence | A8,A7 | ✅ Realized | `ssk-imdf::replay` | `reanalysis_verdict_is_typed_and_class_idempotent` |
+| **G24** Claim 8-tuple + weight-gating | A5 | ✅ Realized | `ssk-imdf::claim` | `well_formed_claim_has_weight_one_and_is_written`, `groundless_claim_is_entwurf_and_refused`, `gate_undefined_claim_is_hypothese_and_refused`, `undeclared_residue_claim_is_refused` |
+| **G26/G27** Blindspot 5-tuple + actionable residue | A4,A5 | ✅ Realized | `ssk-imdf::observer` | `blindspot_is_the_full_five_tuple`, `blindspot_residue_drives_required_aperture_remediation` |
+| **G28** ParallaxOperator pseudometric | A3 | ✅ Realized | `ssk-imdf::wavefront` | `parallax_divergence_is_symmetric_and_zero_on_self` |
+| **G29** SplitOperator role-orthogonality | A3 | ✅ Realized | `ssk-imdf::wavefront` | `birefringent_split_of_a_copy_is_not_orthogonal`, `a3_obligation_binds_only_to_orthogonal_splits` |
+| **G30** SplitAxis enum | A3 | ✅ Realized | `ssk-imdf::wavefront` | `every_split_declares_its_axis` |
+| **G31** Ray / RaySet | A3 | ✅ Realized | `ssk-imdf::wavefront` | `split_yields_a_ray_set_of_at_least_two_orthogonal_rays` |
+| **G34** Contact + Kontaktlücke residue | A2 | ✅ Realized | `ssk-imdf::contact` | `uncontacted_emphasis_becomes_a_conserved_kontaktluecke`, `blindspot_emphasis_is_a_deferred_not_blocking_gap` |
+| **G36** Aperture algebra proofs | A2 | ✅ Realized | `ssk-imdf::aperture` | `focus_is_idempotent_on_the_same_surface`, `focus_partitions_every_surface_dimension_without_loss` |
+
+**Still open after this pass (see §5b tiers):** G4 (QState 4-tuple + Stab(q)), G12 (Kospektral resolution ladder),
+G13 (Multisignature Φpan), G14 (Atlas Φ 13-tuple), G16 (run-transition reset ϱ + ratchet ℓ), G19–G23 (Boundary
+interface B, CompatibilityShell, GateMap/ReplayBridge/ResidueLift, Atlas materialization), G25 (ObserverField
+aggregate), G32/G33/G35/G37 (ImmersionField, FieldCell fold, Lens-as-operator, MirrorDome façade), G38
+(Reflection + Boundary-Ambiguität), G39 (Csym aggregate). The §7 open residues (ρ01–ρ18) remain
+theory-designated non-gaps.
+
+### 5b. Original ranked gap list
 
 ### Tier 1 — A1 (SelfAnchor-priority: foundation)
 **G1. NullAnchor Z (L0 fixpoint) — Absent [A1].**
