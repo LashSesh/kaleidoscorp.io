@@ -859,6 +859,14 @@ impl BoundaryResidue {
     pub fn open_obligation(&self) -> bool {
         matches!(self.status, ResidueStatus::Open)
     }
+
+    /// The CounterHorizon mapping `H(r) = (class, status, next_action)`
+    /// (IMRT A4, Def. H). Every residue yields a complete triple — there is no
+    /// residue whose disposition is undefined.
+    #[must_use]
+    pub fn h_triple(&self) -> (ResidueKind, ResidueStatus, NextAction) {
+        (self.kind, self.status, self.next_action)
+    }
 }
 
 /// Append-only register of residues emitted during one run (ch. 9.2's
@@ -889,6 +897,24 @@ impl ResidueRegister {
     #[must_use]
     pub fn entries(&self) -> &[BoundaryResidue] {
         &self.entries
+    }
+
+    /// The number of residues emitted so far. Monotone non-decreasing over the
+    /// register's life — there is no removal API (append-only by construction).
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// The CounterHorizon triples `H(r)` for every registered residue, in emit
+    /// order — the full `X → K × Status × NextAction` mapping.
+    pub fn horizon(&self) -> impl Iterator<Item = (ResidueKind, ResidueStatus, NextAction)> + '_ {
+        self.entries.iter().map(BoundaryResidue::h_triple)
     }
 }
 
@@ -1323,6 +1349,79 @@ mod tests {
             1,
             "only the Open one blocks"
         );
+    }
+
+    // G10 (A4, Def. H): the register is append-only — length is monotone
+    // non-decreasing and there is no removal API — and the CounterHorizon
+    // mapping H yields a complete (class, status, next_action) triple for every
+    // entry, with no residue left undefined.
+    #[test]
+    fn counter_horizon_register_is_append_only_and_h_is_total() {
+        let mut reg = ResidueRegister::new();
+        assert!(reg.is_empty());
+
+        let mut prev = 0usize;
+        for (i, (kind, status, action)) in [
+            (
+                ResidueKind::Cospectral,
+                ResidueStatus::Open,
+                NextAction::Hold,
+            ),
+            (
+                ResidueKind::FieldProjection,
+                ResidueStatus::Deferred,
+                NextAction::Accept,
+            ),
+            (
+                ResidueKind::Capability,
+                ResidueStatus::Resolved,
+                NextAction::Reanalyze,
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            reg.emit(BoundaryResidue::new_full(
+                ResidueId::new(format!("r{i}")),
+                kind,
+                GateId::Focus,
+                Some(format!("frag{i}")),
+                "reason",
+                Severity::Low,
+                TraceId::new(format!("t{i}")),
+                status,
+                action,
+            ));
+            // Monotone: length only ever grows.
+            assert!(reg.len() > prev, "emit must strictly grow the register");
+            prev = reg.len();
+        }
+
+        // H(r) is total: every registered residue yields its full triple, in
+        // emit order, matching what was emitted.
+        let horizon: Vec<_> = reg.horizon().collect();
+        assert_eq!(
+            horizon,
+            vec![
+                (
+                    ResidueKind::Cospectral,
+                    ResidueStatus::Open,
+                    NextAction::Hold
+                ),
+                (
+                    ResidueKind::FieldProjection,
+                    ResidueStatus::Deferred,
+                    NextAction::Accept
+                ),
+                (
+                    ResidueKind::Capability,
+                    ResidueStatus::Resolved,
+                    NextAction::Reanalyze
+                ),
+            ],
+            "H maps every residue to a complete (class, status, next_action) triple"
+        );
+        assert_eq!(horizon.len(), reg.len(), "H is defined for every entry");
     }
 
     #[test]
