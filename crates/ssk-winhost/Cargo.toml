@@ -1,0 +1,41 @@
+[package]
+name = "ssk-winhost"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# ssk-winhost — the ONE crate exempt from the workspace-wide `unsafe_code =
+# "forbid"`. It isolates every privileged, OS-specific FFI so the rest of the
+# system stays provably unsafe-free. It binds real Windows 11 backends to the
+# three injected seams the pure crates left open (BoundaryEnforcer,
+# TrafficSource, PrivilegedHelper). All privileged work is #[cfg(windows)]; the
+# crate still compiles (and its pure logic is unit-tested) on any host, and is
+# verified to cross-compile for x86_64-pc-windows-msvc.
+
+[dependencies]
+ssk-types = { path = "../ssk-types", version = "0.1.0" }
+ssk-boundary = { path = "../ssk-boundary", version = "0.1.0" }
+ssk-capture = { path = "../ssk-capture", version = "0.1.0" }
+ssk-service-host = { path = "../ssk-service-host", version = "0.1.0" }
+tracing = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Networking_WinSock",
+    "Win32_NetworkManagement_IpHelper",
+] }
+windows-service = "0.8.1"
+
+# This crate deliberately does NOT do `[lints] workspace = true`: the workspace
+# forbids unsafe_code, and `forbid` cannot be relaxed by an inner attribute.
+# Isolating the FFI here is the whole point, so we restate the lints locally
+# with unsafe_code permitted — but keep clippy exactly as strict as the rest of
+# the workspace (CI still runs `clippy --workspace -- -D warnings`).
+[lints.rust]
+unsafe_code = "allow"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+module_name_repetitions = "allow"
+missing_errors_doc = "allow"
