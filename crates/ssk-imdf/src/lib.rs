@@ -41,7 +41,7 @@ pub mod wavefront;
 
 pub use aperture::{Aperture, ApertureSession, FocusResult, Reading};
 pub use atlas::{AtlasEntry, AtlasObservation, SelfPerceptionAtlas};
-pub use closure::{ClosureState, FourPiClosure, OrientationPass};
+pub use closure::{ClosureReport, ClosureState, FourPiClosure, Orientation, OrientationPass};
 pub use error::ImdfError;
 pub use observer::{
     Blindspot, Lens, ObserverId, ObserverModel, TrustLevel, Vantage, SELF_OBSERVATION_USE,
