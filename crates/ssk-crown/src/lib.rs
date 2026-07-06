@@ -476,9 +476,9 @@ mod tests {
                 coherence: 1.0,
                 entropy: 0.1,
                 entropy_bound: 0.5,
-                parallax_consistent: true,
-                replay_equal: true,
-                open_obligations: 0,
+                projection_quality: 1.0,
+                residue_load: 0.0,
+                boundary_stable: true,
                 drift: 0.0,
                 drift_bound: 0.35,
             })

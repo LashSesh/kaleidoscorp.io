@@ -1,18 +1,34 @@
-//! The QLOGIC gate g = (κ, H, Π, R, B, Δ) (IMDF 10).
+//! The QLOGIC gate g = (κ, H, Π, R, B, Δ) (IMDF 10; IMRT Axiom A6, Def. 8.13).
 //!
 //! Six independent axes, each yielding Pass / Hold / Fail, combined into an
-//! overall verdict — **never** collapsed to a single scalar score. The axes:
+//! overall verdict — **never** collapsed to a single scalar score. The axes
+//! carry the theory's *specific* meanings (IMRT §8.13 / §10.6):
 //!
 //! * **κ (kappa)** — coherence: the wavefront measured what its aperture admitted.
 //! * **H** — entropy: measurement entropy within bound.
-//! * **Π (pi)** — parallax: the birefringent split is consistent.
-//! * **R** — replay: replay-equality holds for this observation.
-//! * **B** — boundary: no unresolved boundary/residue obligation.
+//! * **Π (pi)** — projection quality (*Projektionsgüte*): how completely the
+//!   captured field was reconstructed/coupled into the wavefront. This is **not**
+//!   parallax — parallax is the A3 obligation, evaluated separately by the
+//!   composition (`ssk-system`), never on this axis.
+//! * **R** — residue load (*Residuenlast*, λ = |X|/|M|): the fraction of measured
+//!   mass left as unintegrated residue. This is **not** replay — replay-equality
+//!   is an A8 / stability obligation, evaluated separately by the composition.
+//! * **B** — boundary stability (*Boundary-Stabilität*): the boundary
+//!   (egress/kill-switch, seam) is stable and carries no open boundary residue.
 //! * **Δ (delta)** — drift: signature drift from the self-anchor within bound.
 //!
 //! The verdict is `Fail` if any axis fails, else `Hold` if any axis holds, else
 //! `Pass`. Two observations with identical overall verdicts can still differ per
 //! axis — the gate keeps the whole vector, so the *reason* is never lost.
+//!
+//! ## Resolution note (A6 axis semantics, Fassung 1.1 → SSK)
+//! Earlier the code fed `parallax_consistent`, `replay_equal` and
+//! `open_obligations` onto the Π, R and B axes respectively — the divergence the
+//! implementation spec flagged (G3). This is now corrected: each axis reads its
+//! theory quantity, computed from a real signal, and parallax/replay are
+//! relocated to their correct axioms (A3, A8) in the composition. No check is
+//! dropped — only attributed to the right axis. (Per IMRT Regel 3.2 this is a
+//! conformance correction, not a registered divergence.)
 
 use ssk_types::GateOutcomeKind;
 
@@ -68,32 +84,47 @@ impl QOutcome {
     }
 }
 
-/// Evidence the gate evaluates. Each field is a typed measurement, not a score.
+/// Evidence the gate evaluates. Each field is a typed measurement bound to its
+/// theory axis (IMRT §8.13), not a score.
 #[derive(Clone, Debug, PartialEq)]
 pub struct QLogicInput {
-    /// Fraction of admitted dimensions that were actually measured (coherence).
+    /// **κ** — fraction of admitted dimensions that were actually measured
+    /// (coherence).
     pub coherence: f64,
-    /// Measurement entropy and its permitted bound.
+    /// **H** — measurement entropy and its permitted bound.
     pub entropy: f64,
     pub entropy_bound: f64,
-    /// Whether the birefringent split is consistent (parallax).
-    pub parallax_consistent: bool,
-    /// Whether replay-equality holds for this observation.
-    pub replay_equal: bool,
-    /// Count of unresolved boundary/residue obligations.
-    pub open_obligations: usize,
-    /// Signature drift from the self-anchor and its bound.
+    /// **Π** — projection quality (*Projektionsgüte*): how completely the
+    /// captured field was reconstructed/coupled (1.0 = full projection, lower =
+    /// more projection residue). NOT parallax.
+    pub projection_quality: f64,
+    /// **R** — residue load (*Residuenlast*, λ = |X|/|M|): fraction of measured
+    /// mass left as unintegrated residue (0.0 = nothing open). NOT replay.
+    pub residue_load: f64,
+    /// **B** — boundary stability (*Boundary-Stabilität*): the boundary
+    /// (egress/kill-switch, seam) is stable and carries no open boundary residue.
+    pub boundary_stable: bool,
+    /// **Δ** — signature drift from the self-anchor and its bound.
     pub drift: f64,
     pub drift_bound: f64,
 }
 
-/// Tunable thresholds for the coherence axis.
+/// Tunable thresholds. Each threshold pair delimits Pass / Hold / Fail for one
+/// axis; the *semantics* of each axis are fixed by the theory (Def. 8.13), only
+/// the numeric bounds are policy (IMRT ρ06/ρ16).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct QLogicThresholds {
-    /// Below this coherence the κ axis fails; between this and `coherence_pass`
-    /// it holds.
+    /// κ: below `coherence_fail` fails; between it and `coherence_pass` holds.
     pub coherence_fail: f64,
     pub coherence_pass: f64,
+    /// Π: at/above `projection_pass` passes; at/above `projection_hold` holds;
+    /// below fails (higher projection quality is better).
+    pub projection_pass: f64,
+    pub projection_hold: f64,
+    /// R: at/below `residue_pass` passes; at/below `residue_hold` holds; above
+    /// fails (lower residue load is better).
+    pub residue_pass: f64,
+    pub residue_hold: f64,
 }
 
 impl Default for QLogicThresholds {
@@ -101,6 +132,10 @@ impl Default for QLogicThresholds {
         QLogicThresholds {
             coherence_fail: 0.5,
             coherence_pass: 0.999,
+            projection_pass: 0.999,
+            projection_hold: 0.5,
+            residue_pass: 0.0,
+            residue_hold: 0.5,
         }
     }
 }
@@ -197,17 +232,34 @@ impl QLogicGate {
         } else {
             QOutcome::Fail
         };
-        let pi = if input.parallax_consistent {
-            QOutcome::Pass
-        } else {
+        // Π — projection quality: higher is better. Non-finite fails closed
+        // (same reasoning as κ: it tests the *pass* side, so a NaN would slip to
+        // the final arm — guard it explicitly).
+        let pi = if !input.projection_quality.is_finite()
+            || input.projection_quality < self.thresholds.projection_hold
+        {
             QOutcome::Fail
-        };
-        let r = if input.replay_equal {
-            QOutcome::Pass
+        } else if input.projection_quality < self.thresholds.projection_pass {
+            QOutcome::Hold
         } else {
-            QOutcome::Fail
+            QOutcome::Pass
         };
-        let b = if input.open_obligations == 0 {
+        // R — residue load: lower is better; 0 passes, some holds, heavy fails.
+        // Non-finite (incl. a NaN from a 0/0 load) fails closed rather than
+        // slipping past both `>` comparisons to Pass.
+        let r = if !input.residue_load.is_finite()
+            || input.residue_load > self.thresholds.residue_hold
+        {
+            QOutcome::Fail
+        } else if input.residue_load > self.thresholds.residue_pass {
+            QOutcome::Hold
+        } else {
+            QOutcome::Pass
+        };
+        // B — boundary stability: an unstable boundary (kill-switch engaged, or
+        // an open boundary residue) holds conservatively; a hard kill-switch
+        // Deny is enforced above this axis by the Crown.
+        let b = if input.boundary_stable {
             QOutcome::Pass
         } else {
             QOutcome::Hold
@@ -239,9 +291,9 @@ mod tests {
             coherence: 1.0,
             entropy: 0.2,
             entropy_bound: 0.5,
-            parallax_consistent: true,
-            replay_equal: true,
-            open_obligations: 0,
+            projection_quality: 1.0,
+            residue_load: 0.0,
+            boundary_stable: true,
             drift: 0.1,
             drift_bound: 0.35,
         }
@@ -265,11 +317,11 @@ mod tests {
         assert_eq!(vd.verdict(), QOutcome::Fail);
         assert_eq!(vd.delta, QOutcome::Fail);
 
-        // ...while a different failing axis (Π parallax) also fails, but the
-        // *vector* distinguishes them — the reason is not lost to one number.
-        let mut split = clean();
-        split.parallax_consistent = false;
-        let vp = gate.evaluate(&split);
+        // ...while a different failing axis (Π projection quality) also fails,
+        // but the *vector* distinguishes them — the reason is not lost.
+        let mut low_projection = clean();
+        low_projection.projection_quality = 0.0;
+        let vp = gate.evaluate(&low_projection);
         assert_eq!(vp.verdict(), QOutcome::Fail);
         assert_eq!(vp.pi, QOutcome::Fail);
         assert_ne!(
@@ -279,12 +331,61 @@ mod tests {
         );
         assert_ne!(vd.reasons(), vp.reasons());
 
-        // An open obligation holds (not fails) — Hold is a distinct third state.
+        // A residue load holds (not fails) — Hold is a distinct third state.
         let mut held = clean();
-        held.open_obligations = 2;
+        held.residue_load = 0.3;
         let vh = gate.evaluate(&held);
         assert_eq!(vh.verdict(), QOutcome::Hold);
+        assert_eq!(vh.r, QOutcome::Hold);
         assert_eq!(vh.to_ssk(), GateOutcomeKind::Hold);
+    }
+
+    // A6/G3+G4: each axis reads its own theory quantity and nothing else. This
+    // pins the corrected semantics: Π reads projection_quality (not parallax),
+    // R reads residue_load (not replay), B reads boundary_stable (not an
+    // obligation count) — a regression that re-purposed any axis would fail here.
+    #[test]
+    fn each_axis_binds_to_its_theory_quantity() {
+        let gate = QLogicGate::default();
+
+        // Π is driven ONLY by projection_quality.
+        let mut pi_only = clean();
+        pi_only.projection_quality = 0.0;
+        let v = gate.evaluate(&pi_only);
+        assert_eq!(v.pi, QOutcome::Fail);
+        assert_eq!(v.r, QOutcome::Pass, "projection quality must not move R");
+        assert_eq!(v.b, QOutcome::Pass, "projection quality must not move B");
+
+        // R is driven ONLY by residue_load.
+        let mut r_only = clean();
+        r_only.residue_load = 0.9;
+        let v = gate.evaluate(&r_only);
+        assert_eq!(v.r, QOutcome::Fail);
+        assert_eq!(v.pi, QOutcome::Pass, "residue load must not move Π");
+        assert_eq!(v.b, QOutcome::Pass, "residue load must not move B");
+
+        // B is driven ONLY by boundary_stable.
+        let mut b_only = clean();
+        b_only.boundary_stable = false;
+        let v = gate.evaluate(&b_only);
+        assert_eq!(v.b, QOutcome::Hold);
+        assert_eq!(v.pi, QOutcome::Pass, "boundary stability must not move Π");
+        assert_eq!(v.r, QOutcome::Pass, "boundary stability must not move R");
+    }
+
+    // A6: Π and R fail closed on a non-finite measurement, just like κ — a NaN
+    // must never slip past the pass-side comparisons to a spurious Pass.
+    #[test]
+    fn non_finite_projection_and_residue_fail_closed() {
+        let gate = QLogicGate::default();
+
+        let mut nan_pi = clean();
+        nan_pi.projection_quality = f64::NAN;
+        assert_eq!(gate.evaluate(&nan_pi).pi, QOutcome::Fail);
+
+        let mut nan_r = clean();
+        nan_r.residue_load = f64::NAN;
+        assert_eq!(gate.evaluate(&nan_r).r, QOutcome::Fail);
     }
 
     // Regression: non-finite coherence (e.g. 0/0 from a zero-aperture
