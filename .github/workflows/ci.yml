@@ -119,3 +119,21 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo install cargo-deny --locked
       - run: cargo deny check
+
+  # Real Windows validation for the privileged `ssk-winhost` backends (the
+  # BoundaryEnforcer / TrafficSource / PrivilegedHelper "hands"). This compiles
+  # the #[cfg(windows)] FFI with the real MSVC toolchain, lints it (clippy sees
+  # the Windows code paths the Linux jobs never compile), builds the `ssk` CLI
+  # and `ssk-svc` service host for Windows, and runs the crate's pure tests
+  # natively on Windows. Privileged, Administrator-only integration (installing
+  # a firewall rule / a real service) is not exercised here — that is the
+  # operator validation documented in RUNBOOK_WINDOWS.md.
+  windows_backends:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - run: cargo build -p ssk-winhost -p ssk-cli
+      - run: cargo clippy -p ssk-winhost --all-targets -- -D warnings
+      - run: cargo test -p ssk-winhost

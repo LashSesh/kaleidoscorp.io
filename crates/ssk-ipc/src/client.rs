@@ -1,6 +1,8 @@
 #![forbid(unsafe_code)]
 
+#[cfg(unix)]
 use crate::error::IpcError;
+#[cfg(unix)]
 use crate::server::{Request, Response};
 
 /// Unix domain socket client. Connects once and issues requests sequentially
