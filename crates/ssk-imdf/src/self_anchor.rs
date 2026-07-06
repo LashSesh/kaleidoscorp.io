@@ -300,7 +300,10 @@ mod tests {
     #[test]
     fn null_anchor_commitment_is_deterministic_and_domain_separated() {
         let z = NullAnchor::new("order-1", "recover-1");
-        assert_eq!(z.commitment(), NullAnchor::new("order-1", "recover-1").commitment());
+        assert_eq!(
+            z.commitment(),
+            NullAnchor::new("order-1", "recover-1").commitment()
+        );
         assert_ne!(
             z.commitment(),
             NullAnchor::new("order-1", "recover-2").commitment()
@@ -330,7 +333,10 @@ mod tests {
         // the runtime witness of the structural "not Serialize" guarantee.
         let serialized = serde_json::to_string(&anchor).expect("anchor serializes");
         assert!(!serialized.contains("order-secret"), "Z order_ref leaked");
-        assert!(!serialized.contains("recover-secret"), "Z recovery_root leaked");
+        assert!(
+            !serialized.contains("recover-secret"),
+            "Z recovery_root leaked"
+        );
         // The commitment hex IS present — the one allowed boundary-crossing form.
         assert!(serialized.contains(&z.commitment().to_hex()));
     }

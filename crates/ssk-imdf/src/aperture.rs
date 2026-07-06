@@ -160,3 +160,101 @@ impl ApertureSession<'_> {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ssk_signature::{signature_for, OrderedMap, SurfaceObject, Value};
+
+    fn surface() -> SpectralSignature {
+        let fields = OrderedMap::from_iter([
+            ("method".to_owned(), Value::Text("GET".to_owned())),
+            (
+                "url".to_owned(),
+                Value::Text("https://example.test/a".to_owned()),
+            ),
+            ("status".to_owned(), Value::Num(200.0)),
+        ]);
+        signature_for(
+            &SurfaceObject::new("application/trace+json", fields)
+                .with_declared_protocol_class("http"),
+        )
+    }
+
+    fn session<'a>(aperture: &'a Aperture, blindspots: &[&str]) -> ApertureSession<'a> {
+        ApertureSession {
+            aperture,
+            blindspot_regions: blindspots.iter().map(|s| (*s).to_owned()).collect(),
+        }
+    }
+
+    // G36 (A2 operator proof): Focus is idempotent/deterministic — the aperture
+    // operator applied twice to the same surface yields the identical result
+    // (`Foc∘Foc = Foc` in outcome). No hidden state, no drift between passes.
+    #[test]
+    fn focus_is_idempotent_on_the_same_surface() {
+        let sig = surface();
+        let aperture = Aperture::admitting("wide", ["shape", "ordering", "semantic"]);
+        let sess = session(&aperture, &[]);
+
+        let first = sess.focus(&sig);
+        let second = sess.focus(&sig);
+        assert_eq!(
+            first, second,
+            "focusing the same aperture on the same surface twice is deterministic"
+        );
+
+        // A fresh session over the same aperture must also agree — the operator
+        // carries no per-session state.
+        let third = session(&aperture, &[]).focus(&sig);
+        assert_eq!(first, third, "focus depends only on aperture + surface");
+    }
+
+    // G36 (A2 contraction / No Silent Loss): every surface dimension is accounted
+    // for exactly once — measured, blind, or residue. Focus never fabricates a
+    // dimension the surface did not carry, and never silently drops one.
+    #[test]
+    fn focus_partitions_every_surface_dimension_without_loss() {
+        let sig = surface();
+        // Admit some dims, declare one a blindspot, leave the rest to residue.
+        let all: BTreeSet<&str> = sig.dimensions.keys().map(String::as_str).collect();
+        assert!(all.len() >= 3, "the test surface must be multi-dimensional");
+
+        let admitted: Vec<&str> = all.iter().copied().take(2).collect();
+        let aperture = Aperture::admitting("narrow", admitted.iter().copied());
+        // Make the first admitted dimension a blindspot.
+        let sess = session(&aperture, &admitted[..1]);
+        let focus = sess.focus(&sig);
+
+        let measured: BTreeSet<&str> = focus.measured_dimensions().into_iter().collect();
+        let blind: BTreeSet<&str> = focus
+            .blindspot_dimensions
+            .iter()
+            .map(String::as_str)
+            .collect();
+        let hidden: BTreeSet<&str> = focus.hidden_dimensions.iter().map(String::as_str).collect();
+
+        // Partition: the three sets are disjoint and cover exactly the surface.
+        assert!(measured.is_disjoint(&blind));
+        assert!(measured.is_disjoint(&hidden));
+        assert!(blind.is_disjoint(&hidden));
+        let union: BTreeSet<&str> = measured.union(&blind).copied().collect();
+        let union: BTreeSet<&str> = union.union(&hidden).copied().collect();
+        assert_eq!(
+            union, all,
+            "measured ∪ blind ∪ residue must equal the surface exactly (No Silent Loss)"
+        );
+
+        // Contraction: nothing measured lies outside the aperture, and the
+        // blindspot never yields a value.
+        let admitted_set: BTreeSet<&str> = admitted.into_iter().collect();
+        assert!(
+            measured.union(&blind).all(|d| admitted_set.contains(d)),
+            "only admitted dimensions are read at all"
+        );
+        assert!(
+            !blind.is_empty() && blind.is_disjoint(&measured),
+            "a blindspot reads blind, never as a measured value"
+        );
+    }
+}
