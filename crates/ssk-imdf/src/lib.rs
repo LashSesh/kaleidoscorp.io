@@ -31,6 +31,7 @@
 
 pub mod aperture;
 pub mod atlas;
+pub mod claim;
 pub mod closure;
 pub mod contact;
 pub mod error;
@@ -42,6 +43,7 @@ pub mod wavefront;
 
 pub use aperture::{Aperture, ApertureSession, FocusResult, Reading};
 pub use atlas::{AtlasEntry, AtlasObservation, SelfPerceptionAtlas};
+pub use claim::{Claim, ClaimClass, ClaimError, ClaimLedger, ResidueDisposition};
 pub use closure::{ClosureReport, ClosureState, FourPiClosure, Orientation, OrientationPass};
 pub use contact::{Contact, ContactGapReason, Kontaktluecke};
 pub use error::ImdfError;

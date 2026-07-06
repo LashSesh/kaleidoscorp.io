@@ -30,6 +30,7 @@
 //! dropped — only attributed to the right axis. (Per IMRT Regel 3.2 this is a
 //! conformance correction, not a registered divergence.)
 
+use serde::{Deserialize, Serialize};
 use ssk_types::GateOutcomeKind;
 
 /// One QLOGIC axis.
@@ -58,7 +59,7 @@ impl QAxis {
 }
 
 /// A per-axis outcome.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum QOutcome {
     Pass,
     Hold,
