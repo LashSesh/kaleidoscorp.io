@@ -58,4 +58,4 @@ pub use replay::{
 pub use self_anchor::{
     BcikCrossing, DomeLocator, LocatorAddressId, NullAnchor, SelfAnchor, SelfAnchorId,
 };
-pub use wavefront::{BirefringentSplit, Parallax, Wavefront};
+pub use wavefront::{BirefringentSplit, Parallax, Ray, RaySet, SplitAxis, Wavefront};

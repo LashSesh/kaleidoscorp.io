@@ -96,17 +96,122 @@ impl Parallax {
     }
 }
 
-/// Two views of one surface, split birefringently across two vantages.
+/// The admissible axis a [`BirefringentSplit`] separates its two rays along
+/// (A3). A split is not axis-less: it declares *which* orthogonal role pair it
+/// distinguishes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SplitAxis {
+    /// Self identity vs. foreign identity.
+    Identity,
+    /// The identity ray vs. the locator ray (the canonical birefraction).
+    Locator,
+    /// Structural shape.
+    Shape,
+    /// Semantic content.
+    Semantic,
+    /// Timing / ordering.
+    Temporal,
+}
+
+/// One per-vantage **ray**: a single observation from one vantage, the unit the
+/// parallax operator compares (A3). A [`RaySet`] of ≥2 rays is required for a
+/// genuine split.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Ray {
+    pub vantage: String,
+    pub wavefront: Wavefront,
+}
+
+impl Ray {
+    #[must_use]
+    pub fn of(wavefront: Wavefront) -> Self {
+        Ray {
+            vantage: wavefront.vantage.clone(),
+            wavefront,
+        }
+    }
+}
+
+/// A set of `m ≥ 2` rays over the same surface, consumed by the parallax
+/// operator. A set of fewer than two rays is not a split ("sonst kein Split,
+/// nur Kopie") and cannot be constructed.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RaySet {
+    rays: Vec<Ray>,
+}
+
+impl RaySet {
+    /// Build a ray set, requiring `m ≥ 2` rays. Returns `None` for fewer.
+    #[must_use]
+    pub fn new(rays: Vec<Ray>) -> Option<Self> {
+        if rays.len() >= 2 {
+            Some(RaySet { rays })
+        } else {
+            None
+        }
+    }
+
+    #[must_use]
+    pub fn rays(&self) -> &[Ray] {
+        &self.rays
+    }
+
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.rays.len()
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.rays.is_empty()
+    }
+
+    /// Whether the rays are genuinely orthogonal roles — every vantage distinct.
+    /// A repeated vantage makes two rays a copy, not an orthogonal contribution.
+    #[must_use]
+    pub fn is_orthogonal(&self) -> bool {
+        let mut seen = BTreeSet::new();
+        self.rays.iter().all(|r| seen.insert(r.vantage.as_str()))
+    }
+}
+
+/// Two views of one surface, split birefringently across two vantages, along a
+/// declared [`SplitAxis`] (A3).
 #[derive(Clone, Debug, PartialEq)]
 pub struct BirefringentSplit {
     pub left: Wavefront,
     pub right: Wavefront,
+    pub axis: SplitAxis,
 }
 
 impl BirefringentSplit {
+    /// A split along the canonical [`SplitAxis::Identity`] axis.
     #[must_use]
     pub fn of(left: Wavefront, right: Wavefront) -> Self {
-        BirefringentSplit { left, right }
+        BirefringentSplit::on_axis(left, right, SplitAxis::Identity)
+    }
+
+    /// A split along a declared axis.
+    #[must_use]
+    pub fn on_axis(left: Wavefront, right: Wavefront, axis: SplitAxis) -> Self {
+        BirefringentSplit { left, right, axis }
+    }
+
+    /// The axis this split separates along.
+    #[must_use]
+    pub fn axis(&self) -> SplitAxis {
+        self.axis
+    }
+
+    /// The split as a [`RaySet`] of exactly two rays — the parallax operator's
+    /// input. Always ≥2 rays, so construction never fails.
+    #[must_use]
+    pub fn ray_set(&self) -> RaySet {
+        RaySet::new(vec![
+            Ray::of(self.left.clone()),
+            Ray::of(self.right.clone()),
+        ])
+        .expect("a birefringent split always yields two rays")
     }
 
     /// Compare the two views. Dimensions measured by both must agree on their
@@ -335,6 +440,76 @@ mod tests {
         assert!(
             agreeing_split.parallax().discharges_a3(),
             "an agreeing orthogonal split discharges A3"
+        );
+    }
+
+    // G30: every split carries a declared SplitAxis from the admissible set.
+    #[test]
+    fn every_split_declares_its_axis() {
+        let l = observer("left");
+        let r = observer("right");
+        let sig = surface("GET", 200.0);
+
+        // `of` defaults to the canonical Identity axis.
+        let default_split = BirefringentSplit::of(
+            Wavefront::capture(&l, &sig).unwrap(),
+            Wavefront::capture(&r, &sig).unwrap(),
+        );
+        assert_eq!(default_split.axis(), SplitAxis::Identity);
+
+        // `on_axis` tags the split with an explicit admissible axis.
+        for axis in [
+            SplitAxis::Identity,
+            SplitAxis::Locator,
+            SplitAxis::Shape,
+            SplitAxis::Semantic,
+            SplitAxis::Temporal,
+        ] {
+            let split = BirefringentSplit::on_axis(
+                Wavefront::capture(&l, &sig).unwrap(),
+                Wavefront::capture(&r, &sig).unwrap(),
+                axis,
+            );
+            assert_eq!(split.axis(), axis);
+        }
+    }
+
+    // G31: a split yields a RaySet of >=2 rays consumed by the parallax operator;
+    // a set of fewer than two rays is not a split, and a repeated vantage is not
+    // orthogonal.
+    #[test]
+    fn split_yields_a_ray_set_of_at_least_two_orthogonal_rays() {
+        let l = observer("left");
+        let r = observer("right");
+        let sig = surface("GET", 200.0);
+
+        let split = BirefringentSplit::of(
+            Wavefront::capture(&l, &sig).unwrap(),
+            Wavefront::capture(&r, &sig).unwrap(),
+        );
+        let rays = split.ray_set();
+        assert_eq!(rays.len(), 2, "a split yields exactly two rays");
+        assert!(
+            rays.is_orthogonal(),
+            "distinct vantages are orthogonal rays"
+        );
+
+        // A single ray is not a split (m >= 2 required).
+        assert!(
+            RaySet::new(vec![Ray::of(Wavefront::capture(&l, &sig).unwrap())]).is_none(),
+            "one ray cannot form a split"
+        );
+
+        // Two same-vantage rays form a set but are NOT orthogonal (a copy).
+        let same = observer("same");
+        let copy_set = RaySet::new(vec![
+            Ray::of(Wavefront::capture(&same, &sig).unwrap()),
+            Ray::of(Wavefront::capture(&same, &sig).unwrap()),
+        ])
+        .expect("two rays form a set");
+        assert!(
+            !copy_set.is_orthogonal(),
+            "a repeated vantage is a copy, not orthogonal"
         );
     }
 }
