@@ -178,6 +178,44 @@ impl Graph {
     pub fn is_cospectral(&self, other: &Graph) -> bool {
         self.spectrum() == other.spectrum()
     }
+
+    /// The sorted degree sequence — a relabeling-invariant that is **not** a
+    /// spectral invariant, so it can separate some cospectral pairs.
+    #[must_use]
+    pub fn degree_sequence(&self) -> Vec<usize> {
+        let mut degs: Vec<usize> = (0..self.n)
+            .map(|i| (0..self.n).filter(|&j| self.adj[i][j]).count())
+            .collect();
+        degs.sort_unstable();
+        degs
+    }
+
+    /// The number of connected components — a relabeling-invariant that is not
+    /// determined by the adjacency spectrum, so it can separate cospectral pairs
+    /// (e.g. `C₄ ∪ K₁` has two, the star `K₁,₄` has one).
+    #[must_use]
+    #[allow(clippy::needless_range_loop)]
+    pub fn component_count(&self) -> usize {
+        let mut seen = vec![false; self.n];
+        let mut components = 0;
+        for start in 0..self.n {
+            if seen[start] {
+                continue;
+            }
+            components += 1;
+            let mut stack = vec![start];
+            seen[start] = true;
+            while let Some(v) = stack.pop() {
+                for w in 0..self.n {
+                    if self.adj[v][w] && !seen[w] {
+                        seen[w] = true;
+                        stack.push(w);
+                    }
+                }
+            }
+        }
+        components
+    }
 }
 
 fn identity(n: usize) -> Vec<usize> {
@@ -503,6 +541,87 @@ impl CospectralGate {
             CospectralVerdict::Reject
         }
     }
+
+    /// Attempt to **lift** a cospectral hold by trying the distinguisher ladder
+    /// in theory order `D ∈ {deg, trace, Stab, props, catalog, boundary}` and
+    /// returning the *first* `D` for which `D(G) ≠ D(H)` (IMRT A4/A5). A pair no
+    /// distinguisher separates stays `Unresolved` (it holds); an isomorphic pair
+    /// is `NotHeld` (there was no hold to lift).
+    #[must_use]
+    pub fn resolve_hold(&self, left: &Graph, right: &Graph) -> HoldResolution {
+        if left.is_isomorphic(right) {
+            return HoldResolution::NotHeld;
+        }
+        for &d in &Distinguisher::LADDER {
+            if d.separates(left, right) {
+                return HoldResolution::Lifted(d);
+            }
+        }
+        HoldResolution::Unresolved
+    }
+}
+
+/// A distinguisher `D` in the Kospektral-hold resolution ladder (IMRT A4/A5).
+/// Tried in the theory's order — cheapest structural invariants first, the
+/// complete canonical form last, and the external boundary distinguisher last of
+/// all (its Ω-export is the open residue ρ04).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Distinguisher {
+    /// Degree sequence (`deg`).
+    Degree,
+    /// Trace powers of the adjacency matrix (`trace`) — a spectral invariant, so
+    /// it never separates a *cospectral* pair, but it is part of the ladder.
+    TracePower,
+    /// Automorphism count `|Aut| = |Stab|` (`Stab`).
+    Stab,
+    /// Structural properties (`props`) — here, the connected-component count.
+    Props,
+    /// Canonical-form catalog lookup (`catalog`) — the complete invariant.
+    Catalog,
+    /// External BoundaryInterface distinguisher (`boundary`) — not wired inside
+    /// the finite kernel (its export is the open residue ρ04); never separates
+    /// here, so the ladder resolves before reaching it.
+    Boundary,
+}
+
+impl Distinguisher {
+    /// The ladder in theory order.
+    pub const LADDER: [Distinguisher; 6] = [
+        Distinguisher::Degree,
+        Distinguisher::TracePower,
+        Distinguisher::Stab,
+        Distinguisher::Props,
+        Distinguisher::Catalog,
+        Distinguisher::Boundary,
+    ];
+
+    /// Whether this distinguisher genuinely separates the two graphs
+    /// (`D(G) ≠ D(H)`).
+    #[must_use]
+    pub fn separates(self, left: &Graph, right: &Graph) -> bool {
+        match self {
+            Distinguisher::Degree => left.degree_sequence() != right.degree_sequence(),
+            // Trace powers are functions of the spectrum, so they agree on any
+            // cospectral pair — this rung never lifts a cospectral hold.
+            Distinguisher::TracePower => left.spectrum() != right.spectrum(),
+            Distinguisher::Stab => left.automorphism_count() != right.automorphism_count(),
+            Distinguisher::Props => left.component_count() != right.component_count(),
+            Distinguisher::Catalog => left.canon_key() != right.canon_key(),
+            // The external distinguisher is not available inside the kernel.
+            Distinguisher::Boundary => false,
+        }
+    }
+}
+
+/// The outcome of trying to lift a cospectral hold (IMRT A4/A5).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HoldResolution {
+    /// The hold was lifted by the named distinguisher (the first that separated).
+    Lifted(Distinguisher),
+    /// No distinguisher in the ladder separated the pair — it stays a Hold.
+    Unresolved,
+    /// The two graphs are isomorphic — there was no hold to lift.
+    NotHeld,
 }
 
 /// A catalog of known canonical forms → labels. An unknown window holds.
@@ -662,6 +781,48 @@ mod tests {
             .evaluate_with_residue(&a, &triangle)
             .hold()
             .is_none());
+    }
+
+    // G12 (A4/A5): the resolution ladder D∈{deg,trace,Stab,props,catalog,boundary}
+    // lifts a cospectral hold by the first distinguisher that genuinely
+    // separates, in theory order; an isomorphic pair is NotHeld.
+    #[test]
+    fn cospectral_hold_is_lifted_by_the_first_separating_distinguisher() {
+        let a = c4_plus_k1();
+        let b = star_k14();
+        // The Schwenk pair is a genuine cospectral hold.
+        assert!(a.is_cospectral(&b) && !a.is_isomorphic(&b));
+
+        // deg is the first rung and it genuinely separates this pair
+        // (C₄∪K₁ = [0,2,2,2,2] vs K₁,₄ = [1,1,1,1,4]).
+        assert_ne!(a.degree_sequence(), b.degree_sequence());
+        assert_eq!(
+            CospectralGate.resolve_hold(&a, &b),
+            HoldResolution::Lifted(Distinguisher::Degree),
+            "deg is the first distinguisher that separates the Schwenk pair"
+        );
+
+        // The trace rung, being spectral, does NOT separate a cospectral pair.
+        assert!(!Distinguisher::TracePower.separates(&a, &b));
+        // But props (component count: 2 vs 1) and catalog (canon) both do.
+        assert!(Distinguisher::Props.separates(&a, &b));
+        assert!(Distinguisher::Catalog.separates(&a, &b));
+        // The external boundary distinguisher is never available in the kernel.
+        assert!(!Distinguisher::Boundary.separates(&a, &b));
+
+        // The ladder is honored in order: the first true rung wins. Verify by
+        // scanning the ladder directly.
+        let first = Distinguisher::LADDER
+            .iter()
+            .copied()
+            .find(|d| d.separates(&a, &b));
+        assert_eq!(first, Some(Distinguisher::Degree));
+
+        // An isomorphic pair is NotHeld — there is nothing to lift.
+        assert_eq!(
+            CospectralGate.resolve_hold(&a, &a.canon()),
+            HoldResolution::NotHeld
+        );
     }
 
     // FCHL-MPK I7: out-of-catalog window holds, never silently passes.
