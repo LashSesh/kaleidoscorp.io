@@ -678,6 +678,7 @@ mod tests {
             action,
             adjustment: 0.0,
             measured_drift: 0.0,
+            drift_mode: ssk_meta_resonance::DriftMode::Komp,
         }
     }
 
