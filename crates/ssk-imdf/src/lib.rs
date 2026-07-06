@@ -48,5 +48,7 @@ pub use observer::{
 };
 pub use qlogic::{QAxis, QLogicGate, QLogicInput, QLogicThresholds, QLogicVector, QOutcome};
 pub use replay::{reanalyze, ImdfReplayManifest, ReanalysisReport, RunDescriptor};
-pub use self_anchor::{BcikCrossing, DomeLocator, LocatorAddressId, SelfAnchor, SelfAnchorId};
+pub use self_anchor::{
+    BcikCrossing, DomeLocator, LocatorAddressId, NullAnchor, SelfAnchor, SelfAnchorId,
+};
 pub use wavefront::{BirefringentSplit, Parallax, Wavefront};
