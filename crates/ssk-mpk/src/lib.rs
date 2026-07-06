@@ -24,7 +24,10 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
-use ssk_types::{content_id, GateOutcomeKind, HashAlg};
+use ssk_types::{
+    content_id, digest_of, BoundaryResidue, Digest, GateId, GateOutcomeKind, HashAlg, NextAction,
+    ResidueId, ResidueKind, ResidueStatus, Severity, TraceId,
+};
 
 content_id!(MpkSampleId);
 
@@ -368,6 +371,108 @@ impl MpkFieldSample {
     }
 }
 
+/// The residue payload of a cospectral `Hold` (IMRT A4): the spectrum could not
+/// decide identity, so the ≥2 distinct isomorphism-class candidates that share
+/// it are conserved rather than collapsed into a bare `Hold` — the A4 half of
+/// the Kospektral outcome.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CospectralHold {
+    pub reason: String,
+    /// The ≥2 distinct canonical-form keys that share the spectrum — the held
+    /// candidates spectrum alone cannot separate.
+    pub held_candidates: Vec<u64>,
+    /// The shared spectrum that was insufficient to decide identity.
+    pub shared_spectrum: Vec<i128>,
+    /// Content-addressed commitment over the reason + held candidates.
+    pub residue_digest: Digest,
+}
+
+impl CospectralHold {
+    fn of(left: &Graph, right: &Graph) -> Self {
+        let mut held_candidates = vec![left.canon_key(), right.canon_key()];
+        held_candidates.sort_unstable();
+        held_candidates.dedup();
+        let shared_spectrum = left.spectrum();
+        let reason = "spectrum insufficient: cospectral but non-isomorphic".to_owned();
+        let residue_digest = digest_of(
+            &(
+                "mpk/cospectral-hold/v1",
+                &reason,
+                &held_candidates,
+                &shared_spectrum,
+            ),
+            HashAlg::Blake3,
+        )
+        .expect("cospectral-hold form is serializable");
+        CospectralHold {
+            reason,
+            held_candidates,
+            shared_spectrum,
+            residue_digest,
+        }
+    }
+
+    /// The number of distinct held candidates (always ≥2 for a genuine
+    /// cospectral non-isomorphic hold).
+    #[must_use]
+    pub fn candidate_count(&self) -> usize {
+        self.held_candidates.len()
+    }
+
+    /// Lift the hold into a conserved `Cospectral`-kind residue (A4). It is a
+    /// standing obligation (`Open`) whose remediation is the distinguisher
+    /// ladder (`Reanalyze`); the `Fragment` records the held candidate keys.
+    #[must_use]
+    pub fn to_residue(&self, origin: TraceId) -> BoundaryResidue {
+        let fragment = self
+            .held_candidates
+            .iter()
+            .map(|k| format!("{k:016x}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        BoundaryResidue::new_full(
+            ResidueId::new(self.residue_digest.to_hex()),
+            ResidueKind::Cospectral,
+            GateId::Mirror,
+            Some(fragment),
+            self.reason.clone(),
+            Severity::High,
+            origin,
+            ResidueStatus::Open,
+            NextAction::Reanalyze,
+        )
+    }
+}
+
+/// The residue-bearing verdict of the cospectral gate.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CospectralVerdict {
+    Pass,
+    Hold(CospectralHold),
+    Reject,
+}
+
+impl CospectralVerdict {
+    /// The bare gate outcome, discarding any residue.
+    #[must_use]
+    pub fn outcome(&self) -> GateOutcomeKind {
+        match self {
+            CospectralVerdict::Pass => GateOutcomeKind::Pass,
+            CospectralVerdict::Hold(_) => GateOutcomeKind::Hold,
+            CospectralVerdict::Reject => GateOutcomeKind::Reject,
+        }
+    }
+
+    /// The held residue payload, if this is a `Hold`.
+    #[must_use]
+    pub fn hold(&self) -> Option<&CospectralHold> {
+        match self {
+            CospectralVerdict::Hold(h) => Some(h),
+            _ => None,
+        }
+    }
+}
+
 /// The cospectral gate: spectrum alone is not identity.
 ///
 /// Evaluating an "are these the same" claim between two graphs yields `Pass`
@@ -379,14 +484,23 @@ pub struct CospectralGate;
 impl CospectralGate {
     #[must_use]
     pub fn evaluate(&self, left: &Graph, right: &Graph) -> GateOutcomeKind {
+        self.evaluate_with_residue(left, right).outcome()
+    }
+
+    /// Evaluate, carrying the A4 residue payload on a `Hold`: two cospectral but
+    /// non-isomorphic graphs hold with the ≥2 held candidates conserved (I6 +
+    /// A4), rather than collapsing to a bare `Hold`.
+    #[must_use]
+    pub fn evaluate_with_residue(&self, left: &Graph, right: &Graph) -> CospectralVerdict {
         if left.is_isomorphic(right) {
-            GateOutcomeKind::Pass
+            CospectralVerdict::Pass
         } else if left.is_cospectral(right) {
             // Same spectrum, different isomorphism class — spectrum cannot decide
-            // identity, so we hold rather than fabricate a pass.
-            GateOutcomeKind::Hold
+            // identity, so we hold and conserve the held candidates rather than
+            // fabricate a pass.
+            CospectralVerdict::Hold(CospectralHold::of(left, right))
         } else {
-            GateOutcomeKind::Reject
+            CospectralVerdict::Reject
         }
     }
 }
@@ -499,6 +613,55 @@ mod tests {
             CospectralGate.evaluate(&a, &triangle),
             GateOutcomeKind::Reject
         );
+    }
+
+    // G11 (A4): the cospectral Hold is not bare — it carries a content-addressed
+    // residue recording the >=2 held candidates and the reason "spectrum
+    // insufficient", conserved as a Cospectral-kind residue rather than dropped.
+    #[test]
+    fn cospectral_hold_carries_a_conserved_residue_payload() {
+        let a = c4_plus_k1();
+        let b = star_k14();
+        let verdict = CospectralGate.evaluate_with_residue(&a, &b);
+        assert_eq!(verdict.outcome(), GateOutcomeKind::Hold);
+
+        let hold = verdict.hold().expect("a cospectral hold carries a payload");
+        assert!(
+            hold.candidate_count() >= 2,
+            "at least two held candidates share the spectrum"
+        );
+        assert_eq!(
+            hold.held_candidates,
+            {
+                let mut k = vec![a.canon_key(), b.canon_key()];
+                k.sort_unstable();
+                k
+            },
+            "the held candidates are the two distinct isomorphism classes"
+        );
+        assert!(hold.reason.contains("spectrum insufficient"));
+        assert!(!hold.shared_spectrum.is_empty());
+
+        // The residue is a conserved Cospectral 5-tuple, a standing obligation
+        // whose remediation is the distinguisher ladder.
+        let r = hold.to_residue(TraceId::new("t"));
+        assert_eq!(r.kind, ResidueKind::Cospectral);
+        assert_eq!(r.status, ResidueStatus::Open);
+        assert_eq!(r.next_action, NextAction::Reanalyze);
+        assert!(r.open_obligation());
+        assert!(r.fragment.is_some(), "the held candidates are recorded");
+
+        // A genuine isomorphism passes with no held payload; a distinct spectrum
+        // rejects with no payload.
+        assert!(CospectralGate
+            .evaluate_with_residue(&a, &a.canon())
+            .hold()
+            .is_none());
+        let triangle = Graph::from_edges(5, &[(0, 1), (1, 2), (2, 0)]).unwrap();
+        assert!(CospectralGate
+            .evaluate_with_residue(&a, &triangle)
+            .hold()
+            .is_none());
     }
 
     // FCHL-MPK I7: out-of-catalog window holds, never silently passes.
