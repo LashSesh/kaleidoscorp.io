@@ -230,7 +230,7 @@ mod tests {
         assert_eq!(residues.len(), report.high_risk_components.len());
         assert!(residues
             .iter()
-            .all(|r| r.kind == ssk_types::ResidueKind::Correlation && r.open_obligation));
+            .all(|r| r.kind == ssk_types::ResidueKind::Correlation && r.open_obligation()));
     }
 
     #[test]

@@ -672,7 +672,13 @@ pub struct GateWitness {
     pub evidence: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// The closed residue taxonomy **K** (IMRT A4, Def. H). Every non-integrated
+/// field fragment is classified into exactly one of these kinds. The theory
+/// fixes K at 11 kinds; the last two — [`Cospectral`](ResidueKind::Cospectral)
+/// (a spectral-equal-but-non-isomorphic hold, L4) and
+/// [`FieldProjection`](ResidueKind::FieldProjection) (the un-measured remainder
+/// of a lossy projection, IMDF 7) — were previously missing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ResidueKind {
     Identity,
     Locator,
@@ -683,23 +689,91 @@ pub enum ResidueKind {
     Focus,
     Replay,
     Timing,
+    /// Spectrally equal but not isomorphic — a Kospektral hold (L4, `Spec= ∧
+    /// G≇H ⟹ Hold`) whose un-decided mass must be conserved, not passed.
+    Cospectral,
+    /// The remainder of a lossy projection W: field content the projection did
+    /// not carry across (IMDF 7 / Satz 9.13), made visible instead of dropped.
+    FieldProjection,
 }
 
-/// The visible currency of "no silent loss" (Master Spec Ω+1 ch. 9.2,
-/// verbatim field list — plus Phase 0's `Severity`, now wired in).
+impl ResidueKind {
+    /// The complete closed taxonomy K (11 kinds).
+    pub const ALL: [ResidueKind; 11] = [
+        ResidueKind::Identity,
+        ResidueKind::Locator,
+        ResidueKind::Boundary,
+        ResidueKind::Capability,
+        ResidueKind::Protocol,
+        ResidueKind::Correlation,
+        ResidueKind::Focus,
+        ResidueKind::Replay,
+        ResidueKind::Timing,
+        ResidueKind::Cospectral,
+        ResidueKind::FieldProjection,
+    ];
+}
+
+/// The lifecycle **Status** of a residue in the CounterHorizon triple
+/// `H: X → K × Status × NextAction` (IMRT A4, Def. H). Replaces the earlier
+/// `open_obligation` bool so the disposition is a first-class tri-state rather
+/// than a collapsed flag.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ResidueStatus {
+    /// Unresolved and blocking — a standing obligation (fail-closed default).
+    Open,
+    /// Acknowledged and tracked, but explicitly non-blocking for this run.
+    Deferred,
+    /// Discharged — the fragment was integrated or accepted; no obligation.
+    Resolved,
+}
+
+/// The **NextAction** directive of the CounterHorizon triple — what the field
+/// must do about a residue (IMRT A4, Def. H). Distinct from `Status`: a residue
+/// can be `Open` with a `Reacquire` directive, or `Deferred` with `Accept`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum NextAction {
+    /// Quarantine/hold the surface until the fragment is resolved.
+    Hold,
+    /// Re-observe the source to recover the missing fragment.
+    Reacquire,
+    /// Raise severity / route to a higher authority (ρ* escalation).
+    Escalate,
+    /// Re-run reanalysis binding the residue as an input.
+    Reanalyze,
+    /// Accept the fragment as a known, tolerated loss — no further action.
+    Accept,
+}
+
+/// The visible currency of "no silent loss" (IMRT A4, Satz 13.5) — the complete
+/// residue **5-tuple** `(Source, Fragment, Reason, Status, NextAction)` in a
+/// class of the closed taxonomy K.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BoundaryResidue {
     pub id: ResidueId,
+    /// The taxonomy-K class this fragment falls into.
     pub kind: ResidueKind,
+    /// **Source**: which gate/part produced the residue.
     pub source_gate: GateId,
+    /// **Fragment**: the concrete non-integrated field part (what was lost).
+    /// `None` when the emitter has only a reason, not an isolable fragment.
+    pub fragment: Option<String>,
+    /// **Reason**: why the fragment could not be integrated.
     pub detail: String,
     pub severity: Severity,
     pub origin: TraceId,
-    /// Must policy quarantine/hold until resolved? (ch. 9.2, verbatim.)
-    pub open_obligation: bool,
+    /// **Status**: the lifecycle disposition (`Open`/`Deferred`/`Resolved`).
+    pub status: ResidueStatus,
+    /// **NextAction**: the remediation directive.
+    pub next_action: NextAction,
 }
 
 impl BoundaryResidue {
+    /// Construct from the legacy 7-tuple: `open_obligation` maps to
+    /// `Status`/`NextAction` (`true → Open + Hold`, `false → Resolved + Accept`)
+    /// and no isolable `Fragment` is attached. Prefer [`new_full`](Self::new_full)
+    /// or the `with_*` builders at call sites that carry a fragment or a specific
+    /// directive.
     #[must_use]
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -711,15 +785,79 @@ impl BoundaryResidue {
         origin: TraceId,
         open_obligation: bool,
     ) -> Self {
+        let (status, next_action) = if open_obligation {
+            (ResidueStatus::Open, NextAction::Hold)
+        } else {
+            (ResidueStatus::Resolved, NextAction::Accept)
+        };
         Self {
             id,
             kind,
             source_gate,
+            fragment: None,
             detail: detail.into(),
             severity,
             origin,
-            open_obligation,
+            status,
+            next_action,
         }
+    }
+
+    /// Construct the complete 5-tuple with an explicit `Fragment`, `Status`, and
+    /// `NextAction`.
+    #[must_use]
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_full(
+        id: ResidueId,
+        kind: ResidueKind,
+        source_gate: GateId,
+        fragment: Option<String>,
+        detail: impl Into<String>,
+        severity: Severity,
+        origin: TraceId,
+        status: ResidueStatus,
+        next_action: NextAction,
+    ) -> Self {
+        Self {
+            id,
+            kind,
+            source_gate,
+            fragment,
+            detail: detail.into(),
+            severity,
+            origin,
+            status,
+            next_action,
+        }
+    }
+
+    /// Attach the isolable `Fragment` that was lost.
+    #[must_use]
+    pub fn with_fragment(mut self, fragment: impl Into<String>) -> Self {
+        self.fragment = Some(fragment.into());
+        self
+    }
+
+    /// Set the `NextAction` directive.
+    #[must_use]
+    pub fn with_next_action(mut self, next_action: NextAction) -> Self {
+        self.next_action = next_action;
+        self
+    }
+
+    /// Set the lifecycle `Status`.
+    #[must_use]
+    pub fn with_status(mut self, status: ResidueStatus) -> Self {
+        self.status = status;
+        self
+    }
+
+    /// Whether this residue is a standing, blocking obligation. Only `Open`
+    /// residues block; `Deferred` are acknowledged-non-blocking and `Resolved`
+    /// are discharged. Preserves the legacy `open_obligation` predicate.
+    #[must_use]
+    pub fn open_obligation(&self) -> bool {
+        matches!(self.status, ResidueStatus::Open)
     }
 }
 
@@ -745,7 +883,7 @@ impl ResidueRegister {
     }
 
     pub fn open_obligations(&self) -> impl Iterator<Item = &BoundaryResidue> {
-        self.entries.iter().filter(|r| r.open_obligation)
+        self.entries.iter().filter(|r| r.open_obligation())
     }
 
     #[must_use]
@@ -1105,6 +1243,86 @@ mod tests {
         let d = digest_of(&"payload", HashAlg::Blake3).expect("hash must work");
         let hex = d.to_hex();
         assert_eq!(Digest::from_hex(&hex).expect("valid hex"), d);
+    }
+
+    // G9 (A4): the residue is the complete 5-tuple (Source, Fragment, Reason,
+    // Status, NextAction) in a class of the closed taxonomy K (11 kinds).
+    #[test]
+    fn residue_is_the_complete_five_tuple_over_taxonomy_k() {
+        // The taxonomy K is exactly 11 kinds, including the previously-missing
+        // Cospectral and FieldProjection.
+        assert_eq!(ResidueKind::ALL.len(), 11);
+        assert!(ResidueKind::ALL.contains(&ResidueKind::Cospectral));
+        assert!(ResidueKind::ALL.contains(&ResidueKind::FieldProjection));
+
+        // The full constructor carries every tuple field.
+        let r = BoundaryResidue::new_full(
+            ResidueId::new("r1"),
+            ResidueKind::FieldProjection,
+            GateId::Focus,
+            Some("hidden.body".to_owned()),
+            "projection dropped the body sub-surface",
+            Severity::High,
+            TraceId::new("t1"),
+            ResidueStatus::Open,
+            NextAction::Reacquire,
+        );
+        assert_eq!(r.source_gate, GateId::Focus); // Source
+        assert_eq!(r.fragment.as_deref(), Some("hidden.body")); // Fragment
+        assert_eq!(r.detail, "projection dropped the body sub-surface"); // Reason
+        assert_eq!(r.status, ResidueStatus::Open); // Status
+        assert_eq!(r.next_action, NextAction::Reacquire); // NextAction
+        assert!(r.open_obligation(), "Open is a standing obligation");
+
+        // The legacy 7-arg constructor maps open_obligation → Status/NextAction
+        // and preserves the open_obligation() predicate exactly.
+        let held = BoundaryResidue::new(
+            ResidueId::new("r2"),
+            ResidueKind::Boundary,
+            GateId::Boundary,
+            "seam open",
+            Severity::High,
+            TraceId::new("t2"),
+            true,
+        );
+        assert_eq!(held.status, ResidueStatus::Open);
+        assert_eq!(held.next_action, NextAction::Hold);
+        assert!(held.open_obligation());
+        assert!(
+            held.fragment.is_none(),
+            "no isolable fragment via legacy new"
+        );
+
+        let resolved = BoundaryResidue::new(
+            ResidueId::new("r3"),
+            ResidueKind::Boundary,
+            GateId::Boundary,
+            "seam closed",
+            Severity::Info,
+            TraceId::new("t3"),
+            false,
+        );
+        assert_eq!(resolved.status, ResidueStatus::Resolved);
+        assert!(!resolved.open_obligation());
+
+        // Deferred is acknowledged-but-non-blocking: conserved, not an obligation.
+        let deferred = held.with_status(ResidueStatus::Deferred);
+        assert!(
+            !deferred.open_obligation(),
+            "a deferred residue is conserved but does not block"
+        );
+
+        // Only Open residues surface as open obligations in a register.
+        let mut reg = ResidueRegister::new();
+        reg.emit(r);
+        reg.emit(resolved);
+        reg.emit(deferred);
+        assert_eq!(reg.entries().len(), 3);
+        assert_eq!(
+            reg.open_obligations().count(),
+            1,
+            "only the Open one blocks"
+        );
     }
 
     #[test]
