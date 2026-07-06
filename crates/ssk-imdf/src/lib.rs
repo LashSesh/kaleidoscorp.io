@@ -36,6 +36,7 @@ pub mod closure;
 pub mod contact;
 pub mod error;
 pub mod observer;
+pub mod observer_field;
 pub mod qlogic;
 pub mod replay;
 pub mod self_anchor;
@@ -50,6 +51,7 @@ pub use error::ImdfError;
 pub use observer::{
     Blindspot, Lens, ObserverId, ObserverModel, TrustLevel, Vantage, SELF_OBSERVATION_USE,
 };
+pub use observer_field::ObserverField;
 pub use qlogic::{
     QAxis, QLogicGate, QLogicInput, QLogicThresholds, QLogicVector, QOutcome, QState,
 };
