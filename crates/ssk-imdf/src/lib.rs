@@ -50,7 +50,9 @@ pub use error::ImdfError;
 pub use observer::{
     Blindspot, Lens, ObserverId, ObserverModel, TrustLevel, Vantage, SELF_OBSERVATION_USE,
 };
-pub use qlogic::{QAxis, QLogicGate, QLogicInput, QLogicThresholds, QLogicVector, QOutcome};
+pub use qlogic::{
+    QAxis, QLogicGate, QLogicInput, QLogicThresholds, QLogicVector, QOutcome, QState,
+};
 pub use replay::{
     reanalyze, ImdfReplayManifest, ReanalysisReport, ReanalysisVerdict, RunDescriptor,
     RunTransition, StabilityCertificate,

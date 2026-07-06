@@ -283,6 +283,87 @@ impl QLogicGate {
     }
 }
 
+/// The gate's typed quantum-logic input state `q = (s, φ, κ, r)` (IMRT A6):
+/// band-occupancy `s`, phase `φ`, coherence `κ`, and residue-mark `r`. Its
+/// stability `Stab(q)` under two orthogonal kicks decides gate-relevance — a
+/// state that does not move under the kicks carries no parallax (Inv 9.6) and
+/// is not gate-relevant.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct QState {
+    /// Band occupancy `s`.
+    pub band: f64,
+    /// Phase `φ`.
+    pub phase: f64,
+    /// Coherence `κ`.
+    pub coherence: f64,
+    /// Residue-mark `r`.
+    pub residue_mark: f64,
+}
+
+impl QState {
+    #[must_use]
+    pub fn new(band: f64, phase: f64, coherence: f64, residue_mark: f64) -> Self {
+        QState {
+            band,
+            phase,
+            coherence,
+            residue_mark,
+        }
+    }
+
+    /// The Euclidean distance `d(q, q')` over the four components.
+    #[must_use]
+    pub fn distance(&self, other: &QState) -> f64 {
+        let db = self.band - other.band;
+        let dp = self.phase - other.phase;
+        let dk = self.coherence - other.coherence;
+        let dr = self.residue_mark - other.residue_mark;
+        (db * db + dp * dp + dk * dk + dr * dr).sqrt()
+    }
+
+    /// The first orthogonal kick `Φ_U`: a 90° rotation of the `(band, phase)`
+    /// plane, leaving `(coherence, residue_mark)` fixed. Only the plane's origin
+    /// is a fixed point.
+    #[must_use]
+    pub fn kick_u(&self) -> QState {
+        QState {
+            band: -self.phase,
+            phase: self.band,
+            coherence: self.coherence,
+            residue_mark: self.residue_mark,
+        }
+    }
+
+    /// The second, orthogonal kick `Φ_V`: a 90° rotation of the
+    /// `(coherence, residue_mark)` plane, leaving `(band, phase)` fixed.
+    #[must_use]
+    pub fn kick_v(&self) -> QState {
+        QState {
+            band: self.band,
+            phase: self.phase,
+            coherence: -self.residue_mark,
+            residue_mark: self.coherence,
+        }
+    }
+
+    /// The stability probe `Stab(q) = d(q, Φ_U q) + d(q, Φ_V q)` — the total
+    /// displacement under the two orthogonal kicks. `0` iff `q` is the null
+    /// state (all components zero); positive for any state carrying signal.
+    #[must_use]
+    pub fn stab(&self) -> f64 {
+        self.distance(&self.kick_u()) + self.distance(&self.kick_v())
+    }
+
+    /// Whether `q` is gate-relevant: it must carry **non-vanishing parallax**
+    /// under the orthogonal kicks (`Stab(q) > 0`, Inv 9.6). A non-finite state
+    /// is never relevant (fail-closed).
+    #[must_use]
+    pub fn is_gate_relevant(&self) -> bool {
+        let s = self.stab();
+        s.is_finite() && s > 0.0
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -418,5 +499,48 @@ mod tests {
         inf_input.coherence = f64::NEG_INFINITY;
         let v_inf = gate.evaluate(&inf_input);
         assert_eq!(v_inf.kappa, QOutcome::Fail);
+    }
+
+    // G4 (A6): QState round-trips all four components, and Stab(q) confers gate
+    // relevance only under non-vanishing parallax (Inv 9.6) — the null state is
+    // a fixed point of both orthogonal kicks and is not gate-relevant.
+    #[test]
+    fn qstate_stab_confers_relevance_only_under_nonvanishing_parallax() {
+        // Round-trip: all four components are preserved and readable.
+        let q = QState::new(0.3, -0.7, 0.9, 0.1);
+        assert_eq!(q.band, 0.3);
+        assert_eq!(q.phase, -0.7);
+        assert_eq!(q.coherence, 0.9);
+        assert_eq!(q.residue_mark, 0.1);
+        let json = serde_json::to_string(&q).unwrap();
+        let back: QState = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, q);
+
+        // The null state is fixed by both kicks → Stab = 0 → not gate-relevant.
+        let null = QState::new(0.0, 0.0, 0.0, 0.0);
+        assert_eq!(null.kick_u(), null);
+        assert_eq!(null.kick_v(), null);
+        assert_eq!(null.stab(), 0.0);
+        assert!(
+            !null.is_gate_relevant(),
+            "a state with vanishing parallax confers no relevance"
+        );
+
+        // Any state carrying signal moves under the kicks → Stab > 0 → relevant.
+        assert!(q.stab() > 0.0);
+        assert!(q.is_gate_relevant());
+
+        // A kick that only touches the (band, phase) plane leaves (κ, r) fixed;
+        // a state non-zero only in (κ, r) still has non-vanishing parallax via Φ_V.
+        let only_kr = QState::new(0.0, 0.0, 0.5, -0.2);
+        assert_eq!(only_kr.kick_u(), only_kr, "Φ_U fixes the (κ,r)-only state");
+        assert_ne!(only_kr.kick_v(), only_kr, "but Φ_V moves it");
+        assert!(only_kr.is_gate_relevant());
+
+        // Stab is deterministic and finite for finite input; non-finite → not
+        // relevant (fail-closed).
+        assert_eq!(q.stab(), q.stab());
+        let nan = QState::new(f64::NAN, 0.0, 0.0, 0.0);
+        assert!(!nan.is_gate_relevant());
     }
 }
