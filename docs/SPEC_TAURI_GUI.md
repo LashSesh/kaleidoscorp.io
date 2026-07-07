@@ -312,3 +312,29 @@ packaging/signing. P0 is the security core they all sit on.
 **Definition of done for P0:** `cargo build/test` green on Linux for the portable core + mock;
 `cargo check --target x86_64-pc-windows-msvc` green for the `#[cfg(windows)]` edges; `fmt` + `clippy
 -D warnings` clean; committed with the crash-recovery test named and passing.
+
+---
+
+## 13. Implementation status (live)
+
+| Phase | Scope | Status | Verified how |
+|---|---|---|---|
+| **P0** | Privileged broker core (auth, anti-replay, idempotency, state-version, durable ACL'd store, authoritative status, crash recovery) | ✅ **Done** | `ssk-netd-helper` — 12 Linux tests incl. crash-recovery + Inconsistent alarm; `cargo check` windows-msvc for the DACL edge |
+| **P0 transport** | Named-pipe **client-SID** auth end-to-end (`CLIENT_SID_CHECK_IMPLEMENTED`→real) | ⏳ **Deferred — Windows runner** | needs `windows-sys` FFI (unsafe → belongs in `ssk-winhost`); cross-checkable, not runnable on Linux |
+| **P1** | Read-only panel: kill-switch / audit / connections / system-verdict views, 7-state machine, fail-closed error, frontend | ✅ **Done** | `ssk-tauri-bridge` — 20 Linux tests, machine-generated golden fixtures, pinned JSON wire strings; `cargo check` windows-msvc |
+| **P2** | Privileged control layer (engage/release envelope build + response map + stale-version retry) | ✅ **Done** | 5 Linux tests end-to-end vs. an in-process broker + mock enforcer |
+| **P2 glue** | `#[tauri::command]` write commands + WebView2 window | ⏳ **Deferred — webkit runner** | `ui/INTEGRATION.md` template; needs `wry`/`webkit2gtk` a headless CI lacks |
+| **P3** | Live Windows connection capture + event stream | ⏳ **Deferred — Windows runner** | pure byte-parsers done+tested; live `GetExtendedTcpTable` is `#[cfg(windows)]` FFI, returns empty off-Windows |
+| **P4** | MSI/NSIS packaging + Authenticode signing + auto-update | ⏳ **Deferred — release pipeline** | needs a Windows runner + signing HSM |
+| **TS drift guard** | ts-rs generation of the `.d.ts` from the DTOs | ⏳ **Deferred — opt-in job** | pure-Rust, Linux-OK, but adds a registry dependency; the Rust-side wire strings are pinned in the interim |
+
+**The honest boundary.** Everything the Linux sandbox can verify for this GUI is
+done: the broker security core, the four read-only views, the privileged control
+layer — all green, all tested, no fabricated data. The remaining phases are
+gated on hardware/OS this environment does not have (a Windows runner for the
+SID transport + live capture + packaging; a webkit runner for the webview
+glue), and the project's own no-overclaim / everything-tested ethos forbids
+shipping unverified security-critical FFI blind. Those phases are cross-checked
+(`cargo check --target x86_64-pc-windows-msvc`) where code exists, and carry an
+explicit "operator validates on a real admin box" boundary, exactly as
+`RUNBOOK_WINDOWS.md` establishes for the existing winhost backends.
