@@ -25,11 +25,13 @@
 //! [`PanelState::Degraded`](state::PanelState::Degraded), never a fabricated
 //! `Ready`.
 
+pub mod control;
 pub mod dto;
 pub mod error;
 pub mod state;
 pub mod view;
 
+pub use control::{ControlClient, ControlError, KillSwitchControl, NonceSource};
 pub use dto::{
     AuditEntryDto, AuditIntegrityDto, AuditViewDto, ConnectionRowDto, ConnectionsViewDto,
     KillSwitchViewDto, LogicalStateDto, OsRuleDto, ReceiptDto, RecoveryDto, SeverityDto,
