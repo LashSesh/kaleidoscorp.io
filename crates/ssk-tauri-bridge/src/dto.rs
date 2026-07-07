@@ -131,6 +131,51 @@ pub struct ConnectionRowDto {
     pub status: String,
 }
 
+/// The Crown emission decision, projected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DecisionDto {
+    Emit,
+    Hold,
+    Deny,
+}
+
+/// A gate outcome, projected (the closed `GateOutcomeKind` set).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GateOutcomeDto {
+    Pass,
+    Hold,
+    Refine,
+    Reject,
+    Quarantine,
+}
+
+/// The MetaResonance action, projected (hold-only; never promotes).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ResonanceActionDto {
+    Stabilize,
+    Delay,
+    Hold,
+}
+
+/// The system-verdict panel view — one end-to-end pipeline evaluation. The
+/// `field_digest_hex` is a structural 64-hex string (content-addressed), not
+/// asserted byte-equal to a committed golden (determinism across hosts is not
+/// claimed).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SystemVerdictViewDto {
+    pub decision: DecisionDto,
+    pub host_downgraded: bool,
+    pub signature_gate: GateOutcomeDto,
+    pub qlogic_gate: GateOutcomeDto,
+    pub resonance_action: ResonanceActionDto,
+    pub field_digest_hex: String,
+    pub reasons: Vec<String>,
+}
+
 /// The connections panel view.
 ///
 /// `live_supported` is honest: off-Windows (and until the P3 live seam lands)

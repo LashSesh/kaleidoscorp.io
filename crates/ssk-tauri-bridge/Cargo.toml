@@ -21,6 +21,9 @@ license.workspace = true
 ssk-netd-helper = { path = "../ssk-netd-helper", version = "0.1.0" }
 ssk-boundary = { path = "../ssk-boundary", version = "0.1.0" }
 ssk-winhost = { path = "../ssk-winhost", version = "0.1.0" }
+ssk-system = { path = "../ssk-system", version = "0.1.0" }
+ssk-crown = { path = "../ssk-crown", version = "0.1.0" }
+ssk-meta-resonance = { path = "../ssk-meta-resonance", version = "0.1.0" }
 ssk-types = { path = "../ssk-types", version = "0.1.0" }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -28,6 +31,9 @@ thiserror = { workspace = true }
 
 [dev-dependencies]
 ssk-signature = { path = "../ssk-signature", version = "0.1.0" }
+ssk-capture = { path = "../ssk-capture", version = "0.1.0" }
+ssk-mpk = { path = "../ssk-mpk", version = "0.1.0" }
+ssk-service-host = { path = "../ssk-service-host", version = "0.1.0" }
 
 [lints]
 workspace = true

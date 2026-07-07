@@ -34,8 +34,9 @@ pub mod view;
 pub use control::{ControlClient, ControlError, KillSwitchControl, NonceSource};
 pub use dto::{
     AuditEntryDto, AuditIntegrityDto, AuditViewDto, ConnectionRowDto, ConnectionsViewDto,
-    KillSwitchViewDto, LogicalStateDto, OsRuleDto, ReceiptDto, RecoveryDto, SeverityDto,
+    DecisionDto, GateOutcomeDto, KillSwitchViewDto, LogicalStateDto, OsRuleDto, ReceiptDto,
+    RecoveryDto, ResonanceActionDto, SeverityDto, SystemVerdictViewDto,
 };
 pub use error::{BridgeError, BridgeErrorDto};
 pub use state::{classify, transition, IllegalTransition, PanelEvent, PanelState};
-pub use view::{audit_view, connections_view, kill_switch_view};
+pub use view::{audit_view, connections_view, kill_switch_view, system_verdict_view};

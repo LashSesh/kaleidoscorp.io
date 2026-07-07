@@ -3,13 +3,17 @@
 //! Linux-CI-tested surface (SPEC_TAURI_GUI.md §9, §10).
 
 use ssk_boundary::{BoundaryAuditEntry, EnforcementReceipt, KillSwitchState};
+use ssk_crown::EmissionDecision;
+use ssk_meta_resonance::ResonanceAction;
 use ssk_netd_helper::{KillSwitchStatus, Recovery};
-use ssk_types::Digest;
+use ssk_system::SystemVerdict;
+use ssk_types::{Digest, GateOutcomeKind};
 use ssk_winhost::connections::{parse_tcp_table, parse_udp_table, FlowRow};
 
 use crate::dto::{
     AuditEntryDto, AuditIntegrityDto, AuditViewDto, ConnectionRowDto, ConnectionsViewDto,
-    KillSwitchViewDto, LogicalStateDto, OsRuleDto, ReceiptDto, RecoveryDto, SeverityDto,
+    DecisionDto, GateOutcomeDto, KillSwitchViewDto, LogicalStateDto, OsRuleDto, ReceiptDto,
+    RecoveryDto, ResonanceActionDto, SeverityDto, SystemVerdictViewDto,
 };
 
 impl From<KillSwitchState> for LogicalStateDto {
@@ -122,6 +126,54 @@ pub fn audit_view(entries: &[BoundaryAuditEntry], verified: bool) -> AuditViewDt
             AuditIntegrityDto::Unverified
         },
         entries: projected,
+    }
+}
+
+impl From<EmissionDecision> for DecisionDto {
+    fn from(d: EmissionDecision) -> Self {
+        match d {
+            EmissionDecision::Emit => DecisionDto::Emit,
+            EmissionDecision::Hold => DecisionDto::Hold,
+            EmissionDecision::Deny => DecisionDto::Deny,
+        }
+    }
+}
+
+impl From<GateOutcomeKind> for GateOutcomeDto {
+    fn from(g: GateOutcomeKind) -> Self {
+        match g {
+            GateOutcomeKind::Pass => GateOutcomeDto::Pass,
+            GateOutcomeKind::Hold => GateOutcomeDto::Hold,
+            GateOutcomeKind::Refine => GateOutcomeDto::Refine,
+            GateOutcomeKind::Reject => GateOutcomeDto::Reject,
+            GateOutcomeKind::Quarantine => GateOutcomeDto::Quarantine,
+        }
+    }
+}
+
+impl From<ResonanceAction> for ResonanceActionDto {
+    fn from(a: ResonanceAction) -> Self {
+        match a {
+            ResonanceAction::Stabilize => ResonanceActionDto::Stabilize,
+            ResonanceAction::Delay => ResonanceActionDto::Delay,
+            ResonanceAction::Hold => ResonanceActionDto::Hold,
+        }
+    }
+}
+
+/// Project an end-to-end [`SystemVerdict`] into the panel DTO. `SystemVerdict` is
+/// not itself `Serialize`, so this is a hand-written projection with total
+/// (no-wildcard) enum matches, pinning the wire strings the frontend binds to.
+#[must_use]
+pub fn system_verdict_view(v: &SystemVerdict) -> SystemVerdictViewDto {
+    SystemVerdictViewDto {
+        decision: v.decision.into(),
+        host_downgraded: v.host_downgraded,
+        signature_gate: v.signature_gate.into(),
+        qlogic_gate: v.qlogic_gate.into(),
+        resonance_action: v.resonance_action.into(),
+        field_digest_hex: v.field_digest.to_hex(),
+        reasons: v.reasons.clone(),
     }
 }
 
