@@ -1,0 +1,17 @@
+{
+  "audit_head_hex": "0000000000000000000000000000000000000000000000000000000000000000",
+  "audit_len": 1,
+  "is_alarm": false,
+  "journal_claims_engaged": true,
+  "logical_state": "engaged",
+  "os_rule": "present",
+  "protection_confirmed": true,
+  "receipt": {
+    "prior_state": "flowing",
+    "receipt_id_hex": "0000000000000000000000000000000000000000000000000000000000000000",
+    "scope_label": "all-egress"
+  },
+  "recovery": "consistent",
+  "severity": "ok",
+  "state_version": 1
+}

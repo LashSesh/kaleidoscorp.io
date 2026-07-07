@@ -44,6 +44,7 @@ members = [
   "crates/ssk-ipc",
   "crates/ssk-daemon",
   "crates/ssk-netd-helper",
+  "crates/ssk-tauri-bridge",
 ]
 
 [workspace.package]
