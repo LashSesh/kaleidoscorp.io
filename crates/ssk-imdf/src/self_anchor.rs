@@ -91,6 +91,85 @@ impl SelfAnchor {
     }
 }
 
+/// Domain tag for the L0 null-anchor commitment.
+const NULL_ANCHOR_DOMAIN: &str = "imdf/null-anchor/v1";
+
+/// The **L0 NullAnchor `Z`** (IMRT Def. 8.1): the internal, *prätemporal*
+/// ordering reference relative to which projections are ordered and recovered.
+///
+/// Axiom A1 forbids `Z` from ever being *entered, emitted, or materialized as a
+/// locator*. That invariant is enforced structurally, not by convention:
+/// `NullAnchor` deliberately does **not** derive `Serialize`/`Deserialize`, so
+/// the compiler rejects placing it in any serialized atlas, ledger, or wire
+/// payload — it physically cannot cross a boundary. The *only* representation of
+/// `Z` that may cross a boundary is its content-address [`NullAnchor::commitment`]
+/// (a [`Digest`]); the raw `order_ref`/`recovery_root` never do. `Z` **orders** a
+/// [`SelfAnchor`] via [`NullAnchor::order`], binding the anchor's replay root to
+/// `Z`'s commitment so every reconstruction traces back to `Z` without exposing
+/// it (Def. 8.1: *Z ordnet S*).
+#[derive(Clone, Debug)]
+pub struct NullAnchor {
+    order_ref: String,
+    recovery_root: String,
+}
+
+impl NullAnchor {
+    /// A null anchor from an order reference and a recovery root. These are
+    /// internal ordering material and never leave the process except as the
+    /// digest [`commitment`](NullAnchor::commitment).
+    #[must_use]
+    pub fn new(order_ref: impl Into<String>, recovery_root: impl Into<String>) -> Self {
+        NullAnchor {
+            order_ref: order_ref.into(),
+            recovery_root: recovery_root.into(),
+        }
+    }
+
+    /// The content-address commitment to this null anchor — the ONLY
+    /// representation of `Z` that may cross a boundary. `Z` itself never does.
+    #[must_use]
+    pub fn commitment(&self) -> Digest {
+        #[derive(Serialize)]
+        struct Form<'a> {
+            domain: &'a str,
+            order_ref: &'a str,
+            recovery_root: &'a str,
+        }
+        digest_of(
+            &Form {
+                domain: NULL_ANCHOR_DOMAIN,
+                order_ref: &self.order_ref,
+                recovery_root: &self.recovery_root,
+            },
+            HashAlg::Blake3,
+        )
+        .expect("null-anchor form is serializable")
+    }
+
+    /// Order a [`SelfAnchor`] against this null fixpoint (A1: `Z` orders `S`).
+    /// The resulting anchor's replay root is bound to `Z`'s *commitment* (never
+    /// its raw material), so the reconstruction traces back to `Z` without
+    /// emitting it.
+    #[must_use]
+    pub fn order(
+        &self,
+        scope: impl Into<String>,
+        owner: impl Into<String>,
+        policy: PolicyId,
+        key_context: KeyContextRef,
+        boundary: BoundaryRef,
+    ) -> SelfAnchor {
+        SelfAnchor::new(
+            scope,
+            owner,
+            policy,
+            key_context,
+            ReplayRoot::new(self.commitment().to_hex()),
+            boundary,
+        )
+    }
+}
+
 /// A *where-address* — deliberately holds no identity fields.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DomeLocator {
@@ -214,5 +293,71 @@ mod tests {
             anchor_for("alice", "host-a").id,
             anchor_for("bob", "host-a").id
         );
+    }
+
+    // G1/A1: the L0 NullAnchor commitment is deterministic, field-sensitive, and
+    // domain-separated from a locator built off the same string.
+    #[test]
+    fn null_anchor_commitment_is_deterministic_and_domain_separated() {
+        let z = NullAnchor::new("order-1", "recover-1");
+        assert_eq!(
+            z.commitment(),
+            NullAnchor::new("order-1", "recover-1").commitment()
+        );
+        assert_ne!(
+            z.commitment(),
+            NullAnchor::new("order-1", "recover-2").commitment()
+        );
+        // Even built off the same string, Z's commitment never collides with a
+        // locator address digest (distinct domain tags).
+        assert_ne!(z.commitment(), DomeLocator::new("order-1").address_digest());
+    }
+
+    // G1/A1: Z orders S, and Z is NEVER emitted — the anchor's serialized form
+    // carries Z's *commitment* (the allowed reference) but not its raw material.
+    #[test]
+    fn null_anchor_orders_the_self_anchor_without_emitting_z() {
+        let z = NullAnchor::new("order-secret", "recover-secret");
+        let anchor = z.order(
+            "host-a",
+            "alice",
+            PolicyId::new("p"),
+            KeyContextRef::new("kc"),
+            BoundaryRef::new("b"),
+        );
+        // The anchor traces back to Z via its commitment.
+        assert_eq!(anchor.replay_root, ReplayRoot::new(z.commitment().to_hex()));
+
+        // Z's raw ordering material must NOT appear anywhere the anchor can be
+        // serialized to (A1: Z is never entered/emitted/materialized). This is
+        // the runtime witness of the structural "not Serialize" guarantee.
+        let serialized = serde_json::to_string(&anchor).expect("anchor serializes");
+        assert!(!serialized.contains("order-secret"), "Z order_ref leaked");
+        assert!(
+            !serialized.contains("recover-secret"),
+            "Z recovery_root leaked"
+        );
+        // The commitment hex IS present — the one allowed boundary-crossing form.
+        assert!(serialized.contains(&z.commitment().to_hex()));
+    }
+
+    // Two anchors ordered by the same Z share the same recovery binding; a
+    // different Z yields a different binding — Z genuinely orders S.
+    #[test]
+    fn same_null_anchor_binds_anchors_to_the_same_recovery_root() {
+        let z1 = NullAnchor::new("o", "r");
+        let z2 = NullAnchor::new("o", "different");
+        let mk = |z: &NullAnchor| {
+            z.order(
+                "s",
+                "o",
+                PolicyId::new("p"),
+                KeyContextRef::new("kc"),
+                BoundaryRef::new("b"),
+            )
+            .replay_root
+        };
+        assert_eq!(mk(&z1), mk(&z1));
+        assert_ne!(mk(&z1), mk(&z2));
     }
 }

@@ -17,6 +17,14 @@
 //! The loop is meta-stable: the integral term is anti-windup clamped and the
 //! output is bounded, so a persistent drift produces a bounded response, never a
 //! runaway.
+//!
+//! Alongside the PID it carries the run-transition [`DriftMode`] (IMRT
+//! Def. 16.8): a persisted, path-dependent mode over the drift Δ governed by
+//! **double-threshold hysteresis** (θ_on > θ_off). Inside the band both modes
+//! are reachable at the same Δ (Satz 16.9), so the compensate-vs-new-run
+//! boundary is *not* a single-threshold point predicate — the provably wrong
+//! form. This mode is a signal over Δ; it does not change the Δ gate axis or
+//! `IMRTValid` (Bemerkung 16.17).
 
 use serde::{Deserialize, Serialize};
 use ssk_types::GateOutcomeKind;
@@ -32,6 +40,88 @@ pub enum ResonanceAction {
     Hold,
 }
 
+/// The run-transition drift mode (IMRT Def. 16.8, Satz 16.9): whether the
+/// current drift is being **compensated** within the same run, or has crossed
+/// the upper threshold so a **new run** is required. It is deliberately a
+/// *persisted, path-dependent* mode over the drift Δ — not a point predicate on
+/// the current value — because a single-threshold criterion is provably the
+/// wrong form of the boundary (Satz 16.9): inside the hysteresis band both modes
+/// are reachable at the same Δ, decided only by the approach path.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DriftMode {
+    /// Compensate the drift — the same run continues.
+    Komp,
+    /// The drift crossed the upper threshold — a new run is required.
+    Neu,
+}
+
+/// The version ratchet `ℓ` and reset operator `ϱ` of the run-transition
+/// machinery (IMRT A8, Satz 16.12/16.13, Inv 16.15).
+///
+/// * `ℓ` (the *stage*) is monotone non-decreasing — the reset `ϱ` is an
+///   **idempotent max-projection**: `ϱ(ℓ, c) = max(ℓ, c)`, so `ϱ∘ϱ = ϱ`
+///   (Satz 16.12) and `ℓ_{k+1} ≥ ℓ_k` (Satz 16.13). There is no way to lower `ℓ`.
+/// * `ϱ` is triggered at the `Komp → Neu` transition — the moment a new run
+///   supersedes the compensated one.
+/// * Marks carry a **past-vs-future asymmetry** (Inv 16.15): a mark at or before
+///   the current stage weighs full; a future mark is preloaded at half weight.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VersionRatchet {
+    stage: u64,
+}
+
+impl VersionRatchet {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Start at an explicit stage (e.g. read off the append-only ledger head).
+    #[must_use]
+    pub fn at(stage: u64) -> Self {
+        VersionRatchet { stage }
+    }
+
+    /// The current monotone stage `ℓ`.
+    #[must_use]
+    pub fn stage(&self) -> u64 {
+        self.stage
+    }
+
+    /// The reset operator `ϱ`: an idempotent max-projection. Advances `ℓ` to
+    /// `max(ℓ, candidate)` and returns whether it advanced. Never lowers `ℓ`.
+    pub fn reset(&mut self, candidate: u64) -> bool {
+        if candidate > self.stage {
+            self.stage = candidate;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Apply `ϱ` only at a `Komp → Neu` transition (a genuine run supersession);
+    /// any other transition leaves `ℓ` untouched. Returns whether `ℓ` advanced.
+    pub fn on_transition(&mut self, from: DriftMode, to: DriftMode, candidate: u64) -> bool {
+        if from == DriftMode::Komp && to == DriftMode::Neu {
+            self.reset(candidate)
+        } else {
+            false
+        }
+    }
+
+    /// The weight a mark stamped at `mark_stage` carries when evaluated at the
+    /// current stage (Inv 16.15): a past-or-present mark weighs `1.0`; a future
+    /// mark (`mark_stage > ℓ`) is preloaded at `0.5`.
+    #[must_use]
+    pub fn mark_weight(&self, mark_stage: u64) -> f64 {
+        if mark_stage <= self.stage {
+            1.0
+        } else {
+            0.5
+        }
+    }
+}
+
 /// The controller's response for one step.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ResonanceResponse {
@@ -40,6 +130,11 @@ pub struct ResonanceResponse {
     pub adjustment: f64,
     /// The drift the response was computed from.
     pub measured_drift: f64,
+    /// The persisted, hysteretic drift mode after this step (Def. 16.8). This is
+    /// a mode *over* Δ; it does not change the Δ gate axis or `IMRTValid`
+    /// (Bemerkung 16.17) — it signals the run-transition consumer whether a new
+    /// run is required.
+    pub drift_mode: DriftMode,
 }
 
 /// PID gains and thresholds.
@@ -54,6 +149,11 @@ pub struct ResonanceConfig {
     pub stable_threshold: f64,
     /// Drift above which the loop holds rather than merely delays.
     pub hold_threshold: f64,
+    /// θ_on (Def. 16.8): drift at or above which `Komp` switches to `Neu`
+    /// (a new run is required). Must be strictly greater than `drift_mode_off`.
+    pub drift_mode_on: f64,
+    /// θ_off (Def. 16.8): drift at or below which `Neu` switches back to `Komp`.
+    pub drift_mode_off: f64,
 }
 
 impl Default for ResonanceConfig {
@@ -65,6 +165,8 @@ impl Default for ResonanceConfig {
             clamp: 10.0,
             stable_threshold: 0.05,
             hold_threshold: 0.5,
+            drift_mode_on: 0.5,
+            drift_mode_off: 0.2,
         }
     }
 }
@@ -75,6 +177,9 @@ pub struct MetaResonanceController {
     config: ResonanceConfig,
     integral: f64,
     prev_error: f64,
+    /// The persisted, hysteretic run-transition mode (Def. 16.8). Starts in
+    /// `Komp` (compensate) and only flips per the double-threshold rule.
+    drift_mode: DriftMode,
 }
 
 impl Default for MetaResonanceController {
@@ -90,7 +195,14 @@ impl MetaResonanceController {
             config,
             integral: 0.0,
             prev_error: 0.0,
+            drift_mode: DriftMode::Komp,
         }
+    }
+
+    /// The current persisted drift mode.
+    #[must_use]
+    pub fn drift_mode(&self) -> DriftMode {
+        self.drift_mode
     }
 
     /// Advance the loop by one drift measurement (setpoint is zero drift).
@@ -111,10 +223,25 @@ impl MetaResonanceController {
             ResonanceAction::Hold
         };
 
+        // Double-threshold hysteresis (Def. 16.8): Komp→Neu only at/above θ_on,
+        // Neu→Komp only at/below θ_off; inside the band the mode is unchanged,
+        // so it is path-dependent (Satz 16.9), never a point predicate on Δ. A
+        // non-finite drift is treated conservatively as requiring a new run.
+        self.drift_mode = if !measured_drift.is_finite() {
+            DriftMode::Neu
+        } else {
+            match self.drift_mode {
+                DriftMode::Komp if measured_drift >= c.drift_mode_on => DriftMode::Neu,
+                DriftMode::Neu if measured_drift <= c.drift_mode_off => DriftMode::Komp,
+                unchanged => unchanged,
+            }
+        };
+
         ResonanceResponse {
             action,
             adjustment,
             measured_drift,
+            drift_mode: self.drift_mode,
         }
     }
 
@@ -211,6 +338,76 @@ mod tests {
         );
     }
 
+    // G15 / Satz 16.9: the drift mode is bistable inside the hysteresis band —
+    // for Δ ∈ (θ_off, θ_on), approaching from below yields Komp and approaching
+    // from above yields Neu at the SAME Δ. This is the property a single
+    // threshold cannot express.
+    #[test]
+    fn drift_mode_is_bistable_in_the_band() {
+        let cfg = ResonanceConfig::default();
+        let band = (cfg.drift_mode_off + cfg.drift_mode_on) / 2.0; // 0.35, inside (0.2, 0.5)
+        assert!(band > cfg.drift_mode_off && band < cfg.drift_mode_on);
+
+        // Approach from below: start calm, then the band value → stays Komp.
+        let mut from_below = controller();
+        from_below.step(0.0);
+        let r_below = from_below.step(band);
+        assert_eq!(
+            r_below.drift_mode,
+            DriftMode::Komp,
+            "band from below stays Komp"
+        );
+
+        // Approach from above: cross θ_on to Neu, then the same band value →
+        // stays Neu. Same Δ, different mode — decided by the path, not the value.
+        let mut from_above = controller();
+        from_above.step(0.9); // ≥ θ_on → Neu
+        let r_above = from_above.step(band);
+        assert_eq!(
+            r_above.drift_mode,
+            DriftMode::Neu,
+            "band from above stays Neu"
+        );
+
+        assert_eq!(r_below.measured_drift, r_above.measured_drift);
+        assert_ne!(r_below.drift_mode, r_above.drift_mode);
+    }
+
+    // The mode only flips at the thresholds, and a non-finite drift is
+    // conservatively treated as requiring a new run.
+    #[test]
+    fn drift_mode_flips_only_at_thresholds() {
+        let mut c = controller();
+        assert_eq!(c.drift_mode(), DriftMode::Komp);
+        assert_eq!(
+            c.step(0.49).drift_mode,
+            DriftMode::Komp,
+            "just below θ_on holds"
+        );
+        assert_eq!(
+            c.step(0.5).drift_mode,
+            DriftMode::Neu,
+            "at θ_on flips to Neu"
+        );
+        assert_eq!(
+            c.step(0.21).drift_mode,
+            DriftMode::Neu,
+            "just above θ_off holds Neu"
+        );
+        assert_eq!(
+            c.step(0.2).drift_mode,
+            DriftMode::Komp,
+            "at θ_off flips back to Komp"
+        );
+
+        let mut nan = controller();
+        assert_eq!(
+            nan.step(f64::NAN).drift_mode,
+            DriftMode::Neu,
+            "non-finite → new run"
+        );
+    }
+
     // Meta-stability: a persistent drift produces a bounded response; the
     // integral never winds up past the clamp.
     #[test]
@@ -229,5 +426,50 @@ mod tests {
         );
         // Persistent high drift resolves to a Hold action.
         assert!(last.abs() <= clamp);
+    }
+
+    // G16 (A8, Satz 16.12/16.13, Inv 16.15): the reset ϱ is an idempotent
+    // max-projection, the stage ℓ ratchets (never falls), ϱ fires only at the
+    // Komp→Neu transition, and marks carry the past-vs-future weight asymmetry.
+    #[test]
+    fn version_ratchet_reset_is_idempotent_monotone_and_asymmetric() {
+        let mut r = VersionRatchet::new();
+        assert_eq!(r.stage(), 0);
+
+        // ϱ is a max-projection: advancing to a higher stage moves ℓ...
+        assert!(r.reset(3));
+        assert_eq!(r.stage(), 3);
+        // ...idempotence ϱ∘ϱ=ϱ: re-applying the same candidate does not move ℓ.
+        assert!(!r.reset(3));
+        assert_eq!(r.stage(), 3);
+        // Ratchet ℓ_{k+1} ≥ ℓ_k: a lower candidate is refused, ℓ never falls.
+        assert!(!r.reset(1));
+        assert_eq!(r.stage(), 3, "the stage never decreases");
+        assert!(r.reset(7));
+        assert_eq!(r.stage(), 7);
+
+        // ϱ fires ONLY at the Komp→Neu transition.
+        let mut t = VersionRatchet::at(2);
+        assert!(
+            !t.on_transition(DriftMode::Komp, DriftMode::Komp, 9),
+            "no fire"
+        );
+        assert!(
+            !t.on_transition(DriftMode::Neu, DriftMode::Komp, 9),
+            "no fire"
+        );
+        assert_eq!(t.stage(), 2, "non-transitions leave ℓ untouched");
+        assert!(t.on_transition(DriftMode::Komp, DriftMode::Neu, 9), "fires");
+        assert_eq!(t.stage(), 9);
+        // Even at the transition, the ratchet still refuses to fall.
+        assert!(!t.on_transition(DriftMode::Komp, DriftMode::Neu, 4));
+        assert_eq!(t.stage(), 9);
+
+        // Past-vs-future asymmetry (Inv 16.15): past/present full weight, future
+        // preloaded at half.
+        let g = VersionRatchet::at(5);
+        assert_eq!(g.mark_weight(3), 1.0, "a past mark weighs full");
+        assert_eq!(g.mark_weight(5), 1.0, "the present mark weighs full");
+        assert_eq!(g.mark_weight(6), 0.5, "a future mark is half-preloaded");
     }
 }

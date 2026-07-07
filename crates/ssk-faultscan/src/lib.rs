@@ -72,6 +72,10 @@ fn fault_kind_for_residue(kind: &ResidueKind) -> FaultKind {
         ResidueKind::Correlation => FaultKind::PrivacyBudgetExceeded,
         ResidueKind::Focus => FaultKind::FocusAmbiguity,
         ResidueKind::Boundary => FaultKind::BcikSeamMissing,
+        // A cospectral hold is an unresolved spectral-equal/non-isomorphic
+        // ambiguity; a field-projection remainder is exactly a projection gap.
+        ResidueKind::Cospectral => FaultKind::FocusAmbiguity,
+        ResidueKind::FieldProjection => FaultKind::PchProjectionGap,
     }
 }
 

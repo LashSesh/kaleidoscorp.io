@@ -136,3 +136,101 @@ fn system_run_rejects_an_unknown_fixture() {
     let stderr = String::from_utf8(output.stderr).expect("utf8 stderr");
     assert!(stderr.contains("INVALID_FIXTURE"));
 }
+
+// --- winhost (real Windows backends) ---------------------------------------
+//
+// `doctor` and `capture` never fail (they report support and enumerate flows —
+// zero off-Windows), so they exit 0 on any platform. The privileged actions
+// and the "unsupported off-Windows" assertions are gated to non-Windows, where
+// they run on the Linux CI jobs; the Windows CI job compiles and runs the
+// crate's own pure tests.
+
+#[test]
+fn winhost_doctor_runs_on_any_platform() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let output = Command::new(binary())
+        .current_dir(temp.path())
+        .args(["--json", "winhost", "doctor"])
+        .output()
+        .expect("winhost doctor must execute");
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).expect("utf8 stdout");
+    assert!(stdout.contains("\"platform_supported\""));
+    assert!(stdout.contains("\"backends\""));
+}
+
+#[test]
+fn winhost_capture_runs_on_any_platform() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let output = Command::new(binary())
+        .current_dir(temp.path())
+        .args(["--json", "winhost", "capture"])
+        .output()
+        .expect("winhost capture must execute");
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).expect("utf8 stdout");
+    assert!(stdout.contains("\"flow_count\""));
+}
+
+#[cfg(not(windows))]
+#[test]
+fn winhost_doctor_reports_unsupported_off_windows() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let output = Command::new(binary())
+        .current_dir(temp.path())
+        .args(["--json", "winhost", "doctor"])
+        .output()
+        .expect("winhost doctor must execute");
+    let stdout = String::from_utf8(output.stdout).expect("utf8 stdout");
+    assert!(stdout.contains("\"platform_supported\": false"));
+}
+
+#[cfg(not(windows))]
+#[test]
+fn winhost_killswitch_engage_requires_windows() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let output = Command::new(binary())
+        .current_dir(temp.path())
+        .args(["winhost", "killswitch", "engage"])
+        .output()
+        .expect("winhost killswitch engage must execute");
+    assert_eq!(output.status.code(), Some(21));
+    let stderr = String::from_utf8(output.stderr).expect("utf8 stderr");
+    assert!(stderr.contains("requires Windows"));
+}
+
+#[cfg(not(windows))]
+#[test]
+fn winhost_killswitch_release_without_a_receipt_errors() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let output = Command::new(binary())
+        .current_dir(temp.path())
+        .args([
+            "--json",
+            "winhost",
+            "killswitch",
+            "release",
+            "--scope",
+            "ci-nonexistent-scope",
+        ])
+        .output()
+        .expect("winhost killswitch release must execute");
+    assert_eq!(output.status.code(), Some(21));
+    // The machine-readable error envelope is written to stderr by emit_error.
+    let stderr = String::from_utf8(output.stderr).expect("utf8 stderr");
+    assert!(stderr.contains("KILLSWITCH_NO_RECEIPT"));
+}
+
+#[cfg(not(windows))]
+#[test]
+fn winhost_service_start_requires_windows() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let output = Command::new(binary())
+        .current_dir(temp.path())
+        .args(["winhost", "service", "start"])
+        .output()
+        .expect("winhost service start must execute");
+    assert_eq!(output.status.code(), Some(21));
+    let stderr = String::from_utf8(output.stderr).expect("utf8 stderr");
+    assert!(stderr.contains("requires Windows"));
+}

@@ -672,7 +672,13 @@ pub struct GateWitness {
     pub evidence: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// The closed residue taxonomy **K** (IMRT A4, Def. H). Every non-integrated
+/// field fragment is classified into exactly one of these kinds. The theory
+/// fixes K at 11 kinds; the last two — [`Cospectral`](ResidueKind::Cospectral)
+/// (a spectral-equal-but-non-isomorphic hold, L4) and
+/// [`FieldProjection`](ResidueKind::FieldProjection) (the un-measured remainder
+/// of a lossy projection, IMDF 7) — were previously missing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ResidueKind {
     Identity,
     Locator,
@@ -683,23 +689,91 @@ pub enum ResidueKind {
     Focus,
     Replay,
     Timing,
+    /// Spectrally equal but not isomorphic — a Kospektral hold (L4, `Spec= ∧
+    /// G≇H ⟹ Hold`) whose un-decided mass must be conserved, not passed.
+    Cospectral,
+    /// The remainder of a lossy projection W: field content the projection did
+    /// not carry across (IMDF 7 / Satz 9.13), made visible instead of dropped.
+    FieldProjection,
 }
 
-/// The visible currency of "no silent loss" (Master Spec Ω+1 ch. 9.2,
-/// verbatim field list — plus Phase 0's `Severity`, now wired in).
+impl ResidueKind {
+    /// The complete closed taxonomy K (11 kinds).
+    pub const ALL: [ResidueKind; 11] = [
+        ResidueKind::Identity,
+        ResidueKind::Locator,
+        ResidueKind::Boundary,
+        ResidueKind::Capability,
+        ResidueKind::Protocol,
+        ResidueKind::Correlation,
+        ResidueKind::Focus,
+        ResidueKind::Replay,
+        ResidueKind::Timing,
+        ResidueKind::Cospectral,
+        ResidueKind::FieldProjection,
+    ];
+}
+
+/// The lifecycle **Status** of a residue in the CounterHorizon triple
+/// `H: X → K × Status × NextAction` (IMRT A4, Def. H). Replaces the earlier
+/// `open_obligation` bool so the disposition is a first-class tri-state rather
+/// than a collapsed flag.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ResidueStatus {
+    /// Unresolved and blocking — a standing obligation (fail-closed default).
+    Open,
+    /// Acknowledged and tracked, but explicitly non-blocking for this run.
+    Deferred,
+    /// Discharged — the fragment was integrated or accepted; no obligation.
+    Resolved,
+}
+
+/// The **NextAction** directive of the CounterHorizon triple — what the field
+/// must do about a residue (IMRT A4, Def. H). Distinct from `Status`: a residue
+/// can be `Open` with a `Reacquire` directive, or `Deferred` with `Accept`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum NextAction {
+    /// Quarantine/hold the surface until the fragment is resolved.
+    Hold,
+    /// Re-observe the source to recover the missing fragment.
+    Reacquire,
+    /// Raise severity / route to a higher authority (ρ* escalation).
+    Escalate,
+    /// Re-run reanalysis binding the residue as an input.
+    Reanalyze,
+    /// Accept the fragment as a known, tolerated loss — no further action.
+    Accept,
+}
+
+/// The visible currency of "no silent loss" (IMRT A4, Satz 13.5) — the complete
+/// residue **5-tuple** `(Source, Fragment, Reason, Status, NextAction)` in a
+/// class of the closed taxonomy K.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BoundaryResidue {
     pub id: ResidueId,
+    /// The taxonomy-K class this fragment falls into.
     pub kind: ResidueKind,
+    /// **Source**: which gate/part produced the residue.
     pub source_gate: GateId,
+    /// **Fragment**: the concrete non-integrated field part (what was lost).
+    /// `None` when the emitter has only a reason, not an isolable fragment.
+    pub fragment: Option<String>,
+    /// **Reason**: why the fragment could not be integrated.
     pub detail: String,
     pub severity: Severity,
     pub origin: TraceId,
-    /// Must policy quarantine/hold until resolved? (ch. 9.2, verbatim.)
-    pub open_obligation: bool,
+    /// **Status**: the lifecycle disposition (`Open`/`Deferred`/`Resolved`).
+    pub status: ResidueStatus,
+    /// **NextAction**: the remediation directive.
+    pub next_action: NextAction,
 }
 
 impl BoundaryResidue {
+    /// Construct from the legacy 7-tuple: `open_obligation` maps to
+    /// `Status`/`NextAction` (`true → Open + Hold`, `false → Resolved + Accept`)
+    /// and no isolable `Fragment` is attached. Prefer [`new_full`](Self::new_full)
+    /// or the `with_*` builders at call sites that carry a fragment or a specific
+    /// directive.
     #[must_use]
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -711,15 +785,87 @@ impl BoundaryResidue {
         origin: TraceId,
         open_obligation: bool,
     ) -> Self {
+        let (status, next_action) = if open_obligation {
+            (ResidueStatus::Open, NextAction::Hold)
+        } else {
+            (ResidueStatus::Resolved, NextAction::Accept)
+        };
         Self {
             id,
             kind,
             source_gate,
+            fragment: None,
             detail: detail.into(),
             severity,
             origin,
-            open_obligation,
+            status,
+            next_action,
         }
+    }
+
+    /// Construct the complete 5-tuple with an explicit `Fragment`, `Status`, and
+    /// `NextAction`.
+    #[must_use]
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_full(
+        id: ResidueId,
+        kind: ResidueKind,
+        source_gate: GateId,
+        fragment: Option<String>,
+        detail: impl Into<String>,
+        severity: Severity,
+        origin: TraceId,
+        status: ResidueStatus,
+        next_action: NextAction,
+    ) -> Self {
+        Self {
+            id,
+            kind,
+            source_gate,
+            fragment,
+            detail: detail.into(),
+            severity,
+            origin,
+            status,
+            next_action,
+        }
+    }
+
+    /// Attach the isolable `Fragment` that was lost.
+    #[must_use]
+    pub fn with_fragment(mut self, fragment: impl Into<String>) -> Self {
+        self.fragment = Some(fragment.into());
+        self
+    }
+
+    /// Set the `NextAction` directive.
+    #[must_use]
+    pub fn with_next_action(mut self, next_action: NextAction) -> Self {
+        self.next_action = next_action;
+        self
+    }
+
+    /// Set the lifecycle `Status`.
+    #[must_use]
+    pub fn with_status(mut self, status: ResidueStatus) -> Self {
+        self.status = status;
+        self
+    }
+
+    /// Whether this residue is a standing, blocking obligation. Only `Open`
+    /// residues block; `Deferred` are acknowledged-non-blocking and `Resolved`
+    /// are discharged. Preserves the legacy `open_obligation` predicate.
+    #[must_use]
+    pub fn open_obligation(&self) -> bool {
+        matches!(self.status, ResidueStatus::Open)
+    }
+
+    /// The CounterHorizon mapping `H(r) = (class, status, next_action)`
+    /// (IMRT A4, Def. H). Every residue yields a complete triple — there is no
+    /// residue whose disposition is undefined.
+    #[must_use]
+    pub fn h_triple(&self) -> (ResidueKind, ResidueStatus, NextAction) {
+        (self.kind, self.status, self.next_action)
     }
 }
 
@@ -745,12 +891,133 @@ impl ResidueRegister {
     }
 
     pub fn open_obligations(&self) -> impl Iterator<Item = &BoundaryResidue> {
-        self.entries.iter().filter(|r| r.open_obligation)
+        self.entries.iter().filter(|r| r.open_obligation())
     }
 
     #[must_use]
     pub fn entries(&self) -> &[BoundaryResidue] {
         &self.entries
+    }
+
+    /// The number of residues emitted so far. Monotone non-decreasing over the
+    /// register's life — there is no removal API (append-only by construction).
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// The CounterHorizon triples `H(r)` for every registered residue, in emit
+    /// order — the full `X → K × Status × NextAction` mapping.
+    pub fn horizon(&self) -> impl Iterator<Item = (ResidueKind, ResidueStatus, NextAction)> + '_ {
+        self.entries.iter().map(BoundaryResidue::h_triple)
+    }
+}
+
+/// The closed set of **origin edges** of the field (IMRT A4, Def 11.6): the
+/// structural boundary a residue arose at. The residue cloud X partitions
+/// disjointly over these classes; any residue that cannot be attributed to an
+/// origin edge escalates to the ρ\* meta-residue instead of silently belonging
+/// nowhere.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub enum EdgeClass {
+    /// The self/identity edge (L0–L1).
+    SelfEdge,
+    /// The observer edge (L2 perception).
+    Observer,
+    /// The aperture/focus edge (L2–L3 projection).
+    Aperture,
+    /// The gate edge (L5 decision).
+    Gate,
+    /// The boundary/seam edge (L9 crossing).
+    Boundary,
+    /// The replay/reanalysis edge (L6).
+    Replay,
+}
+
+impl EdgeClass {
+    /// The origin edge a residue is attributed to, or `None` (→ ρ\*) if the
+    /// residue lacks a real origin trace. Total over the taxonomy K.
+    #[must_use]
+    pub fn of(residue: &BoundaryResidue) -> Option<EdgeClass> {
+        // A residue with no real origin trace cannot be placed on an edge — it is
+        // a ρ* candidate (Inv 11.7).
+        if residue.origin.0 .0.is_empty() {
+            return None;
+        }
+        Some(match residue.kind {
+            ResidueKind::Identity => EdgeClass::SelfEdge,
+            ResidueKind::Locator | ResidueKind::Boundary => EdgeClass::Boundary,
+            ResidueKind::Correlation | ResidueKind::Timing => EdgeClass::Observer,
+            ResidueKind::Focus | ResidueKind::FieldProjection => EdgeClass::Aperture,
+            ResidueKind::Capability | ResidueKind::Protocol | ResidueKind::Cospectral => {
+                EdgeClass::Gate
+            }
+            ResidueKind::Replay => EdgeClass::Replay,
+        })
+    }
+}
+
+/// A read-only view over a [`ResidueRegister`] that partitions its residue
+/// cloud X into disjoint origin-edge classes plus the ρ\* meta-residue catch-all
+/// (IMRT A4, Def 11.6 / Inv 11.7). Guarantees the partition is total and
+/// disjoint: every residue lands in exactly one edge class, or in ρ\*.
+pub struct ResidueCloud<'a> {
+    entries: &'a [BoundaryResidue],
+}
+
+impl<'a> ResidueCloud<'a> {
+    #[must_use]
+    pub fn of(register: &'a ResidueRegister) -> Self {
+        ResidueCloud {
+            entries: register.entries(),
+        }
+    }
+
+    #[must_use]
+    pub fn from_slice(entries: &'a [BoundaryResidue]) -> Self {
+        ResidueCloud { entries }
+    }
+
+    /// The disjoint edge-class partition of X: each edge class mapped to the
+    /// residues attributed to it. Residues with no origin edge are excluded
+    /// (they appear in [`rho_star`](Self::rho_star)).
+    #[must_use]
+    pub fn partition(&self) -> alloc::collections::BTreeMap<EdgeClass, Vec<&'a BoundaryResidue>> {
+        let mut map: alloc::collections::BTreeMap<EdgeClass, Vec<&'a BoundaryResidue>> =
+            alloc::collections::BTreeMap::new();
+        for r in self.entries {
+            if let Some(edge) = EdgeClass::of(r) {
+                map.entry(edge).or_default().push(r);
+            }
+        }
+        map
+    }
+
+    /// The ρ\* meta-residue: every residue that lacks an origin edge. A
+    /// non-empty ρ\* is a critical error signal (residues must be attributable),
+    /// but it is *kept*, never dropped — it is the closure-guaranteeing catch-all.
+    #[must_use]
+    pub fn rho_star(&self) -> Vec<&'a BoundaryResidue> {
+        self.entries
+            .iter()
+            .filter(|r| EdgeClass::of(r).is_none())
+            .collect()
+    }
+
+    /// Whether the partition is total and disjoint: the edge classes and ρ\*
+    /// together account for every residue in X exactly once.
+    #[must_use]
+    pub fn is_total_disjoint_partition(&self) -> bool {
+        let partitioned: usize = self.partition().values().map(Vec::len).sum();
+        let rho = self.rho_star().len();
+        // Disjoint (edge classes are exclusive by construction) + total: every
+        // residue is either on exactly one edge or in ρ*.
+        partitioned + rho == self.entries.len()
     }
 }
 
@@ -1105,6 +1372,223 @@ mod tests {
         let d = digest_of(&"payload", HashAlg::Blake3).expect("hash must work");
         let hex = d.to_hex();
         assert_eq!(Digest::from_hex(&hex).expect("valid hex"), d);
+    }
+
+    // G9 (A4): the residue is the complete 5-tuple (Source, Fragment, Reason,
+    // Status, NextAction) in a class of the closed taxonomy K (11 kinds).
+    #[test]
+    fn residue_is_the_complete_five_tuple_over_taxonomy_k() {
+        // The taxonomy K is exactly 11 kinds, including the previously-missing
+        // Cospectral and FieldProjection.
+        assert_eq!(ResidueKind::ALL.len(), 11);
+        assert!(ResidueKind::ALL.contains(&ResidueKind::Cospectral));
+        assert!(ResidueKind::ALL.contains(&ResidueKind::FieldProjection));
+
+        // The full constructor carries every tuple field.
+        let r = BoundaryResidue::new_full(
+            ResidueId::new("r1"),
+            ResidueKind::FieldProjection,
+            GateId::Focus,
+            Some("hidden.body".to_owned()),
+            "projection dropped the body sub-surface",
+            Severity::High,
+            TraceId::new("t1"),
+            ResidueStatus::Open,
+            NextAction::Reacquire,
+        );
+        assert_eq!(r.source_gate, GateId::Focus); // Source
+        assert_eq!(r.fragment.as_deref(), Some("hidden.body")); // Fragment
+        assert_eq!(r.detail, "projection dropped the body sub-surface"); // Reason
+        assert_eq!(r.status, ResidueStatus::Open); // Status
+        assert_eq!(r.next_action, NextAction::Reacquire); // NextAction
+        assert!(r.open_obligation(), "Open is a standing obligation");
+
+        // The legacy 7-arg constructor maps open_obligation → Status/NextAction
+        // and preserves the open_obligation() predicate exactly.
+        let held = BoundaryResidue::new(
+            ResidueId::new("r2"),
+            ResidueKind::Boundary,
+            GateId::Boundary,
+            "seam open",
+            Severity::High,
+            TraceId::new("t2"),
+            true,
+        );
+        assert_eq!(held.status, ResidueStatus::Open);
+        assert_eq!(held.next_action, NextAction::Hold);
+        assert!(held.open_obligation());
+        assert!(
+            held.fragment.is_none(),
+            "no isolable fragment via legacy new"
+        );
+
+        let resolved = BoundaryResidue::new(
+            ResidueId::new("r3"),
+            ResidueKind::Boundary,
+            GateId::Boundary,
+            "seam closed",
+            Severity::Info,
+            TraceId::new("t3"),
+            false,
+        );
+        assert_eq!(resolved.status, ResidueStatus::Resolved);
+        assert!(!resolved.open_obligation());
+
+        // Deferred is acknowledged-but-non-blocking: conserved, not an obligation.
+        let deferred = held.with_status(ResidueStatus::Deferred);
+        assert!(
+            !deferred.open_obligation(),
+            "a deferred residue is conserved but does not block"
+        );
+
+        // Only Open residues surface as open obligations in a register.
+        let mut reg = ResidueRegister::new();
+        reg.emit(r);
+        reg.emit(resolved);
+        reg.emit(deferred);
+        assert_eq!(reg.entries().len(), 3);
+        assert_eq!(
+            reg.open_obligations().count(),
+            1,
+            "only the Open one blocks"
+        );
+    }
+
+    // G10 (A4, Def. H): the register is append-only — length is monotone
+    // non-decreasing and there is no removal API — and the CounterHorizon
+    // mapping H yields a complete (class, status, next_action) triple for every
+    // entry, with no residue left undefined.
+    #[test]
+    fn counter_horizon_register_is_append_only_and_h_is_total() {
+        let mut reg = ResidueRegister::new();
+        assert!(reg.is_empty());
+
+        let mut prev = 0usize;
+        for (i, (kind, status, action)) in [
+            (
+                ResidueKind::Cospectral,
+                ResidueStatus::Open,
+                NextAction::Hold,
+            ),
+            (
+                ResidueKind::FieldProjection,
+                ResidueStatus::Deferred,
+                NextAction::Accept,
+            ),
+            (
+                ResidueKind::Capability,
+                ResidueStatus::Resolved,
+                NextAction::Reanalyze,
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            reg.emit(BoundaryResidue::new_full(
+                ResidueId::new(format!("r{i}")),
+                kind,
+                GateId::Focus,
+                Some(format!("frag{i}")),
+                "reason",
+                Severity::Low,
+                TraceId::new(format!("t{i}")),
+                status,
+                action,
+            ));
+            // Monotone: length only ever grows.
+            assert!(reg.len() > prev, "emit must strictly grow the register");
+            prev = reg.len();
+        }
+
+        // H(r) is total: every registered residue yields its full triple, in
+        // emit order, matching what was emitted.
+        let horizon: Vec<_> = reg.horizon().collect();
+        assert_eq!(
+            horizon,
+            vec![
+                (
+                    ResidueKind::Cospectral,
+                    ResidueStatus::Open,
+                    NextAction::Hold
+                ),
+                (
+                    ResidueKind::FieldProjection,
+                    ResidueStatus::Deferred,
+                    NextAction::Accept
+                ),
+                (
+                    ResidueKind::Capability,
+                    ResidueStatus::Resolved,
+                    NextAction::Reanalyze
+                ),
+            ],
+            "H maps every residue to a complete (class, status, next_action) triple"
+        );
+        assert_eq!(horizon.len(), reg.len(), "H is defined for every entry");
+    }
+
+    // G8 (A4, Def 11.6 / Inv 11.7): the residue cloud X partitions disjointly
+    // over origin-edge classes, with any origin-less residue escalated to the
+    // ρ* meta-residue — union == X, pairwise disjoint, nothing dropped.
+    #[test]
+    fn residue_cloud_partitions_disjointly_with_rho_star_catch_all() {
+        let mut reg = ResidueRegister::new();
+        // Residues on distinct edges (each with a real origin trace).
+        let placed = [
+            (ResidueKind::Identity, EdgeClass::SelfEdge),
+            (ResidueKind::Boundary, EdgeClass::Boundary),
+            (ResidueKind::Correlation, EdgeClass::Observer),
+            (ResidueKind::Focus, EdgeClass::Aperture),
+            (ResidueKind::Capability, EdgeClass::Gate),
+            (ResidueKind::Replay, EdgeClass::Replay),
+        ];
+        for (i, (kind, _edge)) in placed.iter().enumerate() {
+            reg.emit(BoundaryResidue::new(
+                ResidueId::new(format!("p{i}")),
+                *kind,
+                GateId::Focus,
+                "reason",
+                Severity::Low,
+                TraceId::new(format!("origin-{i}")),
+                true,
+            ));
+        }
+        // A residue with NO real origin trace → ρ*.
+        reg.emit(BoundaryResidue::new(
+            ResidueId::new("orphan"),
+            ResidueKind::Identity,
+            GateId::Focus,
+            "no origin edge",
+            Severity::High,
+            TraceId::new(""), // empty origin
+            true,
+        ));
+
+        let cloud = ResidueCloud::of(&reg);
+        let partition = cloud.partition();
+        let rho = cloud.rho_star();
+
+        // Every placed residue landed on its expected edge.
+        for (kind, edge) in placed {
+            assert!(
+                partition
+                    .get(&edge)
+                    .is_some_and(|rs| rs.iter().any(|r| r.kind == kind)),
+                "{kind:?} must be attributed to {edge:?}"
+            );
+        }
+        // The orphan is in ρ*, not in any edge class.
+        assert_eq!(rho.len(), 1, "the origin-less residue escalates to ρ*");
+        assert_eq!(rho[0].id, ResidueId::new("orphan"));
+
+        // Total + disjoint: the six edges + ρ* account for all seven residues.
+        assert!(cloud.is_total_disjoint_partition());
+        let partitioned: usize = partition.values().map(Vec::len).sum();
+        assert_eq!(partitioned + rho.len(), reg.len());
+        assert_eq!(partitioned, 6);
+
+        // ρ* is kept, never dropped — a non-empty ρ* is visible.
+        assert!(!rho.is_empty(), "ρ* is a visible catch-all, not silence");
     }
 
     #[test]

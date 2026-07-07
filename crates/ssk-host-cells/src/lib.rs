@@ -19,7 +19,10 @@
 use std::collections::BTreeSet;
 
 use serde::{Deserialize, Serialize};
-use ssk_types::{content_id, HashAlg};
+use ssk_types::{
+    content_id, digest_of, BoundaryResidue, GateId, HashAlg, NextAction, ResidueId, ResidueKind,
+    ResidueStatus, Severity, TraceId,
+};
 
 content_id!(HostCellId);
 
@@ -37,6 +40,57 @@ pub enum HostCellError {
 pub enum CellState {
     Active,
     Dissolved,
+}
+
+/// Why a capability request was denied — the `Reason` of the emitted
+/// `HostAuthority` residue.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DenialReason {
+    /// No cell with that id exists.
+    NoSuchCell,
+    /// The cell exists but is dissolved or its TTL has elapsed.
+    Inactive,
+    /// The cell is live but does not hold the requested capability.
+    CapabilityNotHeld,
+    /// The cell holds the capability but in a different scope.
+    ScopeMismatch,
+}
+
+impl DenialReason {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            DenialReason::NoSuchCell => "no-such-cell",
+            DenialReason::Inactive => "inactive",
+            DenialReason::CapabilityNotHeld => "capability-not-held",
+            DenialReason::ScopeMismatch => "scope-mismatch",
+        }
+    }
+}
+
+/// The verdict of an authority check: the act is granted, or it is denied **with
+/// a conserved residue** (never a silent boolean — IMRT A4). The residue is
+/// boxed so the common `Granted` verdict stays cheap.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CapabilityDecision {
+    Granted,
+    Denied(Box<BoundaryResidue>),
+}
+
+impl CapabilityDecision {
+    #[must_use]
+    pub fn is_granted(&self) -> bool {
+        matches!(self, CapabilityDecision::Granted)
+    }
+
+    /// The conserved denial residue, if the act was denied.
+    #[must_use]
+    pub fn residue(&self) -> Option<&BoundaryResidue> {
+        match self {
+            CapabilityDecision::Granted => None,
+            CapabilityDecision::Denied(r) => Some(r),
+        }
+    }
 }
 
 /// An ephemeral, capability- and scope-bound role cell.
@@ -175,9 +229,71 @@ impl HostCellPlane {
     /// holds the capability, and its scope matches.
     #[must_use]
     pub fn can(&self, id: HostCellId, capability: &str, scope: &str) -> bool {
-        self.get(id).is_some_and(|c| {
-            c.is_active_at(self.now) && c.capabilities.contains(capability) && c.scope == scope
-        })
+        self.deny_reason(id, capability, scope).is_none()
+    }
+
+    /// The single reason a `(cell, capability, scope)` request would be denied,
+    /// or `None` if it is granted. The precedence — existence, then liveness,
+    /// then capability, then scope — makes the denial deterministic.
+    #[must_use]
+    fn deny_reason(&self, id: HostCellId, capability: &str, scope: &str) -> Option<DenialReason> {
+        match self.get(id) {
+            None => Some(DenialReason::NoSuchCell),
+            Some(c) if !c.is_active_at(self.now) => Some(DenialReason::Inactive),
+            Some(c) if !c.capabilities.contains(capability) => {
+                Some(DenialReason::CapabilityNotHeld)
+            }
+            Some(c) if c.scope != scope => Some(DenialReason::ScopeMismatch),
+            Some(_) => None,
+        }
+    }
+
+    /// Authorize an act, **conserving the denial as a residue** rather than
+    /// collapsing it to a silent boolean (IMRT A4 — the `can()` bool drops the
+    /// under-capability mass). On denial a `HostAuthority` residue is emitted:
+    /// a `Capability`-kind 5-tuple whose `Fragment` is the ungranted capability,
+    /// `Status` is `Open`, and `NextAction` is `Escalate` (route the shortfall to
+    /// a higher authority). A granted act carries no residue.
+    #[must_use]
+    pub fn authorize(
+        &self,
+        id: HostCellId,
+        capability: &str,
+        scope: &str,
+        origin: TraceId,
+    ) -> CapabilityDecision {
+        match self.deny_reason(id, capability, scope) {
+            None => CapabilityDecision::Granted,
+            Some(reason) => {
+                let rid = digest_of(
+                    &(
+                        "host-cells/host-authority/v1",
+                        id.0,
+                        capability,
+                        scope,
+                        reason.as_str(),
+                    ),
+                    HashAlg::Blake3,
+                )
+                .expect("host-authority residue key is serializable")
+                .to_hex();
+                let residue = BoundaryResidue::new_full(
+                    ResidueId::new(rid),
+                    ResidueKind::Capability,
+                    GateId::Capability,
+                    Some(capability.to_owned()),
+                    format!(
+                        "host-authority denied ({}) in scope '{scope}'",
+                        reason.as_str()
+                    ),
+                    Severity::High,
+                    origin,
+                    ResidueStatus::Open,
+                    NextAction::Escalate,
+                );
+                CapabilityDecision::Denied(Box::new(residue))
+            }
+        }
     }
 
     /// The number of currently-active cells.
@@ -253,5 +369,66 @@ mod tests {
         // An unknown cell is not found.
         let bogus = HostCellId(ssk_types::digest_of(&"nope", HashAlg::Blake3).unwrap());
         assert_eq!(p.dissolve(bogus).unwrap_err(), HostCellError::NotFound);
+    }
+
+    // G7 (A4): a granted act carries no residue; a denied act conserves a
+    // HostAuthority residue instead of collapsing to a silent boolean. The
+    // residue is the complete 5-tuple — Fragment = the ungranted capability,
+    // Status = Open, NextAction = Escalate — and agrees with `can()`.
+    #[test]
+    fn under_capability_denial_conserves_a_host_authority_residue() {
+        let mut p = plane();
+        let cell = p.spawn("egress", ["connect"], "session-1", 10);
+        let origin = TraceId::new("trace-auth");
+
+        // Granted: no residue, and consistent with can().
+        let ok = p.authorize(cell, "connect", "session-1", origin.clone());
+        assert!(ok.is_granted());
+        assert!(ok.residue().is_none());
+        assert!(p.can(cell, "connect", "session-1"));
+
+        // Denied on a missing capability: a conserved Capability residue.
+        let denied = p.authorize(cell, "capture", "session-1", origin.clone());
+        assert!(!denied.is_granted());
+        assert!(
+            !p.can(cell, "capture", "session-1"),
+            "authorize and can must agree on the verdict"
+        );
+        let r = denied.residue().expect("denial conserves a residue");
+        assert_eq!(r.kind, ResidueKind::Capability);
+        assert_eq!(r.source_gate, GateId::Capability);
+        assert_eq!(
+            r.fragment.as_deref(),
+            Some("capture"),
+            "the Fragment is the ungranted capability"
+        );
+        assert_eq!(
+            r.status,
+            ResidueStatus::Open,
+            "an open, blocking obligation"
+        );
+        assert_eq!(r.next_action, NextAction::Escalate);
+        assert!(r.open_obligation());
+
+        // Every denial reason yields a residue; the four reasons are distinct.
+        let scope_bad = p.authorize(cell, "connect", "other-scope", origin.clone());
+        assert!(scope_bad.residue().is_some());
+        let bogus = HostCellId(digest_of(&"nope", HashAlg::Blake3).unwrap());
+        let no_cell = p.authorize(bogus, "connect", "session-1", origin.clone());
+        assert!(no_cell.residue().is_some());
+        p.dissolve(cell).unwrap();
+        let inactive = p.authorize(cell, "connect", "session-1", origin);
+        assert!(inactive.residue().is_some());
+
+        // Distinct reasons produce distinct residue ids (no collision).
+        let ids: std::collections::BTreeSet<_> = [
+            denied.residue().unwrap().id.clone(),
+            scope_bad.residue().unwrap().id.clone(),
+            no_cell.residue().unwrap().id.clone(),
+            inactive.residue().unwrap().id.clone(),
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(ids.len(), 4, "each denial reason has its own residue id");
     }
 }

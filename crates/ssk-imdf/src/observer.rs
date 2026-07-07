@@ -55,20 +55,157 @@ impl Lens {
     }
 }
 
-/// A declared region the observer cannot see — a typed *unknown*, never a fact.
+/// A declared region the observer cannot see — a typed *unknown*, never a fact
+/// (Vertrag 13.3). The full 5-tuple: which `region` is blind, which
+/// `missing_instrument` would be needed to see it, `reason` it is blind, the
+/// `impact` of not seeing it, and the `required_aperture` that would resolve it
+/// — so the blindspot residue can *drive a remediation*, not just record a gap.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Blindspot {
     pub region: String,
+    pub missing_instrument: String,
     pub reason: String,
+    pub impact: String,
+    pub required_aperture: String,
 }
 
 impl Blindspot {
+    /// A minimal, honest blindspot: only the region and reason are known. The
+    /// instrument/impact/required-aperture are left unspecified (a known-unknown
+    /// with no declared remediation). Prefer [`new_full`](Self::new_full) or the
+    /// `with_*` builders when the remediation is known.
     #[must_use]
     pub fn new(region: impl Into<String>, reason: impl Into<String>) -> Self {
         Blindspot {
             region: region.into(),
+            missing_instrument: String::new(),
             reason: reason.into(),
+            impact: String::new(),
+            required_aperture: String::new(),
         }
+    }
+
+    /// The complete actionable 5-tuple.
+    #[must_use]
+    pub fn new_full(
+        region: impl Into<String>,
+        missing_instrument: impl Into<String>,
+        reason: impl Into<String>,
+        impact: impl Into<String>,
+        required_aperture: impl Into<String>,
+    ) -> Self {
+        Blindspot {
+            region: region.into(),
+            missing_instrument: missing_instrument.into(),
+            reason: reason.into(),
+            impact: impact.into(),
+            required_aperture: required_aperture.into(),
+        }
+    }
+
+    /// Name the instrument whose absence causes the blindspot.
+    #[must_use]
+    pub fn with_missing_instrument(mut self, instrument: impl Into<String>) -> Self {
+        self.missing_instrument = instrument.into();
+        self
+    }
+
+    /// Declare the consequence of not seeing this region.
+    #[must_use]
+    pub fn with_impact(mut self, impact: impl Into<String>) -> Self {
+        self.impact = impact.into();
+        self
+    }
+
+    /// Declare the aperture that would resolve the blindspot.
+    #[must_use]
+    pub fn with_required_aperture(mut self, aperture: impl Into<String>) -> Self {
+        self.required_aperture = aperture.into();
+        self
+    }
+
+    /// Whether every field of the 5-tuple is populated — a fully-actionable
+    /// blindspot that names its own remediation.
+    #[must_use]
+    pub fn is_fully_specified(&self) -> bool {
+        !self.region.is_empty()
+            && !self.missing_instrument.is_empty()
+            && !self.reason.is_empty()
+            && !self.impact.is_empty()
+            && !self.required_aperture.is_empty()
+    }
+
+    /// Lift the blindspot into a conserved residue (A4), attributed to
+    /// `observer`. A blindspot that names a `required_aperture` is a standing
+    /// remediation obligation (`Open`/`Reacquire`, blocking); one with no known
+    /// remediation is an honest accepted known-unknown (`Deferred`/`Accept`).
+    /// The `Fragment` is the blind region; the observer id is carried explicitly
+    /// in the reason so the residue is attributable.
+    #[must_use]
+    pub fn to_residue(
+        &self,
+        observer: ObserverId,
+        origin: ssk_types::TraceId,
+    ) -> ssk_types::BoundaryResidue {
+        let rid = ssk_types::digest_of(
+            &(
+                "imdf/blindspot/v1",
+                observer.0,
+                &self.region,
+                &self.missing_instrument,
+                &self.required_aperture,
+            ),
+            HashAlg::Blake3,
+        )
+        .expect("blindspot residue key is serializable")
+        .to_hex();
+        let (status, next_action, severity) = if self.required_aperture.is_empty() {
+            (
+                ssk_types::ResidueStatus::Deferred,
+                ssk_types::NextAction::Accept,
+                ssk_types::Severity::Low,
+            )
+        } else {
+            (
+                ssk_types::ResidueStatus::Open,
+                ssk_types::NextAction::Reacquire,
+                ssk_types::Severity::High,
+            )
+        };
+        ssk_types::BoundaryResidue::new_full(
+            ssk_types::ResidueId::new(rid),
+            ssk_types::ResidueKind::Focus,
+            ssk_types::GateId::Focus,
+            Some(self.region.clone()),
+            format!(
+                "blindspot [{}]: {} (impact: {}; missing instrument: {}; required aperture: {})",
+                observer.0.to_hex(),
+                if self.reason.is_empty() {
+                    "unspecified"
+                } else {
+                    &self.reason
+                },
+                if self.impact.is_empty() {
+                    "unspecified"
+                } else {
+                    &self.impact
+                },
+                if self.missing_instrument.is_empty() {
+                    "unspecified"
+                } else {
+                    &self.missing_instrument
+                },
+                if self.required_aperture.is_empty() {
+                    "none"
+                } else {
+                    &self.required_aperture
+                },
+            ),
+            severity,
+            origin,
+            status,
+            next_action,
+        )
     }
 }
 
@@ -287,5 +424,80 @@ mod tests {
             "a blindspot yields no value"
         );
         assert!(result.blindspot_dimensions.contains(&"shape".to_owned()));
+    }
+
+    // G26: a fully-specified blindspot exposes all five fields, non-empty.
+    #[test]
+    fn blindspot_is_the_full_five_tuple() {
+        let minimal = Blindspot::new("shape", "sensor unavailable");
+        assert!(
+            !minimal.is_fully_specified(),
+            "a 2-field blindspot is honest but not fully actionable"
+        );
+
+        let full = Blindspot::new_full(
+            "tls_handshake",
+            "tls-inspector",
+            "no MITM instrument attached",
+            "cannot attest cipher suite",
+            "tls-inspecting-aperture",
+        );
+        assert!(full.is_fully_specified());
+        assert!(!full.region.is_empty());
+        assert!(!full.missing_instrument.is_empty());
+        assert!(!full.reason.is_empty());
+        assert!(!full.impact.is_empty());
+        assert!(!full.required_aperture.is_empty());
+
+        // The builders reach the same fully-specified state.
+        let built = Blindspot::new("tls_handshake", "no MITM instrument attached")
+            .with_missing_instrument("tls-inspector")
+            .with_impact("cannot attest cipher suite")
+            .with_required_aperture("tls-inspecting-aperture");
+        assert_eq!(built, full);
+    }
+
+    // G27: the blindspot residue is actionable — a named required-aperture makes
+    // it a standing Open/Reacquire remediation obligation naming that aperture in
+    // its fragment/reason; a blindspot with no known remediation is an honest,
+    // non-blocking Deferred/Accept known-unknown.
+    #[test]
+    fn blindspot_residue_drives_required_aperture_remediation() {
+        let obs = observer(
+            Aperture::admitting("wide", ["shape"]),
+            vec![],
+            &authorized(),
+        )
+        .unwrap();
+        let origin = ssk_types::TraceId::new("t");
+
+        let actionable = Blindspot::new_full(
+            "tls_handshake",
+            "tls-inspector",
+            "no MITM instrument",
+            "cannot attest cipher suite",
+            "tls-inspecting-aperture",
+        );
+        let r = actionable.to_residue(obs.id, origin.clone());
+        assert_eq!(r.kind, ssk_types::ResidueKind::Focus);
+        assert_eq!(r.fragment.as_deref(), Some("tls_handshake"));
+        assert_eq!(r.status, ssk_types::ResidueStatus::Open);
+        assert_eq!(r.next_action, ssk_types::NextAction::Reacquire);
+        assert!(r.open_obligation(), "a remediable blindspot blocks");
+        assert!(
+            r.detail.contains("tls-inspecting-aperture"),
+            "the residue names the required aperture that resolves it"
+        );
+        assert!(
+            r.detail.contains(&obs.id.0.to_hex()),
+            "the residue carries the observer id explicitly"
+        );
+
+        // No known remediation → honest, non-blocking.
+        let honest = Blindspot::new("dark_region", "no instrument exists");
+        let hr = honest.to_residue(obs.id, origin);
+        assert_eq!(hr.status, ssk_types::ResidueStatus::Deferred);
+        assert_eq!(hr.next_action, ssk_types::NextAction::Accept);
+        assert!(!hr.open_obligation());
     }
 }

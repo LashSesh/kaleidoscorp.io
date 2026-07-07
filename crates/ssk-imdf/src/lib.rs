@@ -31,9 +31,12 @@
 
 pub mod aperture;
 pub mod atlas;
+pub mod claim;
 pub mod closure;
+pub mod contact;
 pub mod error;
 pub mod observer;
+pub mod observer_field;
 pub mod qlogic;
 pub mod replay;
 pub mod self_anchor;
@@ -41,12 +44,22 @@ pub mod wavefront;
 
 pub use aperture::{Aperture, ApertureSession, FocusResult, Reading};
 pub use atlas::{AtlasEntry, AtlasObservation, SelfPerceptionAtlas};
-pub use closure::{ClosureState, FourPiClosure, OrientationPass};
+pub use claim::{Claim, ClaimClass, ClaimError, ClaimLedger, ResidueDisposition};
+pub use closure::{ClosureReport, ClosureState, FourPiClosure, Orientation, OrientationPass};
+pub use contact::{Contact, ContactGapReason, Kontaktluecke};
 pub use error::ImdfError;
 pub use observer::{
     Blindspot, Lens, ObserverId, ObserverModel, TrustLevel, Vantage, SELF_OBSERVATION_USE,
 };
-pub use qlogic::{QAxis, QLogicGate, QLogicInput, QLogicThresholds, QLogicVector, QOutcome};
-pub use replay::{reanalyze, ImdfReplayManifest, ReanalysisReport, RunDescriptor};
-pub use self_anchor::{BcikCrossing, DomeLocator, LocatorAddressId, SelfAnchor, SelfAnchorId};
-pub use wavefront::{BirefringentSplit, Parallax, Wavefront};
+pub use observer_field::ObserverField;
+pub use qlogic::{
+    QAxis, QLogicGate, QLogicInput, QLogicThresholds, QLogicVector, QOutcome, QState,
+};
+pub use replay::{
+    reanalyze, ImdfReplayManifest, ReanalysisReport, ReanalysisVerdict, RunDescriptor,
+    RunTransition, StabilityCertificate,
+};
+pub use self_anchor::{
+    BcikCrossing, DomeLocator, LocatorAddressId, NullAnchor, SelfAnchor, SelfAnchorId,
+};
+pub use wavefront::{BirefringentSplit, Parallax, Ray, RaySet, SplitAxis, Wavefront};

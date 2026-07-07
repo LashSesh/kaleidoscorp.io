@@ -1,0 +1,14 @@
+{
+  "live_supported": true,
+  "parse_anomaly": false,
+  "rows": [
+    {
+      "local": "10.0.0.1:55000",
+      "pid": 4321,
+      "protocol": "tcp",
+      "remote": "93.184.216.34:443",
+      "status": "established"
+    }
+  ],
+  "source_id": "mock-source"
+}

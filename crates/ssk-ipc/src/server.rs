@@ -139,7 +139,7 @@ mod windows_transport {
     ) -> Result<(), IpcError> {
         let mut first = true;
         loop {
-            let mut server = ServerOptions::new()
+            let server = ServerOptions::new()
                 .first_pipe_instance(first)
                 .create(pipe_name)
                 .map_err(|e| IpcError::new("Runtime", "IPC_BIND_FAILED", e.to_string()))?;

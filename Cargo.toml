@@ -39,9 +39,12 @@ members = [
   "crates/ssk-delivery",
   "crates/ssk-system",
   "crates/ssk-audit-store",
+  "crates/ssk-winhost",
   "crates/ssk-cli",
   "crates/ssk-ipc",
   "crates/ssk-daemon",
+  "crates/ssk-netd-helper",
+  "crates/ssk-tauri-bridge",
 ]
 
 [workspace.package]

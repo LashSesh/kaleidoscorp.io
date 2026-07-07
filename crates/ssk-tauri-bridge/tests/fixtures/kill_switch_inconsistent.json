@@ -1,0 +1,13 @@
+{
+  "audit_head_hex": "0000000000000000000000000000000000000000000000000000000000000000",
+  "audit_len": 0,
+  "is_alarm": true,
+  "journal_claims_engaged": true,
+  "logical_state": "engaged",
+  "os_rule": "unknown",
+  "protection_confirmed": false,
+  "receipt": null,
+  "recovery": "inconsistent",
+  "severity": "alarm",
+  "state_version": 0
+}

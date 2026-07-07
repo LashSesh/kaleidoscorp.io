@@ -305,7 +305,7 @@ mod tests {
         assert_eq!(b.kind, ResidueKind::Correlation);
         assert_eq!(b.severity, Severity::High);
         assert!(
-            b.open_obligation,
+            b.open_obligation(),
             "medium+ residues carry an open obligation"
         );
         assert_eq!(b.source_gate, GateId::Privacy);

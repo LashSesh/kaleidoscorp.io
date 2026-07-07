@@ -2,7 +2,7 @@
 
 use clap::{Parser, Subcommand};
 use serde::Serialize;
-use ssk_boundary::KillSwitchState;
+use ssk_boundary::{BoundaryEnforcer, BoundaryScope, EnforcementReceipt, KillSwitchState};
 use ssk_capture::{CaptureMode, CaptureScope, SystemTrafficField, TrafficSource, TrafficWindow};
 use ssk_crown::EmissionDecision;
 use ssk_faultscan::{run_playbook, ChaosFaultKind};
@@ -19,10 +19,11 @@ use ssk_netadmin::{
 };
 use ssk_replay::{DeterministicReplayEngine, ReplayEngine};
 use ssk_runtime::{sample_intent, DeterminismContext, Runtime, RuntimeEvent, RuntimeMetrics};
-use ssk_service_host::ServiceHealth;
+use ssk_service_host::{HostManifest, InstallReceipt, PrivilegedHelper, ServiceHealth};
 use ssk_system::{SystemInputs, SystemPipeline};
 use ssk_tensor::{FileLedgerBackend, LedgerBackend, MemoryBackend};
-use ssk_types::{GateId, GateOutcomeKind, LocatorId, ReplayVerdict};
+use ssk_types::{digest_of, GateId, GateOutcomeKind, HashAlg, LocatorId, ReplayVerdict};
+use ssk_winhost::{WindowsConnectionSource, WindowsFirewallEnforcer, WindowsServiceHelper};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -129,6 +130,67 @@ enum Command {
         #[command(subcommand)]
         command: SystemCommand,
     },
+    /// Real Windows 11 privileged actions (the "hands"): live flow capture, the
+    /// firewall kill-switch, and the Windows service lifecycle. Admin-only at
+    /// runtime; on a non-Windows build each action reports a typed "requires
+    /// Windows" error instead of a silent success.
+    #[command(name = "winhost")]
+    WinHost {
+        #[command(subcommand)]
+        command: WinHostCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum WinHostCommand {
+    /// Report whether this build carries the privileged Windows backends and
+    /// what an operator must do to exercise them.
+    Doctor,
+    /// Enumerate real active TCP/UDP flows (IP Helper) as payload-neutral
+    /// canonical surfaces.
+    Capture,
+    /// The firewall kill-switch: sever or restore all outbound egress.
+    Killswitch {
+        #[command(subcommand)]
+        command: KillswitchCommand,
+    },
+    /// The Windows service lifecycle (Service Control Manager).
+    Service {
+        #[command(subcommand)]
+        command: ServiceCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum KillswitchCommand {
+    /// Sever all outbound egress for a scope and persist the rollback receipt.
+    Engage {
+        #[arg(long, default_value = "all-egress")]
+        scope: String,
+    },
+    /// Restore egress by deleting exactly the rule the matching engage created.
+    Release {
+        #[arg(long, default_value = "all-egress")]
+        scope: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum ServiceCommand {
+    /// Register the SSK host as a Windows service pointing at the `ssk-svc`
+    /// binary, and persist the rollback receipt.
+    Install {
+        /// Path to the `ssk-svc` service host executable. Defaults to `ssk-svc`
+        /// (or `ssk-svc.exe`) beside the current binary.
+        #[arg(long)]
+        exe: Option<String>,
+    },
+    /// Start the installed service.
+    Start,
+    /// Stop the running service.
+    Stop,
+    /// Uninstall the service (only if a prior install created it).
+    Uninstall,
 }
 
 #[derive(Subcommand)]
@@ -235,6 +297,10 @@ enum ErrorClass {
     /// — a fail-closed verdict, not a tool malfunction, but still a non-zero
     /// exit so the decision is observable in `$?`/scripts.
     System,
+    /// A real Windows 11 privileged action (`ssk winhost ...`) failed — e.g.
+    /// the backend is unavailable on this platform, or the OS refused the
+    /// privileged operation (typically: not running as Administrator).
+    WinHost,
 }
 
 impl ErrorClass {
@@ -251,6 +317,7 @@ impl ErrorClass {
             Self::Chaos => 18,
             Self::NetAdmin => 19,
             Self::System => 20,
+            Self::WinHost => 21,
         }
     }
 }
@@ -304,6 +371,7 @@ impl From<ssk_ipc::IpcError> for AppError {
 /// response. Spins up a lightweight current-thread Tokio runtime for the
 /// single call rather than making the whole `ssk` binary async — `run` /
 /// `replay-verify` / `doctor` / etc. stay fully synchronous and local.
+#[cfg(unix)]
 fn call_daemon(req: ssk_ipc::Request) -> Result<ssk_ipc::Response, AppError> {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -322,6 +390,25 @@ fn call_daemon(req: ssk_ipc::Request) -> Result<ssk_ipc::Response, AppError> {
             .map_err(AppError::from)?;
         client.call(req).await.map_err(AppError::from)
     })
+}
+
+/// The daemon transport is a Unix domain socket (`sskd` + `ssk-ipc`), so the
+/// daemon-backed commands (`status` / `activate` / `deactivate` /
+/// `list-profiles`) are Unix-only. On other platforms — notably Windows, where
+/// the `winhost` privileged backends *do* run — they report a typed error
+/// rather than failing to build, so the rest of the CLI (`run`, `system`,
+/// `winhost`, `doctor`, ...) is fully available.
+#[cfg(not(unix))]
+fn call_daemon(_req: ssk_ipc::Request) -> Result<ssk_ipc::Response, AppError> {
+    Err(AppError::new(
+        ErrorClass::Runtime,
+        "DAEMON_UNIX_ONLY",
+        "daemon-backed commands use a Unix domain socket and are unavailable on this platform; \
+         use the local commands (run, system, winhost, doctor, ...) instead",
+        vec![
+            "Run the daemon-backed commands on a Unix host, or use `ssk winhost ...` here.".into(),
+        ],
+    ))
 }
 
 #[derive(Serialize)]
@@ -397,6 +484,7 @@ fn run(cli: &Cli) -> Result<(), AppError> {
         } => deactivate_command(*release_kill_switch, cli.json),
         Command::ListProfiles => list_profiles_command(cli.json),
         Command::System { command } => system_command(command, cli.json),
+        Command::WinHost { command } => winhost_command(command, cli.json),
     }
 }
 
@@ -625,6 +713,429 @@ fn system_command(command: &SystemCommand, json: bool) -> Result<(), AppError> {
         ));
     }
 
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// `ssk winhost ...` — the real Windows 11 privileged backends (ssk-winhost),
+// bound here behind the same BoundaryEnforcer / TrafficSource / PrivilegedHelper
+// traits the pure crates use. Each privileged action is reversible and its
+// rollback receipt is persisted to a small state file so a later `release` /
+// `uninstall` (a fresh process) can undo exactly what it did. On a non-Windows
+// build every action reports a typed WinHost error, never a silent success.
+// ---------------------------------------------------------------------------
+
+fn winhost_json_err(e: serde_json::Error) -> AppError {
+    AppError::new(
+        ErrorClass::Runtime,
+        "JSON_OUTPUT_FAILED",
+        e.to_string(),
+        vec![],
+    )
+}
+
+fn winhost_err(machine_code: &str, message: impl Into<String>) -> AppError {
+    AppError::new(
+        ErrorClass::WinHost,
+        machine_code,
+        message,
+        vec!["Live effects require Windows 11 and an elevated (Administrator) shell.".into()],
+    )
+}
+
+fn winhost_state_dir() -> Result<PathBuf, AppError> {
+    let dir = std::env::temp_dir().join("ssk-winhost");
+    std::fs::create_dir_all(&dir).map_err(|e| {
+        AppError::new(
+            ErrorClass::Runtime,
+            "WINHOST_STATE_DIR",
+            e.to_string(),
+            vec![],
+        )
+    })?;
+    Ok(dir)
+}
+
+/// The kill-switch receipt path for a scope, keyed on the scope's *content
+/// digest* — the same digest that determines the firewall rule name — not on a
+/// lossy sanitization of the label. This guarantees distinct scopes never
+/// collide onto the same receipt file (which would let one engage silently
+/// clobber another's rollback receipt).
+fn winhost_killswitch_receipt_path(scope: &BoundaryScope) -> Result<PathBuf, AppError> {
+    let digest = digest_of(scope, HashAlg::Blake3).map_err(|e| {
+        AppError::new(
+            ErrorClass::Runtime,
+            "WINHOST_STATE_DIGEST",
+            e.to_string(),
+            vec![],
+        )
+    })?;
+    Ok(winhost_state_dir()?.join(format!("killswitch-{}.json", digest.to_hex())))
+}
+
+/// The deterministic host manifest the service subcommands share, so `install`,
+/// `start`, `stop`, and `uninstall` all derive the same content-addressed host
+/// id (and therefore the same Windows service name).
+fn winhost_manifest() -> HostManifest {
+    HostManifest::new(
+        "ssk-host",
+        env!("CARGO_PKG_VERSION"),
+        "windows",
+        ["system_capture", "egress_teardown"],
+    )
+}
+
+fn winhost_default_svc_path() -> Result<PathBuf, AppError> {
+    let current = std::env::current_exe()
+        .map_err(|e| AppError::new(ErrorClass::Runtime, "CURRENT_EXE", e.to_string(), vec![]))?;
+    let dir = current.parent().unwrap_or_else(|| Path::new("."));
+    let name = if cfg!(windows) {
+        "ssk-svc.exe"
+    } else {
+        "ssk-svc"
+    };
+    Ok(dir.join(name))
+}
+
+fn winhost_command(command: &WinHostCommand, json: bool) -> Result<(), AppError> {
+    match command {
+        WinHostCommand::Doctor => winhost_doctor(json),
+        WinHostCommand::Capture => winhost_capture(json),
+        WinHostCommand::Killswitch { command } => match command {
+            KillswitchCommand::Engage { scope } => winhost_killswitch_engage(scope, json),
+            KillswitchCommand::Release { scope } => winhost_killswitch_release(scope, json),
+        },
+        WinHostCommand::Service { command } => match command {
+            ServiceCommand::Install { exe } => winhost_service_install(exe.as_deref(), json),
+            ServiceCommand::Start => winhost_service_lifecycle(WinHostServiceOp::Start, json),
+            ServiceCommand::Stop => winhost_service_lifecycle(WinHostServiceOp::Stop, json),
+            ServiceCommand::Uninstall => winhost_service_uninstall(json),
+        },
+    }
+}
+
+fn winhost_doctor(json: bool) -> Result<(), AppError> {
+    let supported = ssk_winhost::platform_supported();
+    let os = std::env::consts::OS;
+    if json {
+        let value = serde_json::json!({
+            "status": "ok",
+            "platform_supported": supported,
+            "os": os,
+            "backends": {
+                "firewall_killswitch": "netsh advfirewall (Administrator)",
+                "capture": "IP Helper GetExtendedTcpTable/GetExtendedUdpTable",
+                "service": "Service Control Manager (windows-service)"
+            },
+            "requires": "Windows 11 + Administrator for live effects"
+        });
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&value).map_err(winhost_json_err)?
+        );
+    } else {
+        println!("platform_supported: {supported}");
+        println!("os: {os}");
+        if supported {
+            println!(
+                "backends: firewall(netsh), capture(iphelper), service(scm) — all require Administrator"
+            );
+        } else {
+            println!(
+                "note: this build has no Windows backends; run on Windows 11 to exercise them"
+            );
+        }
+    }
+    Ok(())
+}
+
+fn winhost_capture(json: bool) -> Result<(), AppError> {
+    let source = WindowsConnectionSource::new();
+    let scope = CaptureScope::new("winhost", ["local"]);
+    let field = SystemTrafficField::capture(&source, &scope, CaptureMode::PassiveLocal);
+
+    if json {
+        let flows: Vec<_> = field
+            .surfaces
+            .iter()
+            .map(|s| {
+                serde_json::json!({
+                    "protocol": s.protocol,
+                    "url": s.url,
+                    "status": s.status
+                })
+            })
+            .collect();
+        let value = serde_json::json!({
+            "status": "ok",
+            "supported": ssk_winhost::platform_supported(),
+            "flow_count": field.surfaces.len(),
+            "flows": flows
+        });
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&value).map_err(winhost_json_err)?
+        );
+    } else {
+        println!("flows captured: {}", field.surfaces.len());
+        for s in &field.surfaces {
+            println!(
+                "  {} {} status={:?}",
+                s.protocol,
+                s.url.as_deref().unwrap_or("-"),
+                s.status
+            );
+        }
+        if !ssk_winhost::platform_supported() {
+            println!("note: no Windows backend on this build; 0 flows is expected off-Windows");
+        }
+    }
+    Ok(())
+}
+
+fn winhost_killswitch_engage(scope_label: &str, json: bool) -> Result<(), AppError> {
+    let scope = BoundaryScope::new(scope_label, ["*"]);
+    let path = winhost_killswitch_receipt_path(&scope)?;
+
+    // Refuse to overwrite an existing engaged receipt: a second engage would
+    // otherwise clobber the first's rollback receipt, orphaning its rule.
+    if path.exists() {
+        return Err(winhost_err(
+            "KILLSWITCH_ALREADY_ENGAGED",
+            format!(
+                "scope '{scope_label}' already has an engaged receipt at {}; release it first",
+                path.display()
+            ),
+        ));
+    }
+
+    let enforcer = WindowsFirewallEnforcer::new();
+    let receipt = enforcer
+        .engage(&scope)
+        .map_err(|e| winhost_err("KILLSWITCH_ENGAGE_FAILED", e.to_string()))?;
+
+    let bytes = serde_json::to_vec_pretty(&receipt).map_err(winhost_json_err)?;
+    std::fs::write(&path, bytes).map_err(|e| {
+        AppError::new(
+            ErrorClass::Runtime,
+            "WINHOST_STATE_WRITE",
+            e.to_string(),
+            vec![],
+        )
+    })?;
+
+    if json {
+        let value = serde_json::json!({
+            "status": "ok",
+            "action": "killswitch-engage",
+            "scope": scope_label,
+            "receipt_id": receipt.receipt_id.to_hex(),
+            "receipt_path": path.display().to_string()
+        });
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&value).map_err(winhost_json_err)?
+        );
+    } else {
+        println!("egress severed for scope '{scope_label}'");
+        println!(
+            "receipt: {} -> {}",
+            receipt.receipt_id.to_hex(),
+            path.display()
+        );
+        println!("release with: ssk winhost killswitch release --scope {scope_label}");
+    }
+    Ok(())
+}
+
+fn winhost_killswitch_release(scope_label: &str, json: bool) -> Result<(), AppError> {
+    let scope = BoundaryScope::new(scope_label, ["*"]);
+    let path = winhost_killswitch_receipt_path(&scope)?;
+    let bytes = std::fs::read(&path).map_err(|e| {
+        winhost_err(
+            "KILLSWITCH_NO_RECEIPT",
+            format!(
+                "no engage receipt for scope '{scope_label}' at {}: {e}",
+                path.display()
+            ),
+        )
+    })?;
+    let receipt: EnforcementReceipt = serde_json::from_slice(&bytes).map_err(|e| {
+        AppError::new(
+            ErrorClass::Runtime,
+            "WINHOST_STATE_READ",
+            e.to_string(),
+            vec![],
+        )
+    })?;
+
+    let enforcer = WindowsFirewallEnforcer::new();
+    enforcer
+        .release(&receipt)
+        .map_err(|e| winhost_err("KILLSWITCH_RELEASE_FAILED", e.to_string()))?;
+    let _ = std::fs::remove_file(&path);
+
+    if json {
+        let value = serde_json::json!({
+            "status": "ok",
+            "action": "killswitch-release",
+            "scope": scope_label,
+            "receipt_id": receipt.receipt_id.to_hex()
+        });
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&value).map_err(winhost_json_err)?
+        );
+    } else {
+        println!("egress restored for scope '{scope_label}' (rule deleted)");
+    }
+    Ok(())
+}
+
+fn winhost_service_install(exe: Option<&str>, json: bool) -> Result<(), AppError> {
+    let manifest = winhost_manifest();
+    let exe_path = match exe {
+        Some(p) => PathBuf::from(p),
+        None => winhost_default_svc_path()?,
+    };
+
+    // Prepare the durable receipt path BEFORE the privileged effect, so a
+    // state-dir failure cannot leave a created service with no receipt.
+    let path = winhost_state_dir()?.join("service-install.json");
+
+    // Refuse to overwrite an existing install receipt. Re-running install would
+    // otherwise find the service already present, record prior_state=Installed,
+    // and downgrade the authoritative "we created it" receipt — after which
+    // uninstall would skip deleting a service this tool actually created,
+    // orphaning it. The first receipt is authoritative about the pre-SSK state.
+    if path.exists() {
+        return Err(winhost_err(
+            "SERVICE_ALREADY_TRACKED",
+            format!(
+                "an install receipt already exists at {}; run `ssk winhost service uninstall` first",
+                path.display()
+            ),
+        ));
+    }
+
+    let helper = WindowsServiceHelper::new(&exe_path);
+    let receipt = helper
+        .install(&manifest)
+        .map_err(|e| winhost_err("SERVICE_INSTALL_FAILED", e.to_string()))?;
+
+    // Persist the receipt. If this fails after a fresh create, compensate by
+    // uninstalling the just-created service rather than leaking an orphaned,
+    // untracked privileged service (the receipt records prior_state ==
+    // Uninstalled, so uninstall will actually delete it).
+    let bytes = serde_json::to_vec_pretty(&receipt).map_err(winhost_json_err)?;
+    if let Err(e) = std::fs::write(&path, bytes) {
+        if receipt.prior_state == ssk_service_host::ServiceState::Uninstalled.as_str() {
+            let _ = helper.uninstall(&receipt);
+        }
+        return Err(AppError::new(
+            ErrorClass::Runtime,
+            "WINHOST_STATE_WRITE",
+            format!("failed to persist install receipt (created service rolled back): {e}"),
+            vec![],
+        ));
+    }
+
+    if json {
+        let value = serde_json::json!({
+            "status": "ok",
+            "action": "service-install",
+            "host_id": manifest.host_id.to_hex(),
+            "exe": exe_path.display().to_string(),
+            "receipt_id": receipt.receipt_id.to_hex(),
+            "receipt_path": path.display().to_string()
+        });
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&value).map_err(winhost_json_err)?
+        );
+    } else {
+        println!("service installed for host {}", manifest.host_id.to_hex());
+        println!("exe: {}", exe_path.display());
+        println!(
+            "receipt: {} -> {}",
+            receipt.receipt_id.to_hex(),
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy)]
+enum WinHostServiceOp {
+    Start,
+    Stop,
+}
+
+fn winhost_service_lifecycle(op: WinHostServiceOp, json: bool) -> Result<(), AppError> {
+    let manifest = winhost_manifest();
+    let helper = WindowsServiceHelper::new(winhost_default_svc_path()?);
+    let (verb, code) = match op {
+        WinHostServiceOp::Start => ("start", "SERVICE_START_FAILED"),
+        WinHostServiceOp::Stop => ("stop", "SERVICE_STOP_FAILED"),
+    };
+    match op {
+        WinHostServiceOp::Start => helper.start(&manifest.host_id, &manifest.provided),
+        WinHostServiceOp::Stop => helper.stop(&manifest.host_id),
+    }
+    .map_err(|e| winhost_err(code, e.to_string()))?;
+
+    if json {
+        let value = serde_json::json!({
+            "status": "ok",
+            "action": format!("service-{verb}"),
+            "host_id": manifest.host_id.to_hex()
+        });
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&value).map_err(winhost_json_err)?
+        );
+    } else {
+        println!("service {verb} for host {}", manifest.host_id.to_hex());
+    }
+    Ok(())
+}
+
+fn winhost_service_uninstall(json: bool) -> Result<(), AppError> {
+    let path = winhost_state_dir()?.join("service-install.json");
+    let bytes = std::fs::read(&path).map_err(|e| {
+        winhost_err(
+            "SERVICE_NO_RECEIPT",
+            format!("no install receipt at {}: {e}", path.display()),
+        )
+    })?;
+    let receipt: InstallReceipt = serde_json::from_slice(&bytes).map_err(|e| {
+        AppError::new(
+            ErrorClass::Runtime,
+            "WINHOST_STATE_READ",
+            e.to_string(),
+            vec![],
+        )
+    })?;
+
+    let helper = WindowsServiceHelper::new(winhost_default_svc_path()?);
+    helper
+        .uninstall(&receipt)
+        .map_err(|e| winhost_err("SERVICE_UNINSTALL_FAILED", e.to_string()))?;
+    let _ = std::fs::remove_file(&path);
+
+    if json {
+        let value = serde_json::json!({
+            "status": "ok",
+            "action": "service-uninstall",
+            "host_id": receipt.host_id.to_hex()
+        });
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&value).map_err(winhost_json_err)?
+        );
+    } else {
+        println!("service uninstalled for host {}", receipt.host_id.to_hex());
+    }
     Ok(())
 }
 
@@ -2114,5 +2625,27 @@ mod tests {
         let output = explain_target("config").expect("config explanation exists");
         assert_eq!(output.category, "error");
         assert!(!output.details.is_empty());
+    }
+
+    // The kill-switch receipt path is keyed on the scope content digest, so
+    // distinct scopes never collide onto one receipt file (finding #3), and the
+    // same scope always resolves to the same file (engage/release must agree).
+    #[test]
+    fn killswitch_receipt_path_is_scope_digest_keyed() {
+        let a = BoundaryScope::new("all-egress", ["*"]);
+        let b = BoundaryScope::new("tenant-7", ["*"]);
+        let a2 = BoundaryScope::new("all-egress", ["*"]);
+        let pa = winhost_killswitch_receipt_path(&a).expect("path a");
+        let pb = winhost_killswitch_receipt_path(&b).expect("path b");
+        let pa2 = winhost_killswitch_receipt_path(&a2).expect("path a2");
+        assert_ne!(pa, pb, "distinct scopes must not share a receipt file");
+        assert_eq!(
+            pa, pa2,
+            "the same scope must resolve to the same receipt file"
+        );
+        assert!(pa
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.starts_with("killswitch-") && n.ends_with(".json")));
     }
 }

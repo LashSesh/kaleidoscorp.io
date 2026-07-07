@@ -24,7 +24,10 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
-use ssk_types::{content_id, GateOutcomeKind, HashAlg};
+use ssk_types::{
+    content_id, digest_of, BoundaryResidue, Digest, GateId, GateOutcomeKind, HashAlg, NextAction,
+    ResidueId, ResidueKind, ResidueStatus, Severity, TraceId,
+};
 
 content_id!(MpkSampleId);
 
@@ -174,6 +177,44 @@ impl Graph {
     #[must_use]
     pub fn is_cospectral(&self, other: &Graph) -> bool {
         self.spectrum() == other.spectrum()
+    }
+
+    /// The sorted degree sequence — a relabeling-invariant that is **not** a
+    /// spectral invariant, so it can separate some cospectral pairs.
+    #[must_use]
+    pub fn degree_sequence(&self) -> Vec<usize> {
+        let mut degs: Vec<usize> = (0..self.n)
+            .map(|i| (0..self.n).filter(|&j| self.adj[i][j]).count())
+            .collect();
+        degs.sort_unstable();
+        degs
+    }
+
+    /// The number of connected components — a relabeling-invariant that is not
+    /// determined by the adjacency spectrum, so it can separate cospectral pairs
+    /// (e.g. `C₄ ∪ K₁` has two, the star `K₁,₄` has one).
+    #[must_use]
+    #[allow(clippy::needless_range_loop)]
+    pub fn component_count(&self) -> usize {
+        let mut seen = vec![false; self.n];
+        let mut components = 0;
+        for start in 0..self.n {
+            if seen[start] {
+                continue;
+            }
+            components += 1;
+            let mut stack = vec![start];
+            seen[start] = true;
+            while let Some(v) = stack.pop() {
+                for w in 0..self.n {
+                    if self.adj[v][w] && !seen[w] {
+                        seen[w] = true;
+                        stack.push(w);
+                    }
+                }
+            }
+        }
+        components
     }
 }
 
@@ -368,6 +409,108 @@ impl MpkFieldSample {
     }
 }
 
+/// The residue payload of a cospectral `Hold` (IMRT A4): the spectrum could not
+/// decide identity, so the ≥2 distinct isomorphism-class candidates that share
+/// it are conserved rather than collapsed into a bare `Hold` — the A4 half of
+/// the Kospektral outcome.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CospectralHold {
+    pub reason: String,
+    /// The ≥2 distinct canonical-form keys that share the spectrum — the held
+    /// candidates spectrum alone cannot separate.
+    pub held_candidates: Vec<u64>,
+    /// The shared spectrum that was insufficient to decide identity.
+    pub shared_spectrum: Vec<i128>,
+    /// Content-addressed commitment over the reason + held candidates.
+    pub residue_digest: Digest,
+}
+
+impl CospectralHold {
+    fn of(left: &Graph, right: &Graph) -> Self {
+        let mut held_candidates = vec![left.canon_key(), right.canon_key()];
+        held_candidates.sort_unstable();
+        held_candidates.dedup();
+        let shared_spectrum = left.spectrum();
+        let reason = "spectrum insufficient: cospectral but non-isomorphic".to_owned();
+        let residue_digest = digest_of(
+            &(
+                "mpk/cospectral-hold/v1",
+                &reason,
+                &held_candidates,
+                &shared_spectrum,
+            ),
+            HashAlg::Blake3,
+        )
+        .expect("cospectral-hold form is serializable");
+        CospectralHold {
+            reason,
+            held_candidates,
+            shared_spectrum,
+            residue_digest,
+        }
+    }
+
+    /// The number of distinct held candidates (always ≥2 for a genuine
+    /// cospectral non-isomorphic hold).
+    #[must_use]
+    pub fn candidate_count(&self) -> usize {
+        self.held_candidates.len()
+    }
+
+    /// Lift the hold into a conserved `Cospectral`-kind residue (A4). It is a
+    /// standing obligation (`Open`) whose remediation is the distinguisher
+    /// ladder (`Reanalyze`); the `Fragment` records the held candidate keys.
+    #[must_use]
+    pub fn to_residue(&self, origin: TraceId) -> BoundaryResidue {
+        let fragment = self
+            .held_candidates
+            .iter()
+            .map(|k| format!("{k:016x}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        BoundaryResidue::new_full(
+            ResidueId::new(self.residue_digest.to_hex()),
+            ResidueKind::Cospectral,
+            GateId::Mirror,
+            Some(fragment),
+            self.reason.clone(),
+            Severity::High,
+            origin,
+            ResidueStatus::Open,
+            NextAction::Reanalyze,
+        )
+    }
+}
+
+/// The residue-bearing verdict of the cospectral gate.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CospectralVerdict {
+    Pass,
+    Hold(CospectralHold),
+    Reject,
+}
+
+impl CospectralVerdict {
+    /// The bare gate outcome, discarding any residue.
+    #[must_use]
+    pub fn outcome(&self) -> GateOutcomeKind {
+        match self {
+            CospectralVerdict::Pass => GateOutcomeKind::Pass,
+            CospectralVerdict::Hold(_) => GateOutcomeKind::Hold,
+            CospectralVerdict::Reject => GateOutcomeKind::Reject,
+        }
+    }
+
+    /// The held residue payload, if this is a `Hold`.
+    #[must_use]
+    pub fn hold(&self) -> Option<&CospectralHold> {
+        match self {
+            CospectralVerdict::Hold(h) => Some(h),
+            _ => None,
+        }
+    }
+}
+
 /// The cospectral gate: spectrum alone is not identity.
 ///
 /// Evaluating an "are these the same" claim between two graphs yields `Pass`
@@ -379,16 +522,106 @@ pub struct CospectralGate;
 impl CospectralGate {
     #[must_use]
     pub fn evaluate(&self, left: &Graph, right: &Graph) -> GateOutcomeKind {
+        self.evaluate_with_residue(left, right).outcome()
+    }
+
+    /// Evaluate, carrying the A4 residue payload on a `Hold`: two cospectral but
+    /// non-isomorphic graphs hold with the ≥2 held candidates conserved (I6 +
+    /// A4), rather than collapsing to a bare `Hold`.
+    #[must_use]
+    pub fn evaluate_with_residue(&self, left: &Graph, right: &Graph) -> CospectralVerdict {
         if left.is_isomorphic(right) {
-            GateOutcomeKind::Pass
+            CospectralVerdict::Pass
         } else if left.is_cospectral(right) {
             // Same spectrum, different isomorphism class — spectrum cannot decide
-            // identity, so we hold rather than fabricate a pass.
-            GateOutcomeKind::Hold
+            // identity, so we hold and conserve the held candidates rather than
+            // fabricate a pass.
+            CospectralVerdict::Hold(CospectralHold::of(left, right))
         } else {
-            GateOutcomeKind::Reject
+            CospectralVerdict::Reject
         }
     }
+
+    /// Attempt to **lift** a cospectral hold by trying the distinguisher ladder
+    /// in theory order `D ∈ {deg, trace, Stab, props, catalog, boundary}` and
+    /// returning the *first* `D` for which `D(G) ≠ D(H)` (IMRT A4/A5). A pair no
+    /// distinguisher separates stays `Unresolved` (it holds); an isomorphic pair
+    /// is `NotHeld` (there was no hold to lift).
+    #[must_use]
+    pub fn resolve_hold(&self, left: &Graph, right: &Graph) -> HoldResolution {
+        if left.is_isomorphic(right) {
+            return HoldResolution::NotHeld;
+        }
+        for &d in &Distinguisher::LADDER {
+            if d.separates(left, right) {
+                return HoldResolution::Lifted(d);
+            }
+        }
+        HoldResolution::Unresolved
+    }
+}
+
+/// A distinguisher `D` in the Kospektral-hold resolution ladder (IMRT A4/A5).
+/// Tried in the theory's order — cheapest structural invariants first, the
+/// complete canonical form last, and the external boundary distinguisher last of
+/// all (its Ω-export is the open residue ρ04).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Distinguisher {
+    /// Degree sequence (`deg`).
+    Degree,
+    /// Trace powers of the adjacency matrix (`trace`) — a spectral invariant, so
+    /// it never separates a *cospectral* pair, but it is part of the ladder.
+    TracePower,
+    /// Automorphism count `|Aut| = |Stab|` (`Stab`).
+    Stab,
+    /// Structural properties (`props`) — here, the connected-component count.
+    Props,
+    /// Canonical-form catalog lookup (`catalog`) — the complete invariant.
+    Catalog,
+    /// External BoundaryInterface distinguisher (`boundary`) — not wired inside
+    /// the finite kernel (its export is the open residue ρ04); never separates
+    /// here, so the ladder resolves before reaching it.
+    Boundary,
+}
+
+impl Distinguisher {
+    /// The ladder in theory order.
+    pub const LADDER: [Distinguisher; 6] = [
+        Distinguisher::Degree,
+        Distinguisher::TracePower,
+        Distinguisher::Stab,
+        Distinguisher::Props,
+        Distinguisher::Catalog,
+        Distinguisher::Boundary,
+    ];
+
+    /// Whether this distinguisher genuinely separates the two graphs
+    /// (`D(G) ≠ D(H)`).
+    #[must_use]
+    pub fn separates(self, left: &Graph, right: &Graph) -> bool {
+        match self {
+            Distinguisher::Degree => left.degree_sequence() != right.degree_sequence(),
+            // Trace powers are functions of the spectrum, so they agree on any
+            // cospectral pair — this rung never lifts a cospectral hold.
+            Distinguisher::TracePower => left.spectrum() != right.spectrum(),
+            Distinguisher::Stab => left.automorphism_count() != right.automorphism_count(),
+            Distinguisher::Props => left.component_count() != right.component_count(),
+            Distinguisher::Catalog => left.canon_key() != right.canon_key(),
+            // The external distinguisher is not available inside the kernel.
+            Distinguisher::Boundary => false,
+        }
+    }
+}
+
+/// The outcome of trying to lift a cospectral hold (IMRT A4/A5).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HoldResolution {
+    /// The hold was lifted by the named distinguisher (the first that separated).
+    Lifted(Distinguisher),
+    /// No distinguisher in the ladder separated the pair — it stays a Hold.
+    Unresolved,
+    /// The two graphs are isomorphic — there was no hold to lift.
+    NotHeld,
 }
 
 /// A catalog of known canonical forms → labels. An unknown window holds.
@@ -498,6 +731,97 @@ mod tests {
         assert_eq!(
             CospectralGate.evaluate(&a, &triangle),
             GateOutcomeKind::Reject
+        );
+    }
+
+    // G11 (A4): the cospectral Hold is not bare — it carries a content-addressed
+    // residue recording the >=2 held candidates and the reason "spectrum
+    // insufficient", conserved as a Cospectral-kind residue rather than dropped.
+    #[test]
+    fn cospectral_hold_carries_a_conserved_residue_payload() {
+        let a = c4_plus_k1();
+        let b = star_k14();
+        let verdict = CospectralGate.evaluate_with_residue(&a, &b);
+        assert_eq!(verdict.outcome(), GateOutcomeKind::Hold);
+
+        let hold = verdict.hold().expect("a cospectral hold carries a payload");
+        assert!(
+            hold.candidate_count() >= 2,
+            "at least two held candidates share the spectrum"
+        );
+        assert_eq!(
+            hold.held_candidates,
+            {
+                let mut k = vec![a.canon_key(), b.canon_key()];
+                k.sort_unstable();
+                k
+            },
+            "the held candidates are the two distinct isomorphism classes"
+        );
+        assert!(hold.reason.contains("spectrum insufficient"));
+        assert!(!hold.shared_spectrum.is_empty());
+
+        // The residue is a conserved Cospectral 5-tuple, a standing obligation
+        // whose remediation is the distinguisher ladder.
+        let r = hold.to_residue(TraceId::new("t"));
+        assert_eq!(r.kind, ResidueKind::Cospectral);
+        assert_eq!(r.status, ResidueStatus::Open);
+        assert_eq!(r.next_action, NextAction::Reanalyze);
+        assert!(r.open_obligation());
+        assert!(r.fragment.is_some(), "the held candidates are recorded");
+
+        // A genuine isomorphism passes with no held payload; a distinct spectrum
+        // rejects with no payload.
+        assert!(CospectralGate
+            .evaluate_with_residue(&a, &a.canon())
+            .hold()
+            .is_none());
+        let triangle = Graph::from_edges(5, &[(0, 1), (1, 2), (2, 0)]).unwrap();
+        assert!(CospectralGate
+            .evaluate_with_residue(&a, &triangle)
+            .hold()
+            .is_none());
+    }
+
+    // G12 (A4/A5): the resolution ladder D∈{deg,trace,Stab,props,catalog,boundary}
+    // lifts a cospectral hold by the first distinguisher that genuinely
+    // separates, in theory order; an isomorphic pair is NotHeld.
+    #[test]
+    fn cospectral_hold_is_lifted_by_the_first_separating_distinguisher() {
+        let a = c4_plus_k1();
+        let b = star_k14();
+        // The Schwenk pair is a genuine cospectral hold.
+        assert!(a.is_cospectral(&b) && !a.is_isomorphic(&b));
+
+        // deg is the first rung and it genuinely separates this pair
+        // (C₄∪K₁ = [0,2,2,2,2] vs K₁,₄ = [1,1,1,1,4]).
+        assert_ne!(a.degree_sequence(), b.degree_sequence());
+        assert_eq!(
+            CospectralGate.resolve_hold(&a, &b),
+            HoldResolution::Lifted(Distinguisher::Degree),
+            "deg is the first distinguisher that separates the Schwenk pair"
+        );
+
+        // The trace rung, being spectral, does NOT separate a cospectral pair.
+        assert!(!Distinguisher::TracePower.separates(&a, &b));
+        // But props (component count: 2 vs 1) and catalog (canon) both do.
+        assert!(Distinguisher::Props.separates(&a, &b));
+        assert!(Distinguisher::Catalog.separates(&a, &b));
+        // The external boundary distinguisher is never available in the kernel.
+        assert!(!Distinguisher::Boundary.separates(&a, &b));
+
+        // The ladder is honored in order: the first true rung wins. Verify by
+        // scanning the ladder directly.
+        let first = Distinguisher::LADDER
+            .iter()
+            .copied()
+            .find(|d| d.separates(&a, &b));
+        assert_eq!(first, Some(Distinguisher::Degree));
+
+        // An isomorphic pair is NotHeld — there is nothing to lift.
+        assert_eq!(
+            CospectralGate.resolve_hold(&a, &a.canon()),
+            HoldResolution::NotHeld
         );
     }
 

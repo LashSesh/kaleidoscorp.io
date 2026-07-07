@@ -26,16 +26,18 @@
 //! make it more conservative. The whole evaluation is a pure function of its
 //! inputs, so it replays by content.
 //!
-//! **Honesty note on the QLOGIC six-axis input.** Of the six axes, this
-//! composition genuinely evidences four: κ (coherence, from the captured
-//! residues), H (entropy, from the captured spectrum's real measured
-//! `shannon_entropy`), B (open obligations), and Δ (drift, from the field's
-//! δF drift signals). The remaining two — Π (parallax) and R (replay) —
-//! require IMDF wavefront/replay-manifest evidence this pipeline does not yet
-//! collect; rather than fabricate a constant "clean" value for them, they are
-//! [`SystemInputs`] fields the caller must supply explicitly. A caller with no
-//! real evidence should pass `false` so the axis conservatively holds/fails
-//! instead of silently assuming consistency.
+//! **Honesty note on the QLOGIC six-axis input (A6, corrected).** All six axes
+//! are now computed from a real signal and bound to their theory quantity
+//! (IMRT §8.13): κ coherence and H entropy from the captured spectrum; Π
+//! projection quality from the skin's coupling completeness; R residue load
+//! λ=|X|/|M| from the residue/obligation mass; B boundary stability from the
+//! kill-switch state; Δ drift from the field's δF signals. Parallax and replay
+//! are deliberately **not** QLOGIC axes — they are the A3 (parallax obligation)
+//! and A8 (replay/stability) checks, evaluated separately in the composition
+//! and downgrading a would-be Emit to Hold with their own reason. They remain
+//! caller-supplied [`SystemInputs`] evidence (`parallax_consistent`,
+//! `replay_equal`); a caller with no real evidence should pass `false` so the
+//! obligation conservatively holds rather than silently assuming consistency.
 
 use ssk_boundary::KillSwitchState;
 use ssk_capture::SystemTrafficField;
@@ -149,12 +151,14 @@ impl SystemPipeline {
             None => GateOutcomeKind::Hold,
         };
 
-        // 5. The IMDF QLOGIC verdict. Coherence is full on a clean field and
-        //    degrades when a residue is present; entropy is the captured
-        //    spectrum's real measured shannon_entropy (or a fail-closed
-        //    maximum when nothing was captured); drift feeds the Δ axis;
-        //    parallax/replay are genuine caller-supplied evidence (see the
-        //    module-level honesty note), never a fabricated constant.
+        // 5. The IMDF QLOGIC verdict g=(κ,H,Π,R,B,Δ). Every axis is computed from
+        //    a real signal and bound to its theory quantity (IMRT §8.13/§10.6):
+        //    κ coherence and H entropy from the captured spectrum; Π projection
+        //    quality from how completely the captured field was coupled into the
+        //    skin; R residue load λ=|X|/|M| from the residue/obligation mass; B
+        //    boundary stability from the kill-switch; Δ drift. Parallax and
+        //    replay are NOT axes here — they are the A3 and A8 obligations,
+        //    evaluated separately below.
         let coherence = if skin.residue_tensor.is_empty() {
             1.0
         } else {
@@ -169,9 +173,9 @@ impl SystemPipeline {
                 coherence,
                 entropy,
                 entropy_bound: ENTROPY_BOUND,
-                parallax_consistent: inputs.parallax_consistent,
-                replay_equal: inputs.replay_equal,
-                open_obligations: inputs.open_obligations,
+                projection_quality: projection_quality(&skin),
+                residue_load: residue_load(&skin, inputs.open_obligations),
+                boundary_stable: inputs.kill_switch != KillSwitchState::Engaged,
                 drift,
                 drift_bound: 0.35,
             })
@@ -186,20 +190,40 @@ impl SystemPipeline {
             open_obligations: inputs.open_obligations,
         });
 
-        // 7. The host-health join: an un-emittable host can only *hold* a would-be
-        //    emit (fail-closed), never open one up. Deny/Hold pass through.
+        // 7. The composition can only make the decision *more* conservative,
+        //    never promote it. Three joins, each downgrading a would-be Emit to
+        //    Hold and recording its reason:
         let mut reasons = crown_report.reasons.clone();
-        let (decision, host_downgraded) = if !inputs.host_health.is_emittable()
-            && crown_report.decision == EmissionDecision::Emit
-        {
+        let mut decision = crown_report.decision;
+        let mut host_downgraded = false;
+
+        // 7a. Host-health: an un-emittable host holds a would-be emit.
+        if !inputs.host_health.is_emittable() {
             reasons.push(format!(
                 "service_host_not_emittable:{}",
                 inputs.host_health.as_str()
             ));
-            (EmissionDecision::Hold, true)
-        } else {
-            (crown_report.decision, false)
-        };
+            if decision == EmissionDecision::Emit {
+                decision = EmissionDecision::Hold;
+                host_downgraded = true;
+            }
+        }
+        // 7b. A3 parallax obligation (relocated off the Π axis): a finding stable
+        //     in only one ray gains no gate relevance.
+        if !inputs.parallax_consistent {
+            reasons.push("a3_parallax_inconsistent".to_owned());
+            if decision == EmissionDecision::Emit {
+                decision = EmissionDecision::Hold;
+            }
+        }
+        // 7c. A8 replay/stability obligation (relocated off the R axis): a run
+        //     whose replay is not deterministic is not stable.
+        if !inputs.replay_equal {
+            reasons.push("a8_replay_divergent".to_owned());
+            if decision == EmissionDecision::Emit {
+                decision = EmissionDecision::Hold;
+            }
+        }
 
         // Structured, runtime-observable projection of the whole composed
         // verdict (severity escalates with the decision; the underlying
@@ -302,6 +326,40 @@ fn observed_entropy(sig: &ssk_signature::SpectralSignature) -> f64 {
 /// headroom to Pass while still flagging genuinely anomalous high-entropy
 /// captured content (e.g. an embedded random/opaque token) as Hold.
 const ENTROPY_BOUND: f64 = 6.0;
+
+/// The Π axis' projection quality (*Projektionsgüte*): how completely the
+/// captured field was reconstructed and coupled into the skin. A real,
+/// three-level measure of the C_coupling step — nothing captured means nothing
+/// projected (0.0, fails Π); captured but uncoupled is a partial projection
+/// (0.5, holds); captured and coupled is a full projection (1.0). It reads
+/// *distinct* skin state from κ (which reads residue-emptiness) and R (which
+/// reads residue mass), so the three axes stay independent. A finer continuous
+/// metric is a model refinement (IMRT ρ05-class residue), not a fabricated
+/// value — this returns only what the skin genuinely evidences.
+fn projection_quality(skin: &FieldTensorSkin) -> f64 {
+    if skin.surface_tensor.is_empty() {
+        0.0
+    } else if skin.coupling.is_empty() {
+        0.5
+    } else {
+        1.0
+    }
+}
+
+/// The R axis' residue load (*Residuenlast*, λ = |X|/|M|): the fraction of
+/// measured mass that remains unintegrated residue. |X| is the open residue +
+/// obligation count; |M| is the total measured mass (projected surfaces + that
+/// same open mass). With nothing open the load is 0.0 (Pass). Reads the residue
+/// *mass*, distinct from Π (which reads whether coupling happened at all).
+fn residue_load(skin: &FieldTensorSkin, open_obligations: usize) -> f64 {
+    let open = skin.residue_tensor.len() + open_obligations;
+    let measured = skin.surface_tensor.len() + open;
+    if measured == 0 {
+        0.0
+    } else {
+        open as f64 / measured as f64
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -573,10 +631,12 @@ mod tests {
         assert_eq!(verdict.qlogic_gate, GateOutcomeKind::Hold);
     }
 
-    // Regression: parallax_consistent and replay_equal are genuine caller-
-    // supplied evidence, not hardcoded constants — the QLOGIC gate (and so the
-    // whole pipeline) must respond when either is false, on an otherwise
-    // fully-clean field that would emit if these axes were still hardcoded true.
+    // Regression (A6 re-map): parallax_consistent and replay_equal are genuine
+    // caller-supplied evidence, not hardcoded constants — but they are the A3
+    // and A8 obligations, NOT QLOGIC axes. The QLOGIC gate is free to Pass on a
+    // clean field (parallax/replay no longer feed Π/R), yet the composed
+    // pipeline must still refuse to Emit when either obligation fails, with the
+    // reason attributed to its correct axiom.
     #[test]
     fn parallax_and_replay_evidence_genuinely_gate_the_pipeline() {
         let traffic = field(&CleanSource);
@@ -586,23 +646,19 @@ mod tests {
         inconsistent_parallax.parallax_consistent = false;
         let mut p1 = SystemPipeline::new();
         let v1 = p1.evaluate(&inconsistent_parallax);
-        assert_ne!(
-            v1.qlogic_gate,
-            GateOutcomeKind::Pass,
-            "an inconsistent parallax split must not let QLOGIC pass"
-        );
+        // Parallax is now an A3 obligation, not a gate axis: the gate may pass...
+        assert_eq!(v1.qlogic_gate, GateOutcomeKind::Pass);
+        // ...but the composed decision holds, attributed to A3.
         assert_ne!(v1.decision, EmissionDecision::Emit);
+        assert!(v1.reasons.iter().any(|r| r == "a3_parallax_inconsistent"));
 
         let mut broken_replay = clean_inputs(&traffic, &ws);
         broken_replay.replay_equal = false;
         let mut p2 = SystemPipeline::new();
         let v2 = p2.evaluate(&broken_replay);
-        assert_ne!(
-            v2.qlogic_gate,
-            GateOutcomeKind::Pass,
-            "broken replay-equality must not let QLOGIC pass"
-        );
+        assert_eq!(v2.qlogic_gate, GateOutcomeKind::Pass);
         assert_ne!(v2.decision, EmissionDecision::Emit);
+        assert!(v2.reasons.iter().any(|r| r == "a8_replay_divergent"));
     }
 
     // Regression: entropy is the field's real measured shannon_entropy, not a

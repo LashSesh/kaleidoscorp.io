@@ -35,6 +35,7 @@ ssk-mpk = { path = "../ssk-mpk", version = "0.1.0" }
 ssk-service-host = { path = "../ssk-service-host", version = "0.1.0" }
 ssk-boundary = { path = "../ssk-boundary", version = "0.1.0" }
 ssk-crown = { path = "../ssk-crown", version = "0.1.0" }
+ssk-winhost = { path = "../ssk-winhost", version = "0.1.0" }
 # Only "rt" + "net" + "macros": one-shot current-thread runtime for the new
 # daemon-backed commands (status/activate/deactivate/list-profiles). `run` /
 # `replay-verify` / `doctor` / etc. remain fully synchronous and local.
