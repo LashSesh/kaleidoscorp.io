@@ -1,0 +1,29 @@
+[package]
+name = "ssk-netd-helper"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# The elevated privileged broker (SPEC_TAURI_GUI.md §2, §12 / P0). The single
+# authoritative owner of the kill-switch security domain: it routes each
+# privileged verb through the ssk-boundary auth gate + hash-chained audit,
+# persists the rollback receipt and journal to a durable ACL'd store, and serves
+# the authoritative KillSwitchStatus (journal + receipt + observed OS rule +
+# recovery state). This crate is the portable, synchronous security core; the
+# async ssk-ipc named-pipe transport (with client-SID auth) wraps it at a later
+# phase. The real Windows firewall edge lives in ssk-winhost, behind cfg.
+
+[dependencies]
+ssk-types = { path = "../ssk-types", version = "0.1.0" }
+ssk-signature = { path = "../ssk-signature", version = "0.1.0" }
+ssk-boundary = { path = "../ssk-boundary", version = "0.1.0" }
+serde = { workspace = true }
+ciborium = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+[lints]
+workspace = true

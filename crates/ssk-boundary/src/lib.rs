@@ -35,6 +35,8 @@ pub enum BoundaryError {
     NotEngaged,
     #[error("enforcement failed: {0}")]
     Enforcement(String),
+    #[error("cannot rehydrate: corrupt or incoherent journal: {0}")]
+    CorruptJournal(String),
 }
 
 /// The kill-switch state.
@@ -214,9 +216,81 @@ impl KillSwitch {
         }
     }
 
+    /// Reconstruct a switch from persisted parts after a crash/restart, so a
+    /// privileged broker can restore the authoritative state and still
+    /// [`release`](Self::release) using the receipt captured on the original
+    /// engage. This is the durable-recovery counterpart to [`arm`](Self::arm).
+    ///
+    /// The reconstruction is **validated** — it is not a blind assignment:
+    /// * the audit `ledger` must be a well-formed hash chain (same check as
+    ///   [`verify_audit`](Self::verify_audit)), and
+    /// * receipt/state coherence must hold — an `Engaged` switch must carry a
+    ///   held receipt (needed to release), and an `Armed`/`Released` switch must
+    ///   carry none.
+    ///
+    /// # Errors
+    /// [`BoundaryError::CorruptJournal`] if the chain is broken or the
+    /// receipt/state pairing is incoherent.
+    pub fn rehydrate(
+        session: SessionId,
+        scope: BoundaryScope,
+        policy: BoundaryPolicy,
+        state: KillSwitchState,
+        receipt: Option<EnforcementReceipt>,
+        ledger: Vec<BoundaryAuditEntry>,
+    ) -> Result<Self, BoundaryError> {
+        // 1. The persisted audit chain must be intact.
+        let mut expected_prev = Digest::GENESIS;
+        for (index, entry) in ledger.iter().enumerate() {
+            if entry.seq != index as u64 || entry.prev_hash != expected_prev {
+                return Err(BoundaryError::CorruptJournal(format!(
+                    "broken link at seq {}",
+                    entry.seq
+                )));
+            }
+            if entry.entry_hash != audit_hash(entry.seq, &entry.prev_hash, &entry.event) {
+                return Err(BoundaryError::CorruptJournal(format!(
+                    "entry hash mismatch at seq {}",
+                    entry.seq
+                )));
+            }
+            expected_prev = entry.entry_hash;
+        }
+        // 2. Receipt/state coherence — an Engaged switch must be able to release.
+        match (state, &receipt) {
+            (KillSwitchState::Engaged, None) => {
+                return Err(BoundaryError::CorruptJournal(
+                    "engaged state without a held receipt".to_owned(),
+                ));
+            }
+            (KillSwitchState::Armed | KillSwitchState::Released, Some(_)) => {
+                return Err(BoundaryError::CorruptJournal(format!(
+                    "{} state must not hold a receipt",
+                    state.as_str()
+                )));
+            }
+            _ => {}
+        }
+        Ok(KillSwitch {
+            session,
+            scope,
+            policy,
+            state,
+            receipt,
+            ledger,
+        })
+    }
+
     #[must_use]
     pub fn state(&self) -> KillSwitchState {
         self.state
+    }
+
+    /// The held rollback receipt, if the switch is currently engaged. A broker
+    /// persists this so it can rehydrate and release after a restart.
+    #[must_use]
+    pub fn receipt(&self) -> Option<&EnforcementReceipt> {
+        self.receipt.as_ref()
     }
 
     #[must_use]
@@ -452,6 +526,87 @@ mod tests {
         assert_eq!(ks.audit_entries().len(), 1);
         assert_eq!(ks.audit_entries()[0].event.kind, "engage");
         assert!(ks.verify_audit());
+    }
+
+    // A broker can persist an engaged switch's parts and rehydrate it after a
+    // restart, then release using the recovered receipt.
+    #[test]
+    fn rehydrate_restores_an_engaged_switch_and_can_release() {
+        let mut ks = switch();
+        let enforcer = FakeEnforcer::new();
+        ks.engage(&control_auth(), &enforcer).unwrap();
+
+        // Snapshot the parts a durable broker would persist.
+        let state = ks.state();
+        let receipt = ks.receipt().cloned();
+        let ledger = ks.audit_entries().to_vec();
+        assert_eq!(state, KillSwitchState::Engaged);
+        assert!(receipt.is_some());
+
+        // Rehydrate a fresh switch from the persisted parts.
+        let mut restored = KillSwitch::rehydrate(
+            SessionId::new("sess-1"),
+            BoundaryScope::all_egress(),
+            BoundaryPolicy::default(),
+            state,
+            receipt,
+            ledger,
+        )
+        .expect("valid parts rehydrate");
+        assert_eq!(restored.state(), KillSwitchState::Engaged);
+        assert!(restored.verify_audit());
+
+        // The recovered switch can release using its recovered receipt.
+        let enforcer2 = FakeEnforcer::new();
+        restored.release(&control_auth(), &enforcer2).unwrap();
+        assert_eq!(restored.state(), KillSwitchState::Released);
+    }
+
+    // Rehydration is validated: a broken chain or an incoherent receipt/state
+    // pairing is rejected rather than silently trusted.
+    #[test]
+    fn rehydrate_rejects_corrupt_or_incoherent_parts() {
+        let mut ks = switch();
+        ks.engage(&control_auth(), &FakeEnforcer::new()).unwrap();
+        let good_ledger = ks.audit_entries().to_vec();
+
+        // Engaged state but no held receipt → cannot ever release → rejected.
+        let err = KillSwitch::rehydrate(
+            SessionId::new("s"),
+            BoundaryScope::all_egress(),
+            BoundaryPolicy::default(),
+            KillSwitchState::Engaged,
+            None,
+            good_ledger.clone(),
+        )
+        .unwrap_err();
+        assert!(matches!(err, BoundaryError::CorruptJournal(_)));
+
+        // Released state but holding a receipt → incoherent → rejected.
+        let err = KillSwitch::rehydrate(
+            SessionId::new("s"),
+            BoundaryScope::all_egress(),
+            BoundaryPolicy::default(),
+            KillSwitchState::Released,
+            ks.receipt().cloned(),
+            good_ledger.clone(),
+        )
+        .unwrap_err();
+        assert!(matches!(err, BoundaryError::CorruptJournal(_)));
+
+        // A tampered audit chain → rejected.
+        let mut bad_ledger = good_ledger;
+        bad_ledger[0].event.actor = "someone-else".to_owned();
+        let err = KillSwitch::rehydrate(
+            SessionId::new("s"),
+            BoundaryScope::all_egress(),
+            BoundaryPolicy::default(),
+            KillSwitchState::Engaged,
+            ks.receipt().cloned(),
+            bad_ledger,
+        )
+        .unwrap_err();
+        assert!(matches!(err, BoundaryError::CorruptJournal(_)));
     }
 
     #[test]
