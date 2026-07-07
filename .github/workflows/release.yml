@@ -14,7 +14,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo build --workspace --release
       - run: mkdir -p dist && tar -czf dist/ssk-omega-${GITHUB_REF_NAME}.tar.gz crates Cargo.toml README.md docs
