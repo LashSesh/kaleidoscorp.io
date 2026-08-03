@@ -35,6 +35,25 @@ pub enum BoundaryError {
     NotEngaged,
     #[error("enforcement failed: {0}")]
     Enforcement(String),
+    /// The enforcing action itself reported success, but the enforcer could
+    /// **not confirm the post-condition** (e.g. it could not observe that the
+    /// egress block is actually in place).
+    ///
+    /// This is deliberately *not* `Ok`: a claim of protection must never be
+    /// stronger than the evidence for it. It is equally deliberately *not* a
+    /// plain [`BoundaryError::Enforcement`]: it carries the
+    /// [`EnforcementReceipt`] so the (possibly real) enforcement stays
+    /// releasable. Dropping the receipt here would strand the host with an
+    /// enforcement nobody can roll back — a denial-of-rollback with no
+    /// attacker required.
+    ///
+    /// A caller that persists receipts **must persist this one too**, then
+    /// report the failure.
+    #[error("enforcement applied but could not be verified: {detail}")]
+    EnforcementUnverified {
+        receipt: Box<EnforcementReceipt>,
+        detail: String,
+    },
     #[error("cannot rehydrate: corrupt or incoherent journal: {0}")]
     CorruptJournal(String),
 }
@@ -97,28 +116,187 @@ pub struct EnforcementReceipt {
     pub prior_state: String,
 }
 
+/// Why an [`EnforcementReceipt`] failed its integrity check.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum ReceiptIntegrityError {
+    #[error("receipt is for scope {found:?}, not {expected:?}")]
+    ScopeLabelMismatch { expected: String, found: String },
+    #[error("receipt_id does not match its own contents (expected {expected}, found {found})")]
+    DigestMismatch { expected: String, found: String },
+}
+
 impl EnforcementReceipt {
     #[must_use]
     pub fn new(scope: &BoundaryScope, prior_state: impl Into<String>) -> Self {
         let prior_state = prior_state.into();
-        #[derive(Serialize)]
-        struct Form<'a> {
-            scope: &'a BoundaryScope,
-            prior_state: &'a str,
-        }
-        let receipt_id = digest_of(
-            &Form {
-                scope,
-                prior_state: &prior_state,
-            },
-            HashAlg::Blake3,
-        )
-        .expect("receipt form is serializable");
+        let receipt_id = Self::expected_id(scope, &prior_state);
         EnforcementReceipt {
             receipt_id,
             scope_label: scope.label.clone(),
             prior_state,
         }
+    }
+
+    /// The `receipt_id` a receipt for this `(scope, prior_state)` pair must
+    /// carry. Exposed so a loader can recompute rather than trust.
+    #[must_use]
+    pub fn expected_id(scope: &BoundaryScope, prior_state: &str) -> Digest {
+        #[derive(Serialize)]
+        struct Form<'a> {
+            scope: &'a BoundaryScope,
+            prior_state: &'a str,
+        }
+        digest_of(&Form { scope, prior_state }, HashAlg::Blake3)
+            .expect("receipt form is serializable")
+    }
+
+    /// Recompute `receipt_id` from `scope` + this receipt's own `prior_state`
+    /// and compare, after checking the receipt is for that scope at all.
+    ///
+    /// # What this detects, and what it does **not**
+    ///
+    /// `receipt_id` is an **unkeyed** Blake3 hash over `{scope, prior_state}`
+    /// (see [`EnforcementReceipt::new`]). Anyone who can write a receipt can
+    /// therefore also compute a matching `receipt_id` for a `prior_state` of
+    /// their choosing. This check consequently detects:
+    ///
+    /// * corruption, truncation and torn writes of a persisted receipt,
+    /// * a receipt paired with the **wrong scope**,
+    /// * naive tampering that edits `prior_state` without rehashing,
+    ///
+    /// and it does **not** detect forgery. Forgery is bounded elsewhere:
+    /// by the DACL on wherever receipts are stored, and — decisively — by the
+    /// enforcer validating the *contents* of `prior_state` before acting on
+    /// them (see `ssk_winhost::firewall::KillSwitchRuleName`). Do not treat a
+    /// passing `verify_against` as authentication.
+    ///
+    /// # Errors
+    /// [`ReceiptIntegrityError`] when the scope label or the digest disagree.
+    pub fn verify_against(&self, scope: &BoundaryScope) -> Result<(), ReceiptIntegrityError> {
+        if self.scope_label != scope.label {
+            return Err(ReceiptIntegrityError::ScopeLabelMismatch {
+                expected: scope.label.clone(),
+                found: self.scope_label.clone(),
+            });
+        }
+        let expected = Self::expected_id(scope, &self.prior_state);
+        if expected != self.receipt_id {
+            return Err(ReceiptIntegrityError::DigestMismatch {
+                expected: expected.to_hex(),
+                found: self.receipt_id.to_hex(),
+            });
+        }
+        Ok(())
+    }
+}
+
+/// Three-valued presence of an enforcement, as **observed** rather than as
+/// believed.
+///
+/// The third value is the point: a probe that cannot answer must say so.
+/// Collapsing `Indeterminate` into `Absent` is how a kill-switch comes to
+/// report restored egress it never restored, so it is spelled out as its own
+/// variant and no constructor produces `Absent` from a failed observation.
+///
+/// This is the same fail-closed contract `ssk_netd_helper::status::EgressObserver`
+/// already specifies as `Option<bool>`; [`Presence::as_option_bool`] is the
+/// lossless bridge to it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub enum Presence {
+    /// Positively observed to be in place.
+    Present,
+    /// Positively observed to be gone.
+    Absent,
+    /// The probe could not answer. **Never** treat as `Absent`.
+    Indeterminate { detail: String },
+}
+
+impl Presence {
+    #[must_use]
+    pub fn is_present(&self) -> bool {
+        matches!(self, Presence::Present)
+    }
+
+    /// `Some(true)`/`Some(false)` when observed, `None` when indeterminate —
+    /// the shape `EgressObserver::rule_present` speaks.
+    #[must_use]
+    pub fn as_option_bool(&self) -> Option<bool> {
+        match self {
+            Presence::Present => Some(true),
+            Presence::Absent => Some(false),
+            Presence::Indeterminate { .. } => None,
+        }
+    }
+}
+
+/// One observation of the boundary, with the mechanism that produced it and
+/// opaque human-readable evidence.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BoundaryObservation {
+    pub presence: Presence,
+    /// Which actuator observed this, e.g. `"netsh-advfirewall"`,
+    /// `"wfp-session-filter"`. Stable identifiers, not prose.
+    pub mechanism: &'static str,
+    /// Diagnostic payload for a human or a log. **No branch may read this** —
+    /// it is whatever the underlying tool emitted, in whatever locale and
+    /// encoding it chose.
+    pub evidence: String,
+}
+
+/// Observe the boundary without mutating it. Deliberately distinct from
+/// [`BoundaryEnforcer`]: a status/recovery path must be able to look without
+/// any possibility of changing anything.
+pub trait BoundaryProbe {
+    fn observe(&self, scope: &BoundaryScope) -> BoundaryObservation;
+}
+
+/// What a release actually did — so a caller can report the truth instead of
+/// assuming `Ok(())` means "removed".
+///
+/// Deliberately carries no "number of things removed": a count is only
+/// available from some mechanisms (and only by reading localized tool prose),
+/// so it cannot be a success criterion. The criterion is the post-condition
+/// probe.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ReleaseOutcome {
+    /// The removal reported success and the post-condition (enforcement no
+    /// longer present) was confirmed.
+    Reverted,
+    /// The removal did not report success, but the post-condition holds
+    /// anyway: nothing this receipt names is in place. Egress is not severed
+    /// by us.
+    AlreadyAbsent,
+    /// The enforcement pre-existed this engagement, so this engagement did not
+    /// create it and must not remove it. **Nothing was deleted and egress may
+    /// well still be severed** by whoever did create it.
+    SkippedPreexisting,
+    /// The enforcer only reports success/failure and cannot say which of the
+    /// above occurred. Never treat this as evidence that anything was removed.
+    Unreported,
+}
+
+impl ReleaseOutcome {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ReleaseOutcome::Reverted => "reverted",
+            ReleaseOutcome::AlreadyAbsent => "already_absent",
+            ReleaseOutcome::SkippedPreexisting => "skipped_preexisting",
+            ReleaseOutcome::Unreported => "unreported",
+        }
+    }
+
+    /// Whether this outcome is evidence that *this* engagement's enforcement is
+    /// gone. False for [`ReleaseOutcome::SkippedPreexisting`] (nothing was
+    /// removed) and for [`ReleaseOutcome::Unreported`] (nothing was proven).
+    #[must_use]
+    pub fn enforcement_confirmed_gone(self) -> bool {
+        matches!(
+            self,
+            ReleaseOutcome::Reverted | ReleaseOutcome::AlreadyAbsent
+        )
     }
 }
 
@@ -128,13 +306,39 @@ pub trait BoundaryEnforcer {
     /// Sever egress for the scope, returning a receipt for later rollback.
     ///
     /// # Errors
-    /// [`BoundaryError::Enforcement`] on failure.
+    /// [`BoundaryError::Enforcement`] on failure, or
+    /// [`BoundaryError::EnforcementUnverified`] when the action was applied but
+    /// its post-condition could not be confirmed — that variant still carries a
+    /// releasable receipt and must not be discarded.
     fn engage(&self, scope: &BoundaryScope) -> Result<EnforcementReceipt, BoundaryError>;
     /// Revert the enforcement described by the receipt (rollback).
     ///
     /// # Errors
     /// [`BoundaryError::Enforcement`] on failure.
     fn release(&self, receipt: &EnforcementReceipt) -> Result<(), BoundaryError>;
+
+    /// Revert, given both the receipt **and** the scope it claims to belong to,
+    /// and report what actually happened.
+    ///
+    /// Supplying the scope is what lets an enforcer re-derive what it is
+    /// allowed to touch instead of trusting a name carried inside the receipt,
+    /// which is the difference between "a forged receipt names one of our own
+    /// rules" and "a forged receipt names any rule at all".
+    ///
+    /// The default implementation delegates to [`BoundaryEnforcer::release`]
+    /// and reports [`ReleaseOutcome::Unreported`], because an enforcer that
+    /// only returns `()` has told us nothing more than that.
+    ///
+    /// # Errors
+    /// [`BoundaryError::Enforcement`] on failure.
+    fn release_scoped(
+        &self,
+        scope: &BoundaryScope,
+        receipt: &EnforcementReceipt,
+    ) -> Result<ReleaseOutcome, BoundaryError> {
+        let _ = scope;
+        self.release(receipt).map(|()| ReleaseOutcome::Unreported)
+    }
 }
 
 /// Which authorizations may control the switch.
@@ -344,11 +548,40 @@ impl KillSwitch {
         );
     }
 
+    /// Adopt an engagement whose enforcement was applied but **not** confirmed.
+    ///
+    /// The switch takes ownership of the receipt and moves to `Engaged` — so
+    /// the enforcement stays releasable and the transition is audited — and the
+    /// caller still gets the error back. Losing the receipt here would leave an
+    /// applied enforcement that nothing can roll back, which is a strictly
+    /// worse failure than an unverified engagement.
+    fn adopt_unverified(
+        &mut self,
+        kind: &str,
+        actor: &str,
+        receipt: Box<EnforcementReceipt>,
+        detail: String,
+        reason: Option<String>,
+    ) -> BoundaryError {
+        let from = self.state;
+        self.state = KillSwitchState::Engaged;
+        self.receipt = Some((*receipt).clone());
+        let note = match reason {
+            Some(r) => format!("{r}; unverified: {detail}"),
+            None => format!("unverified: {detail}"),
+        };
+        self.record(kind, from, self.state, actor, Some(note));
+        BoundaryError::EnforcementUnverified { receipt, detail }
+    }
+
     /// Engage the switch: sever egress. Requires a control authorization.
     ///
     /// # Errors
     /// [`BoundaryError::Unauthorized`], [`BoundaryError::InvalidTransition`] if
-    /// already engaged, or [`BoundaryError::Enforcement`].
+    /// already engaged, [`BoundaryError::Enforcement`], or
+    /// [`BoundaryError::EnforcementUnverified`] — in which case the switch is
+    /// nevertheless left `Engaged` holding the receipt (see
+    /// [`KillSwitch::adopt_unverified`]).
     pub fn engage(
         &mut self,
         authorization: &AuthorizationManifest,
@@ -362,7 +595,19 @@ impl KillSwitch {
                 "already engaged".to_owned(),
             ));
         }
-        let receipt = enforcer.engage(&self.scope)?;
+        let receipt = match enforcer.engage(&self.scope) {
+            Ok(receipt) => receipt,
+            Err(BoundaryError::EnforcementUnverified { receipt, detail }) => {
+                return Err(self.adopt_unverified(
+                    "engage",
+                    &authorization.source_name,
+                    receipt,
+                    detail,
+                    None,
+                ));
+            }
+            Err(other) => return Err(other),
+        };
         let from = self.state;
         self.state = KillSwitchState::Engaged;
         self.receipt = Some(receipt);
@@ -381,6 +626,23 @@ impl KillSwitch {
         authorization: &AuthorizationManifest,
         enforcer: &dyn BoundaryEnforcer,
     ) -> Result<(), BoundaryError> {
+        self.release_reporting(authorization, enforcer).map(|_| ())
+    }
+
+    /// Release, returning what the enforcer actually did.
+    ///
+    /// Identical to [`KillSwitch::release`] except that the [`ReleaseOutcome`]
+    /// is handed back rather than discarded, so a caller can report the truth
+    /// (e.g. distinguish "the rule was deleted" from "the rule pre-existed and
+    /// was deliberately left in place" — a distinction `Ok(())` erases).
+    ///
+    /// # Errors
+    /// Same as [`KillSwitch::release`].
+    pub fn release_reporting(
+        &mut self,
+        authorization: &AuthorizationManifest,
+        enforcer: &dyn BoundaryEnforcer,
+    ) -> Result<ReleaseOutcome, BoundaryError> {
         if !authorization.is_valid_for(&self.policy.control_use) {
             return Err(BoundaryError::Unauthorized);
         }
@@ -388,17 +650,30 @@ impl KillSwitch {
             return Err(BoundaryError::NotEngaged);
         }
         let receipt = self.receipt.take().ok_or(BoundaryError::NotEngaged)?;
-        enforcer.release(&receipt)?;
+        // Hand the enforcer the scope as well as the receipt: an enforcer that
+        // can re-derive what it owns from the scope need not trust anything the
+        // receipt claims. Implementations that cannot use it ignore it.
+        let outcome = match enforcer.release_scoped(&self.scope, &receipt) {
+            Ok(outcome) => outcome,
+            Err(e) => {
+                // The enforcement is still in place (or its state is unknown);
+                // keep the receipt so a retry is possible.
+                self.receipt = Some(receipt);
+                return Err(e);
+            }
+        };
         let from = self.state;
         self.state = KillSwitchState::Released;
+        // The audited reason records what the enforcer actually did, so the
+        // ledger never says "released" where the truth was "left in place".
         self.record(
             "release",
             from,
             self.state,
             &authorization.source_name,
-            None,
+            Some(format!("outcome={}", outcome.as_str())),
         );
-        Ok(())
+        Ok(outcome)
     }
 
     /// Force engagement via the authorized override path (e.g., to engage from an
@@ -434,7 +709,19 @@ impl KillSwitch {
             );
             return Ok(());
         }
-        let receipt = enforcer.engage(&self.scope)?;
+        let receipt = match enforcer.engage(&self.scope) {
+            Ok(receipt) => receipt,
+            Err(BoundaryError::EnforcementUnverified { receipt, detail }) => {
+                return Err(self.adopt_unverified(
+                    "override_engage",
+                    &authorization.source_name,
+                    receipt,
+                    detail,
+                    Some(reason),
+                ));
+            }
+            Err(other) => return Err(other),
+        };
         self.state = KillSwitchState::Engaged;
         self.receipt = Some(receipt);
         self.record(
@@ -513,6 +800,198 @@ mod tests {
             BoundaryScope::all_egress(),
             BoundaryPolicy::default(),
         )
+    }
+
+    // ---- receipt integrity (unkeyed digest: corruption, not forgery) -------
+
+    #[test]
+    fn a_pristine_receipt_verifies_against_its_scope() {
+        let scope = BoundaryScope::all_egress();
+        let receipt = EnforcementReceipt::new(&scope, "v2;mech=netsh;own=created;rule=X");
+        assert_eq!(receipt.verify_against(&scope), Ok(()));
+    }
+
+    #[test]
+    fn a_tampered_prior_state_is_rejected() {
+        let scope = BoundaryScope::all_egress();
+        let mut receipt = EnforcementReceipt::new(&scope, "v2;mech=netsh;own=created;rule=ours");
+        // Edit the payload without rehashing — the classic naive tamper.
+        receipt.prior_state = "v2;mech=netsh;own=created;rule=all".to_owned();
+        assert!(matches!(
+            receipt.verify_against(&scope),
+            Err(ReceiptIntegrityError::DigestMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn a_receipt_for_another_scope_is_rejected() {
+        let scope = BoundaryScope::all_egress();
+        let other = BoundaryScope::new("other", ["*"]);
+        let receipt = EnforcementReceipt::new(&other, "flowing");
+        assert!(matches!(
+            receipt.verify_against(&scope),
+            Err(ReceiptIntegrityError::ScopeLabelMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn a_truncated_or_zeroed_receipt_id_is_rejected() {
+        let scope = BoundaryScope::all_egress();
+        let mut receipt = EnforcementReceipt::new(&scope, "flowing");
+        receipt.receipt_id = Digest::GENESIS;
+        assert!(matches!(
+            receipt.verify_against(&scope),
+            Err(ReceiptIntegrityError::DigestMismatch { .. })
+        ));
+    }
+
+    // The honest limitation, asserted rather than merely documented: the digest
+    // is UNKEYED, so an attacker who can write a receipt can also write a
+    // matching receipt_id. `verify_against` is a corruption check, not
+    // authentication — this test exists so nobody later mistakes it for one.
+    #[test]
+    fn a_fully_recomputed_forgery_passes_verification_by_design() {
+        let scope = BoundaryScope::all_egress();
+        let forged = EnforcementReceipt::new(&scope, "flowing;rule=anything-at-all");
+        assert_eq!(
+            forged.verify_against(&scope),
+            Ok(()),
+            "an unkeyed digest cannot detect a forgery that rehashes; the \
+             enforcer must validate prior_state's CONTENTS, not its hash"
+        );
+    }
+
+    // ---- tri-state presence bridges to the EgressObserver contract ---------
+
+    #[test]
+    fn presence_maps_to_the_fail_closed_option_bool() {
+        assert_eq!(Presence::Present.as_option_bool(), Some(true));
+        assert_eq!(Presence::Absent.as_option_bool(), Some(false));
+        assert_eq!(
+            Presence::Indeterminate {
+                detail: "exit 1".into()
+            }
+            .as_option_bool(),
+            None,
+            "an unanswerable probe must be None, never Some(false)"
+        );
+        assert!(!Presence::Indeterminate {
+            detail: String::new()
+        }
+        .is_present());
+    }
+
+    #[test]
+    fn release_outcome_only_claims_removal_when_it_happened() {
+        assert!(ReleaseOutcome::Reverted.enforcement_confirmed_gone());
+        assert!(ReleaseOutcome::AlreadyAbsent.enforcement_confirmed_gone());
+        assert!(
+            !ReleaseOutcome::SkippedPreexisting.enforcement_confirmed_gone(),
+            "a skipped release removed nothing; egress may still be severed"
+        );
+        assert!(
+            !ReleaseOutcome::Unreported.enforcement_confirmed_gone(),
+            "an enforcer that only returned Ok(()) proved nothing"
+        );
+    }
+
+    // An enforcer written against the old two-method trait keeps working and is
+    // honest about how little it said.
+    #[test]
+    fn release_scoped_defaults_to_delegating_and_reports_unreported() {
+        let enforcer = FakeEnforcer::new();
+        let scope = BoundaryScope::all_egress();
+        let receipt = enforcer.engage(&scope).unwrap();
+        assert_eq!(
+            enforcer.release_scoped(&scope, &receipt),
+            Ok(ReleaseOutcome::Unreported)
+        );
+        assert!(!enforcer.severed.get());
+    }
+
+    // ---- an unverified engagement is never Ok, but is never lost either ----
+
+    struct UnverifiedEnforcer;
+    impl BoundaryEnforcer for UnverifiedEnforcer {
+        fn engage(&self, scope: &BoundaryScope) -> Result<EnforcementReceipt, BoundaryError> {
+            Err(BoundaryError::EnforcementUnverified {
+                receipt: Box::new(EnforcementReceipt::new(scope, "flowing;rule=ours")),
+                detail: "post-condition probe was indeterminate".to_owned(),
+            })
+        }
+        fn release(&self, _receipt: &EnforcementReceipt) -> Result<(), BoundaryError> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn an_unverified_engage_still_leaves_a_releasable_receipt() {
+        let mut ks = switch();
+        let err = ks.engage(&control_auth(), &UnverifiedEnforcer).unwrap_err();
+        assert!(matches!(err, BoundaryError::EnforcementUnverified { .. }));
+        assert_eq!(
+            ks.state(),
+            KillSwitchState::Engaged,
+            "the enforcement was applied; the switch must not pretend otherwise"
+        );
+        assert!(
+            ks.receipt().is_some(),
+            "dropping the receipt would strand an enforcement nobody can roll back"
+        );
+        let entry = ks.audit_entries().last().expect("the attempt is audited");
+        assert_eq!(entry.event.kind, "engage");
+        assert!(entry
+            .event
+            .reason
+            .as_deref()
+            .is_some_and(|r| r.contains("unverified")));
+        assert!(ks.verify_audit());
+
+        // And it really is releasable.
+        ks.release(&control_auth(), &FakeEnforcer::new()).unwrap();
+        assert_eq!(ks.state(), KillSwitchState::Released);
+    }
+
+    #[test]
+    fn an_unverified_override_engage_is_also_retained_and_audited() {
+        let mut ks = switch();
+        let err = ks
+            .override_engage(&override_auth(), "incident-9", &UnverifiedEnforcer)
+            .unwrap_err();
+        assert!(matches!(err, BoundaryError::EnforcementUnverified { .. }));
+        assert_eq!(ks.state(), KillSwitchState::Engaged);
+        assert!(ks.receipt().is_some());
+        let entry = ks.audit_entries().last().unwrap();
+        assert_eq!(entry.event.kind, "override_engage");
+        assert!(entry
+            .event
+            .reason
+            .as_deref()
+            .is_some_and(|r| r.contains("incident-9") && r.contains("unverified")));
+    }
+
+    // A failed release must not consume the receipt: without it the switch is
+    // Engaged with nothing to roll back, which `rehydrate` itself calls corrupt.
+    #[test]
+    fn a_failed_release_keeps_the_receipt_for_a_retry() {
+        struct FailingRelease;
+        impl BoundaryEnforcer for FailingRelease {
+            fn engage(&self, scope: &BoundaryScope) -> Result<EnforcementReceipt, BoundaryError> {
+                Ok(EnforcementReceipt::new(scope, "flowing;rule=ours"))
+            }
+            fn release(&self, _receipt: &EnforcementReceipt) -> Result<(), BoundaryError> {
+                Err(BoundaryError::Enforcement("netsh unreachable".to_owned()))
+            }
+        }
+        let mut ks = switch();
+        ks.engage(&control_auth(), &FailingRelease).unwrap();
+        let err = ks.release(&control_auth(), &FailingRelease).unwrap_err();
+        assert!(matches!(err, BoundaryError::Enforcement(_)));
+        assert_eq!(ks.state(), KillSwitchState::Engaged);
+        assert!(
+            ks.receipt().is_some(),
+            "a failed release must leave the switch releasable"
+        );
     }
 
     #[test]

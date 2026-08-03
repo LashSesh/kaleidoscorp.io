@@ -17,15 +17,100 @@ ssk-types = { path = "../ssk-types", version = "0.1.0" }
 ssk-boundary = { path = "../ssk-boundary", version = "0.1.0" }
 ssk-capture = { path = "../ssk-capture", version = "0.1.0" }
 ssk-service-host = { path = "../ssk-service-host", version = "0.1.0" }
+# The portable security core. This edge exists so `state_dir` can REUSE the P1
+# store lockdown (`FileReceiptStore::provision*`, `setowner_args`,
+# `lockdown_args`, `Elevation`, the `NOT_ELEVATED` machine code) instead of
+# growing a second copy of security-critical argv. It runs the right way round:
+# `ssk-winhost` (the FFI edge) depends on the portable broker core, never the
+# reverse — the broker stays `#![forbid(unsafe_code)]` and platform-neutral, and
+# P3 hosts it from `ssk-svc`, a binary in this crate.
+ssk-netd-helper = { path = "../ssk-netd-helper", version = "0.1.0" }
+# P3: `ssk-svc`'s composition root builds the broker's `AuthorizationManifest`
+# and its `AuthorizationPolicyTable`. `Broker::recover_privileged` takes the
+# table BY VALUE with no default, so `ActuationAuthority::SelfAsserted` is not
+# expressible from a privileged host -- but the table has to be constructed
+# somewhere, and that somewhere is a binary in this crate. `ssk-signature` sits
+# below `ssk-netd-helper`, which already depends on it, so this adds no crate to
+# the graph and no cycle.
+ssk-signature = { path = "../ssk-signature", version = "0.1.0" }
 tracing = { workspace = true }
+# Process diagnostics for the `ssk-svc` bin target: the subscriber, the durable
+# rotated file sink, and the panic hook. `ssk-diag` has NO workspace
+# dependencies of its own, which is what keeps this edge acyclic — P2 added
+# `ssk-daemon -> ssk-winhost` (the named-pipe peer authenticator), so a shared
+# diagnostics crate that reached back up into `ssk-ipc`/`ssk-daemon` would
+# close a loop. Verified with `cargo tree -p ssk-diag`.
+ssk-diag = { path = "../ssk-diag", version = "0.1.0" }
+# The OS CSPRNG, for the privileged host's lease-id source (`CsprngLeaseIds`).
+# No FFI and no new `unsafe`: on Windows `getrandom` 0.3 calls `ProcessPrng`
+# (bcryptprimitives.dll). Same version `ssk-diag` already pins, so this adds no
+# crate to the graph and no fourth `getrandom` major.
+getrandom = "0.3"
+# `authz_file`: the privileged broker's `(SID, verb)` allow-list is JSON with
+# `deny_unknown_fields`, so an unknown key is a refusal rather than a silently
+# ignored line. Both already in the graph via `ssk-diag`/`ssk-config`.
+serde = { workspace = true }
+serde_json = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = [
     "Win32_Foundation",
     "Win32_Networking_WinSock",
     "Win32_NetworkManagement_IpHelper",
+    # Added for `pipe.rs` (P2). Each is needed by a symbol that was verified to
+    # exist in the vendored windows-sys 0.59.0 source before being enabled:
+    #   Win32_Security               -> GetTokenInformation, RevertToSelf,
+    #                                   TOKEN_USER/TokenUser/TOKEN_QUERY,
+    #                                   SECURITY_ATTRIBUTES, PSID,
+    #                                   PSECURITY_DESCRIPTOR
+    #   Win32_Security_Authorization -> ConvertSidToStringSidW,
+    #                                   ConvertStringSecurityDescriptorToSecurityDescriptorW,
+    #                                   SDDL_REVISION_1 (+ GetSecurityInfo and
+    #                                   ConvertSecurityDescriptorToStringSecurityDescriptorW,
+    #                                   used by the DACL read-back test)
+    #   Win32_System_Pipes           -> ImpersonateNamedPipeClient, and ONLY
+    #                                   that: GetNamedPipeClientProcessId is
+    #                                   deliberately not used (a PID is
+    #                                   recycled; see pipe.rs).
+    #   Win32_System_Threading       -> OpenThreadToken, OpenProcessToken,
+    #                                   GetCurrentThread, GetCurrentProcess
+    #   Win32_System_SystemServices  -> SE_GROUP_USE_FOR_DENY_ONLY and
+    #                                   SE_GROUP_LOGON_ID (P3). Constants only;
+    #                                   both verified present at
+    #                                   Win32/System/SystemServices/mod.rs:1947
+    #                                   and :1951 in the vendored 0.59.0 before
+    #                                   this feature was enabled.
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_System_Pipes",
+    "Win32_System_SystemServices",
+    "Win32_System_Threading",
 ] }
 windows-service = "0.8.1"
+# The Windows named-pipe authentication seam. `ssk-ipc` defines the traits
+# (`PeerAuthenticator`, `PipeFactory`) and owns the *decision*; this crate holds
+# the `unsafe` that implements them. The edge runs the right way round —
+# `ssk-ipc` does not and must not depend on `ssk-winhost` — and it is acyclic:
+# `ssk-ipc`'s transitive closure is ssk-types/ssk-netadmin/ssk-config and their
+# pure dependencies, none of which reach back here.
+#
+# `cfg(windows)` only, so the Linux build of this crate is byte-for-byte
+# unchanged.
+ssk-ipc = { path = "../ssk-ipc", version = "0.1.0" }
+# Forced, not preferred: `ServerOptions::create_with_security_attributes_raw`
+# takes `&self` and returns `io::Result<NamedPipeServer>`, so there is no way to
+# hand a `SECURITY_ATTRIBUTES` pointer into `ssk-ipc` and have that crate make
+# the call. Whoever holds the `unsafe` must also hold tokio and hand back the
+# finished server. Already in the committed Cargo.lock at 1.53.1.
+#
+# P3 adds `rt`, `time` and `io-util` for `privileged.rs`. `ssk-netd-helper`'s
+# `FrameTransport` is deliberately synchronous -- that is what makes the whole
+# privileged protocol testable with no runtime at all -- so this crate owns a
+# current-thread runtime per listener and calls `block_on` per I/O operation.
+# `rt-multi-thread` is deliberately NOT enabled for the library: a work-stealing
+# runtime is exactly the thing `ImpersonationGuard` exists to protect against,
+# and a current-thread runtime cannot hand a listener's thread an unrelated task.
+tokio = { version = "1", features = ["io-util", "net", "rt", "time"] }
 
 # This crate deliberately does NOT do `[lints] workspace = true`: the workspace
 # forbids unsafe_code, and `forbid` cannot be relaxed by an inner attribute.
@@ -39,3 +124,22 @@ unsafe_code = "allow"
 all = { level = "warn", priority = -1 }
 module_name_repetitions = "allow"
 missing_errors_doc = "allow"
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+[target.'cfg(windows)'.dev-dependencies]
+# `pipe.rs`'s tests and `tests/named_pipe_auth.rs` drive the real FFI against a
+# real pipe: they need a runtime to create/connect a `NamedPipeServer`,
+# `#[tokio::test]` to express it, and `io-util` to observe that an
+# unauthenticated peer is hung up on rather than answered.
+tokio = { version = "1", features = [
+    "macros",
+    "rt-multi-thread",
+    "time",
+    "io-util",
+] }
+# `privileged.rs`'s tests build a `ClientHello` frame by hand, so the assertion
+# that the transport reads what a real client wrote does not share an encoder
+# with the transport under test.
+ciborium = { workspace = true }

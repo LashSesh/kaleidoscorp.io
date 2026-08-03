@@ -13,7 +13,9 @@ serde_json.workspace = true
 ciborium.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
-rand.workspace = true
+# `rand` used to be here for `auth::SessionToken::generate`. The token was
+# minted per connection, never transmitted and never compared; it is gone (see
+# `auth.rs`), and so is the dependency.
 tokio = { version = "1", features = [
     "net",
     "rt-multi-thread",

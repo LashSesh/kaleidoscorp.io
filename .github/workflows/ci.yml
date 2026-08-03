@@ -8,17 +8,37 @@ permissions:
   contents: read
 
 jobs:
+  # ---------------------------------------------------------------------------
+  # The four core gates -- `fmt --check`, `clippy -D warnings`,
+  # `build --workspace --all-targets`, `test --workspace` -- run on BOTH
+  # ubuntu-latest and windows-latest. Windows is a first-class target, not a
+  # smoke test.
+  #
+  # `fail-fast: false` is deliberate: a failure on one OS must never cancel the
+  # other leg. The *difference* between the two legs is the signal this matrix
+  # exists to produce, so both legs must always report.
+  # ---------------------------------------------------------------------------
   fmt_lint:
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       - run: cargo fmt --all -- --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
 
   build_test:
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - uses: dtolnay/rust-toolchain@stable
@@ -26,13 +46,22 @@ jobs:
       - run: cargo build --workspace --all-targets
       - run: cargo test --workspace
 
+  # `PROPTEST_CASES=32 cargo test` (inline env-var prefix) is POSIX-shell-only
+  # syntax and is a parse error under PowerShell, so it is set via `env:`
+  # instead -- portable across every runner shell.
   proptest_smoke:
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-      - run: PROPTEST_CASES=32 cargo test --workspace
+      - run: cargo test --workspace
+        env:
+          PROPTEST_CASES: 32
 
   replay_vectors:
     runs-on: ubuntu-latest
@@ -50,15 +79,30 @@ jobs:
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       - run: cargo test -p ssk-interop
 
+  # Runs on both OSes: the schema export goes through the `ssk` CLI, which is a
+  # shipped Windows binary, so a Windows-only break in that path must be caught
+  # here. The redirect + `test -s` are POSIX constructs, so the step declares
+  # `shell: bash` (available on GitHub's Windows runners via Git Bash). The
+  # export target is a relative path inside the checkout rather than the
+  # Unix-only `/tmp` -- and rather than `$RUNNER_TEMP`, which on Windows is a
+  # backslash-separated path that Git Bash would have to round-trip.
   config_schema_guard:
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       - run: cargo test -p ssk-config schema_snapshot_stable
-      - run: cargo run -p ssk-cli -- config schema --json > /tmp/ssk-config-schema.json
-      - run: test -s /tmp/ssk-config-schema.json
+      - name: Export config schema and assert it is non-empty
+        shell: bash
+        run: |
+          cargo run -p ssk-cli -- config schema --json > ssk-config-schema.json
+          test -s ssk-config-schema.json
+          rm -f ssk-config-schema.json
 
   breaking_change_guard:
     runs-on: ubuntu-latest
@@ -104,12 +148,16 @@ jobs:
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       - run: cargo test -p ssk-faultscan
 
+  # cargo-audit / cargo-deny are pinned to exact versions. An unpinned
+  # `cargo install --locked` picks up whatever is newest at job start, which
+  # makes an unrelated upstream release able to turn CI red (or, worse, green)
+  # with no commit in this repo. Bump these deliberately.
   cargo_audit:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - uses: dtolnay/rust-toolchain@stable
-      - run: cargo install cargo-audit --locked
+      - run: cargo install cargo-audit --version 0.22.2 --locked
       - run: cargo audit --deny warnings
 
   cargo_deny:
@@ -117,23 +165,57 @@ jobs:
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - uses: dtolnay/rust-toolchain@stable
-      - run: cargo install cargo-deny --locked
+      - run: cargo install cargo-deny --version 0.20.2 --locked
       - run: cargo deny check
 
   # Real Windows validation for the privileged `ssk-winhost` backends (the
-  # BoundaryEnforcer / TrafficSource / PrivilegedHelper "hands"). This compiles
-  # the #[cfg(windows)] FFI with the real MSVC toolchain, lints it (clippy sees
-  # the Windows code paths the Linux jobs never compile), builds the `ssk` CLI
-  # and `ssk-svc` service host for Windows, and runs the crate's pure tests
-  # natively on Windows. Privileged, Administrator-only integration (installing
-  # a firewall rule / a real service) is not exercised here — that is the
-  # operator validation documented in RUNBOOK_WINDOWS.md.
+  # BoundaryEnforcer / TrafficSource / PrivilegedHelper "hands"): it builds the
+  # `ssk` CLI alongside the crate so the shipped Windows binaries are exercised
+  # as a unit. The workspace-wide Windows legs of `fmt_lint` / `build_test`
+  # above now also cover this crate; this job is retained as a fast, narrowly
+  # scoped signal that names the failing area directly instead of inside a
+  # 44-crate workspace run. Privileged, Administrator-only integration
+  # (installing a firewall rule / a real service) is not exercised here -- that
+  # is the operator validation documented in RUNBOOK_WINDOWS.md.
   windows_backends:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       - run: cargo build -p ssk-winhost -p ssk-cli
       - run: cargo clippy -p ssk-winhost --all-targets -- -D warnings
       - run: cargo test -p ssk-winhost
+
+  # Per-crate Windows gates for the four crates that had never been compiled or
+  # run on Windows in CI before this job existed: the IPC transport, the daemon,
+  # the privileged broker, and the GUI bridge.
+  #
+  # These are REAL gates. In particular `ssk-netd-helper` is known to fail 8 of
+  # its 12 `p0_broker` tests on an *unelevated* Windows box (an icacls/DACL
+  # self-lockout in `store.rs`, see WINDOWS_PRODUCT_ROADMAP.md 1.2 / 5.2). A
+  # GitHub windows-latest runner executes as an administrator, so this job is
+  # the experiment that answers whether the failure is an unelevated-caller
+  # artifact or a real defect. It is deliberately NOT `continue-on-error`: a red
+  # result here is the answer we are asking for, not a badge problem to hide.
+  # The fix itself is P1 scope.
+  #
+  # `fail-fast: false` so one crate's failure does not suppress the other three
+  # crates' results.
+  windows_crate_gates:
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        crate: [ssk-ipc, ssk-daemon, ssk-netd-helper, ssk-tauri-bridge]
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - run: cargo build -p ${{ matrix.crate }} --all-targets
+      - run: cargo clippy -p ${{ matrix.crate }} --all-targets -- -D warnings
+      - run: cargo test -p ${{ matrix.crate }}

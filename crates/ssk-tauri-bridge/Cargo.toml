@@ -32,6 +32,7 @@ thiserror = { workspace = true }
 [dev-dependencies]
 ssk-signature = { path = "../ssk-signature", version = "0.1.0" }
 ssk-capture = { path = "../ssk-capture", version = "0.1.0" }
+ssk-field-tensor = { path = "../ssk-field-tensor", version = "0.1.0" }
 ssk-mpk = { path = "../ssk-mpk", version = "0.1.0" }
 ssk-service-host = { path = "../ssk-service-host", version = "0.1.0" }
 

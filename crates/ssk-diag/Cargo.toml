@@ -1,0 +1,42 @@
+[package]
+name = "ssk-diag"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# ssk-diag — the process-diagnostics floor: the tracing subscriber, the durable
+# rotated log sink, the panic hook / crash record, and the OS-CSPRNG health
+# probe. One implementation, linked by all three shipped binaries (`ssk`,
+# `sskd`, `ssk-svc`).
+#
+# It has NO workspace dependencies, deliberately. `ssk-svc` is a bin target of
+# `ssk-winhost`, and P2 added the edge `ssk-daemon -> ssk-winhost` (the named-pipe
+# peer authenticator), so anything `ssk-winhost` links must sit strictly below it.
+# A leaf crate cannot participate in a cycle at all, which is the cheapest way to
+# guarantee that -- and it is why the CLI's `Layout::resolve()` (which reads
+# `ssk_ipc::paths::state_dir()`) stayed in `ssk-cli` while `Layout` itself moved
+# here.
+
+[dependencies]
+tracing = { workspace = true }
+# `json` on top of the workspace's `fmt`/`env-filter`: the durable sink is a
+# machine contract (docs/OBSERVABILITY.md), so it is JSON, not prose. Pulls only
+# `serde_json`, which is already in the graph.
+tracing-subscriber = { workspace = true, features = ["json"] }
+# The rolling, retention-pruned, non-blocking file sink. MIT (tokio-rs/tracing),
+# already on deny.toml's allow-list and already in Cargo.lock at 0.2.5.
+tracing-appender = "0.2"
+serde = { workspace = true }
+serde_json = { workspace = true }
+# The OS CSPRNG, with no FFI and no new `unsafe`. Resolves to the 0.3.4 already
+# in `Cargo.lock` (via rand_core 0.9), so this adds zero crates and no fourth
+# `getrandom` major. On Windows it calls `ProcessPrng` (bcryptprimitives.dll) --
+# the documented successor to `RtlGenRandom` and `BCryptGenRandom`; on Linux
+# `getrandom(2)`.
+getrandom = "0.3"
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+[lints]
+workspace = true

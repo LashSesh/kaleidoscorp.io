@@ -14,7 +14,7 @@ The workspace follows the SSK Ω separation model:
 - `ssk-faultscan`: chaos fault injection, recovery drills, and playbook automation
 - `ssk-netadmin`: in-process network administration layer — real, policy-driven route **planning** (adapter-free, `no_std`-friendly)
 - `ssk-netcore`: real route **execution** — Direct/SOCKS5/HTTP-CONNECT/TLS egress, DNS-override resolution, health probing (closes SSKΩ-7)
-- `ssk-ipc`: request/response protocol (Unix socket; Windows named-pipe path written but unverified in CI) between `ssk-cli` and `sskd`
+- `ssk-ipc`: request/response protocol between `ssk-cli` and `sskd`. Unix domain socket: server **and** client. Windows named pipe: **server only** — verified working on Windows 11 on 2026-08-02 (`sskd.exe` bound `\\.\pipe\kaleidoscorp-sskd` and returned a valid `Response::Status` to an external client over the CBOR framing), but no named-pipe client exists in the tree, so the CLI control plane cannot reach it on Windows (P2)
 - `ssk-daemon`: `sskd` — the real local system service: state machine, real `ssk-netcore`-backed activation, persisted hash-chained audit ledger
 
 Data path: Intent -> Orbit -> Locator -> BCIK -> GateVector -> Tensor -> Focus -> Replay. This deterministic core (`ssk-runtime`) stays adapter-free and never touches a real network — that responsibility is layered below it, in `ssk-daemon`/`ssk-netcore`.
@@ -23,9 +23,16 @@ Observability path: Runtime event envelope (`run_id`, `replay_id`, `seeded`, `ep
 
 ## Network Administration Layer (`ssk-netadmin` + `ssk-netcore`)
 
-`ssk-netadmin` plans; `ssk-netcore` executes. Together they sit between `sskd` and all
-external connections, providing policy-driven traffic steering without any third-party
-proxy software:
+`ssk-netadmin` plans; `ssk-netcore` executes. Together they sit between `sskd` and the
+connections `sskd` itself opens, providing policy-driven egress:
+
+> **Scope correction (2026-08-02).** This layer does **not** sit between local applications and the
+> network, and it steers no third-party traffic. There is no ingress: no proxy listener, no
+> WFP/WinDivert/LSP/TUN hook, no PAC, no proxy-settings writer. The only connections it sees are the
+> ones `ssk activate --dest host:port` asks for, and no application bytes are written through them
+> (`EgressSession::transport_mut`, `crates/ssk-netcore/src/session.rs:63`, has zero callers).
+> Building ingress and dispatch is P4 of `docs/WINDOWS_PRODUCT_ROADMAP.md`.
+
 
 ```
 ssk-runtime

@@ -28,7 +28,19 @@ allow = [
 confidence-threshold = 0.8
 
 [bans]
-# Deny multiple versions of the same crate to avoid supply-chain confusion.
+# Duplicate versions are reported but NOT denied. This is a deliberate,
+# time-boxed exception, not an oversight: measured with
+# `cargo tree --duplicates --workspace --target all` against the committed
+# Cargo.lock on 2026-08-02, the graph carries 14 crate names at 30 versions --
+# cpufeatures, getrandom (0.2/0.3/0.4), linux-raw-sys, r-efi, rand (0.8/0.9),
+# rand_chacha, rand_core, rustix (0.38/1.1), serde_spanned, syn (2/3),
+# toml (0.8/1.1), toml_datetime, windows-sys (0.52/0.59/0.61) and winnow.
+# All of them are transitive and most are inherited from a single laggard
+# (proptest pulls rand 0.9 against the workspace's rand 0.8; ring pins
+# windows-sys 0.52; ssk-ipc pins rustix 0.38 against tempfile's 1.1).
+# Flipping this to "deny" today turns CI red without fixing anything, so the
+# collapse is scheduled as P6 repo hygiene in docs/WINDOWS_PRODUCT_ROADMAP.md.
+# Do not set this to "deny" before those upgrades land.
 multiple-versions = "warn"
 # Deny wildcard dependencies.
 wildcards = "deny"

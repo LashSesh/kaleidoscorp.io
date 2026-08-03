@@ -1,5 +1,55 @@
 # RELEASE_BLOCKER_REGISTER.md
 
+> ## STATUS BOX — 2026-08-02 · this register is no longer the source of truth
+>
+> **Read [`docs/WINDOWS_PRODUCT_ROADMAP.md`](docs/WINDOWS_PRODUCT_ROADMAP.md) first.** That document
+> was written from the first execution of this workspace on real Windows 11 hardware (de-DE,
+> unelevated, rustc 1.95.0) and supersedes the forward-looking parts of this register. Everything
+> below this box is a **dated audit artifact from 2026-07-04** plus a same-day implementation update.
+> Its value is that it records what was true when it was written; it is not being rewritten, and it
+> should not be read as current status.
+>
+> The first real Windows run moved entries here in **both** directions. Specifically:
+>
+> **Entries that were too pessimistic (the code is better than recorded):**
+>
+> - **RB-G2's named-pipe claim — WRONG, now corrected.** RB-G2 states the Windows named-pipe path
+>   *"is `#[cfg(windows)]` and never compiled/tested (`crates/ssk-daemon/src/main.rs:78-93`,
+>   `crates/ssk-ipc/src/server.rs:123-127`)"*. **The named-pipe server works.** `sskd.exe` binds
+>   `\\.\pipe\kaleidoscorp-sskd`; an auditor drove it from a hand-written .NET client through the
+>   CBOR framing and received a valid 116-byte `Response::Status` DTO. The source doc-comments that
+>   carried the "not compiled or tested" caveat have been replaced with what is actually true.
+> - **RB-A3 (SSKΩ "all met" self-contradiction) — reconciled.** No rung row in
+>   `docs/OMEGA_CORE_CONFORMANCE_SPEC.md` carries ⚠️ under an "all met" summary any more; the summary
+>   is explicitly marked superseded, and SSKΩ-7 / SSKΩ-9 have been regraded ⚠️ to match their own row
+>   text and the Windows measurements.
+> - **RB-E2 (no test exercises a real network effect) — partially closed.** `ssk-netcore` has real
+>   TCP / RFC 1928-1929 SOCKS5 / HTTP-CONNECT / `rustls` TLS / DNS tests against live listeners.
+>
+> **Entries that were too optimistic, or that the run made worse:**
+>
+> - **RB-A1's "CLOSED" is over-credited.** A real *dialer* exists; the *product* does not. There is
+>   still **no traffic ingress of any kind** (no proxy listener, no WFP/WinDivert/LSP/TUN, no PAC),
+>   and **no bytes cross an established session** — `EgressSession::transport_mut`
+>   (`crates/ssk-netcore/src/session.rs:63`) has zero callers. Roadmap P4.
+> - **RB-C2 (IPC peer-cred reject untested; Windows SID check unimplemented) — worse than recorded.**
+>   On Windows the server performs **no peer check at all**, and the pipe is created with no
+>   `SECURITY_ATTRIBUTES`. Two auditors independently drove privileged verbs from unrelated,
+>   unelevated PowerShell processes with zero credentials; one activated a nonexistent profile and
+>   received `Protected` plus a hash-chained audit entry. Filed as **SEC-3** in the roadmap.
+> - **RB-G1 (release ships source, not binaries) — still open, unchanged.** `release.yml:20` tars
+>   `crates Cargo.toml README.md docs`; the built binaries are discarded. There is no Windows
+>   artifact at all. Roadmap P6.
+> - **"Cross-platform scope" — still open, and quantified.** 13 of 14 CI jobs ran `ubuntu-latest`;
+>   the single `windows-latest` job covered 1 of 44 crates. On Windows, all four of the repo's own
+>   gates failed. Roadmap P0.
+>
+> **Findings this register never contained** (all new on 2026-08-02, all in the roadmap): **SEC-1**
+> forged rollback receipt drives an elevated `netsh delete rule` (Critical); **SEC-2** the documented
+> install procedure hands SYSTEM to a user-writable binary (Critical); the kill-switch cannot engage
+> on non-English Windows; `ssk doctor` always fails on Windows; `ssk --version` errors out; only one
+> daemon instance can ever exist; and ~29% of the workspace's `src` LOC links into no shipped binary.
+
 > **IMPLEMENTATION UPDATE (post-audit, same day).** RB-A1, RB-A2, and RB-B2 below are now **CLOSED** by a follow-up implementation pass — read this box first, then the (otherwise unmodified, still historically accurate at the time it was written) register below.
 >
 > - **RB-A1 (no data plane) — CLOSED.** A new crate, `crates/ssk-netcore/`, implements a real `RouteExecutor`: real `TcpStream` Direct connect, a real SOCKS5 (RFC 1928/1929) client handshake, a real HTTP CONNECT handshake, a real `rustls` TLS handshake verified against the OS-native trust store, and a real UDP/TCP DNS query with RFC 1035 name (de)compression. `ssk-daemon`'s `MockDataPlane` was deleted from the production binary (`crates/ssk-daemon/src/main.rs`); `activate_profile` now requires a real `dest_host`/`dest_port` and only reports `Protected` after `ssk-netcore` really connects (`crates/ssk-daemon/src/supervisor.rs`). Reachable end-to-end via `ssk activate --profile <p> --dest <host:port>` (`crates/ssk-cli/src/main.rs`). Proven by real (not mocked) tests: `crates/ssk-netcore/src/*.rs` (21 tests against real local listeners / wire-protocol-compliant fake servers), `crates/ssk-daemon/tests/round_trip.rs` (spawns the real `sskd` binary, drives it to really connect to a listener in the test process), `crates/ssk-cli/tests/activate_real_egress.rs` (spawns real `ssk` + `sskd` binaries end-to-end). **Still open**: `ssk-capture` (arbitrary local traffic classification — a separate, higher-privilege layer, not started without explicit sign-off on its blast radius), true multi-hop chaining beyond the tested single/two-hop cases, a config-driven multi-profile model, a system-wide (not per-session) kill switch, OS service integration.

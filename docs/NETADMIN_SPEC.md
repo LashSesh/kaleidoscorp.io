@@ -1,11 +1,34 @@
 # ssk-netadmin — Network Administration Layer Specification
 
+> **Status (2026-08-02) — this is a design specification, not a description of delivered behaviour.**
+> The **planning** half described here is real, tested and reachable. The **Proxifier-replacement**
+> framing is not met and, on the evidence below, is not close to met:
+>
+> - **There is no traffic ingress anywhere in the workspace.** No proxy listener, no
+>   WFP/WinDivert/LSP/TUN hook, no PAC file, no proxy-settings writer. `ssk-netadmin` never
+>   intercepts anything; the word "intercepts" in the Positioning diagram below was aspirational and
+>   has been corrected.
+> - **`FlowDescriptor` is not derived from a real flow.** The daemon hardcodes `RiskLevel::Low` and
+>   `ProtocolKind::Tcp`, so every non-`Direct` executor path is structurally unreachable in
+>   production. `ssk-capture`'s only production `TrafficSource` is a hardcoded CLI fixture.
+> - **No application bytes move.** `EgressSession::transport_mut`
+>   (`crates/ssk-netcore/src/session.rs:63`) has zero callers of any kind, so an established session
+>   carries nothing. `ssk activate` requires an operator-typed `--dest` and opens exactly one socket.
+> - **Rules are not config-driven.** The validated `AppConfig` is not passed into `Supervisor::new`;
+>   the adapter registry is a hardcoded literal.
+>
+> What *is* real: the policy engine, the route orchestrator, the hash-chained session and audit
+> ledgers, and — in the sibling crate `ssk-netcore` — genuine Direct/SOCKS5/HTTP-CONNECT/TLS/DNS
+> handshakes against live listeners. Read this document as the target, and
+> `docs/WINDOWS_PRODUCT_ROADMAP.md` (P4 for ingress and dispatch) as the current status.
+
 ## Purpose
 
 `ssk-netadmin` is the in-process network administration layer for the SSK Ω runtime.
-It replaces the need for third-party proxy/routing software (Proxifier and equivalents)
-by providing a cryptographically-secured, policy-driven traffic-steering subsystem
-that operators control entirely through the SSK CLI and configuration system.
+Its **intended** role is to remove the need for third-party proxy/routing software (Proxifier and
+equivalents) by providing a cryptographically-secured, policy-driven traffic-steering subsystem
+that operators control entirely through the SSK CLI and configuration system. Today it delivers the
+decision half of that role only — see the status box above.
 
 ---
 
@@ -15,8 +38,8 @@ that operators control entirely through the SSK CLI and configuration system.
 ssk-runtime  (produces outbound connection intents)
       │
       ▼
-ssk-netadmin  (intercepts, classifies, enforces policy, routes)
-      │
+ssk-netadmin  (classifies, enforces policy, plans a route)
+      │        ── it does NOT intercept; there is no ingress (P4)
       ├─► Direct TCP/IP
       ├─► SOCKS5 proxy
       ├─► HTTP CONNECT tunnel
@@ -182,10 +205,17 @@ pub trait DataPlaneAdapter: Send + Sync {
 }
 ```
 
-A runtime `connect()` ships in Phase 3 as `ssk-netcore::AdapterRuntime::connect`
-(see `docs/DESKTOP_CLIENT_ARCHITECTURE.md` section G), layered *alongside* this
-descriptor trait — not added to it — so `ssk-netadmin` stays a pure,
-`no_std`-friendly decision/descriptor crate with no socket or async dependency.
+The runtime connect half **now exists**, in the sibling crate `ssk-netcore`, as
+`RouteExecutor` (not the `AdapterRuntime::connect` name this document originally
+projected). It is layered *alongside* this descriptor trait — not added to it —
+so `ssk-netadmin` stays a pure, `no_std`-friendly decision/descriptor crate with
+no socket or async dependency. `ssk-netcore` performs real TCP connects, real
+RFC 1928/1929 SOCKS5, HTTP-CONNECT and `rustls` TLS handshakes, and real DNS
+queries, tested against live listeners.
+
+The gap that remains is not the dial — it is everything on either side of it:
+nothing feeds `RouteExecutor` a flow it did not get from an operator's
+`--dest`, and nothing reads or writes the transport it returns.
 
 | Adapter | Protocol |
 |---------|---------|
@@ -237,11 +267,21 @@ ssk net-admin audit-dump [--session <id>] [--since <timestamp>]
 
 ## Acceptance Criteria for "Proxifier Replacement Maturity"
 
-1. **Policy-driven routing without third-party software** — all adapter types functional, CLI-operable
-2. **Demonstrable interop/conformance** — `ssk interop conformance` passes all 7 reference profiles
-3. **Reproducible incident recovery under fault** — `ssk chaos drill` passes without data-plane bypass
-4. **Full CLI and telemetry operability** — `flow-inspect`, `route-trace`, `audit-dump` produce correct output
-5. **Hash-chain forensics** — `SessionLedger::verify()` and `AuditLedger::verify()` detect any tampering
+These are **targets, none of which is currently claimed as met** — status as of 2026-08-02 in the
+right-hand column.
+
+| # | Criterion | Status |
+|---|---|---|
+| 1 | **Policy-driven routing without third-party software** — all adapter types functional, CLI-operable | **Not met.** `ssk-netcore` performs real handshakes for every adapter kind, but nothing routes third-party traffic: there is no ingress, and no bytes cross an established session. |
+| 2 | **Demonstrable interop/conformance** — `ssk interop conformance` passes all 7 reference profiles | Scoped to the in-process model. The suite exercises this crate's own encoder/decoder against reference profiles; no independent third-party implementation has ever been on the other end. |
+| 3 | **Reproducible incident recovery under fault** — `ssk chaos drill` passes without data-plane bypass | Partial — there is no data plane to bypass, and the CLI drill runner is a stub over a mimicked gate heuristic (see `RELEASE_BLOCKER_REGISTER.md` RB-E3). |
+| 4 | **Full CLI and telemetry operability** — `flow-inspect`, `route-trace`, `audit-dump` produce correct output | These are local, non-daemon commands and work. The daemon-backed verbs they sit alongside are unreachable on Windows (no named-pipe client, P2). |
+| 5 | **Hash-chain forensics** — `SessionLedger::verify()` and `AuditLedger::verify()` detect any tampering | The chain and its verification are real and the daemon now records real entries, so the verification is no longer vacuous. |
+
+A sixth criterion is missing from the original list and is the one that actually gates the claim:
+**an automated end-to-end test in which a real application's traffic enters SSK, is classified by a
+config-declared rule, is dispatched through a config-declared adapter, and arrives.** No such test
+exists; writing the capability it would test is P4 of `docs/WINDOWS_PRODUCT_ROADMAP.md`.
 
 ---
 

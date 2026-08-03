@@ -50,7 +50,7 @@ fn doctor_json_fails_closed_when_entropy_missing() {
 }
 
 #[test]
-fn system_run_clean_fixture_emits() {
+fn system_run_clean_fixture_holds_without_parallax_or_replay_evidence() {
     let temp = tempfile::tempdir().expect("tempdir");
     let output = Command::new(binary())
         .current_dir(temp.path())
@@ -60,7 +60,9 @@ fn system_run_clean_fixture_emits() {
 
     assert!(output.status.success());
     let stdout = String::from_utf8(output.stdout).expect("utf8 stdout");
-    assert!(stdout.contains("\"decision\": \"emit\""));
+    assert!(stdout.contains("\"decision\": \"hold\""));
+    assert!(stdout.contains("a3_parallax_inconsistent"));
+    assert!(stdout.contains("a8_replay_divergent"));
     assert!(stdout.contains("\"ledger_ok\": true"));
 }
 
@@ -120,7 +122,14 @@ fn system_run_unhealthy_host_holds_not_denies() {
     assert!(output.status.success());
     let stdout = String::from_utf8(output.stdout).expect("utf8 stdout");
     assert!(stdout.contains("\"decision\": \"hold\""));
-    assert!(stdout.contains("\"host_downgraded\": true"));
+    // Not `"host_downgraded": true`: with no persisted signature baseline
+    // wired into this fixture path, the signature gate already holds on its
+    // own (`signature_baseline_missing`), so the Crown's own decision starts
+    // at Hold rather than a would-be Emit that host-health then downgrades.
+    // The reason this test cares about — an unhealthy host is named,
+    // end to end, and never escalates to a Deny — still holds regardless of
+    // which axis got there first.
+    assert!(stdout.contains("service_host_not_emittable"));
 }
 
 #[test]

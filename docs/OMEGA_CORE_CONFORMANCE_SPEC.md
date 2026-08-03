@@ -260,6 +260,27 @@ earlier pass without recheck).
 Verbatim from the PDF, Chapter 22 ("Conformance is staged... a build may claim level *k* only
 if all tests for levels 0..*k* pass"):
 
+> **Reconciliation (2026-08-02).** The specific contradiction filed as RB-A3 — an "all met" summary
+> sitting above a ⚠️ SSKΩ-7 row — is resolved: the summary line in Section A is explicitly marked
+> superseded, and SSKΩ-7 had already been rewritten away from a bare ⚠️. But the table had drifted
+> the other way: **every** row read ✅, including two whose own text described partial fulfilment.
+> Those two are corrected to ⚠️ below.
+>
+> - **SSKΩ-7** — the row already said "met for the adapter/health-probing half". A half is not a
+>   level. The other half (the funnel-DAG wired to a production path) is still open, and the first
+>   Windows run added a further gap the row did not capture: no bytes traverse an established
+>   session at all (`EgressSession::transport_mut`, `crates/ssk-netcore/src/session.rs:63`, has zero
+>   callers), and there is no traffic ingress of any kind.
+> - **SSKΩ-9** — "production-hardened runtime profile" is contradicted by measurement. On the first
+>   run of this workspace on real Windows 11 hardware (2026-08-02), `cargo build --all-targets`,
+>   `cargo test --workspace`, `cargo clippy -- -D warnings` and `cargo fmt --check` all failed; the
+>   release workflow ships source rather than binaries; `Cargo.lock` was untracked with no toolchain
+>   pin, no MSRV and no `[profile.release]`; and there is no `LICENSE` file despite `Cargo.toml`
+>   declaring Apache-2.0. Restoring this rung is P0 + P6 of `docs/WINDOWS_PRODUCT_ROADMAP.md`.
+>
+> The remaining ✅ rows are core-decision-model grades and are read as such — this ladder was never
+> a network-product ladder. See `docs/WINDOWS_PRODUCT_ROADMAP.md` for measured product status.
+
 | Level | PDF Requirement | Current status |
 |-------|-----------------|-----------------|
 | SSKΩ-0 | Typed model: `ssk-types`/`ssk-core` compile; Core, Identity Plane, Locator Plane exist and are separately typed. | ✅ met |
@@ -269,9 +290,9 @@ if all tests for levels 0..*k* pass"):
 | SSKΩ-4 | Gate vector + boundary residues: twelve gates, fail-closed, typed residues, PCH projection checks. | ✅ met (Phase 3: twelve real gate structs, no early-break, typed `ResidueKind` on every fail path, `HypercubeGate` drives the real 9-axis PCH) |
 | SSKΩ-5 | Persistent Stitch Tensor + audit: hash-chained append, storage backends, tensor-preservation theorem tested. | ✅ met — `ssk-tensor`'s real `StitchTensor`/`apply_sorted`/`StorageBackend` (Phase 4), now wired into the live pipeline (`run_to_outcome` materializes via `apply_sorted`, hardening iter. A) and into `Connection<GatePassed>::materialize` (hardening iter. C); the preservation theorem is proven end-to-end (`failed_gate_preserves_the_tensor` in `tests/conformance.rs`) |
 | SSKΩ-6 | Concave Reanalysis Focus + replay: class reconstruction, replay determinism harness green. | ✅ met — real `FocusEngine`/`FocusReport` and a genuinely re-executing `ReplayEngine` (Phase 5), and `run_to_outcome` now drives the full pipeline (BCIK crossing → `StitchTensor` materialization → `FiberExecutor` response capture → `FocusEngine`) to a real 3-variant `RunOutcome`, tested deterministic and fail-closed (hardening iteration A) |
-| SSKΩ-7 | Locator pool + relay-fabric adapters: real egress adapters behind the async edge, health probing. | ✅ met for the adapter/health-probing half — `ssk-netcore` now provides a real `RouteExecutor` (real Direct/SOCKS5/HTTP-CONNECT/TLS handshakes + real DNS query, real `ProbeReport` health probing), reachable end-to-end via `ssk activate --dest`; see `crates/ssk-netcore/`, `AUDIT_PREVIOUS_FINAL_CLAIMS.md`, `SSKΩ_CONFORMANCE_REEVALUATION.md`. The funnel-DAG (`StitchEdge`/`LocatorGraph`/`HyperEdge`/`select_path`, Phase 6) remains a tested in-memory algorithm not yet wired to a production path — real multi-hop routing beyond two explicit hops and the funnel-DAG's own dynamic path selection are still open. |
+| SSKΩ-7 | Locator pool + relay-fabric adapters: real egress adapters behind the async edge, health probing. | ⚠️ **partial.** The adapter/health-probing half is met: `ssk-netcore` provides a real `RouteExecutor` (real Direct/SOCKS5/HTTP-CONNECT/TLS handshakes + real DNS query, real `ProbeReport` health probing), reachable end-to-end via `ssk activate --dest`; see `crates/ssk-netcore/`, `AUDIT_PREVIOUS_FINAL_CLAIMS.md`, `SSKΩ_CONFORMANCE_REEVALUATION.md`. Open: (a) the funnel-DAG (`StitchEdge`/`LocatorGraph`/`HyperEdge`/`select_path`, Phase 6) is a tested in-memory algorithm not wired to a production path, and real multi-hop routing beyond two explicit hops does not exist; (b) **no bytes traverse an established session** — `EgressSession::transport_mut` (`crates/ssk-netcore/src/session.rs:63`) has zero callers; (c) there is no traffic ingress, so the executor only ever sees a destination the operator typed. (b) and (c) are P4 of `docs/WINDOWS_PRODUCT_ROADMAP.md`. |
 | SSKΩ-8 | Full simulation + conformance testbed: privacy metric tests, defensive adversary sim, all vectors. | ✅ met — `FaultKind`/`Faultscan` detection taxonomy (Phase 7); `LinkabilityEstimator` metric + residue-visibility-completeness tests (`ssk-privacy`, hardening iter. E); and the cross-cutting property-obligation suite (`facet_recovers_to_core`, `no_silent_loss`, `failed_gate_preserves_the_tensor`, `decision_core_is_deterministic` — `tests/conformance.rs`) all green (Section W) |
-| SSKΩ-9 | Production-hardened runtime profile: dissolution/TTL sweeps, ledger verification, deployment audit, documented limits. | ✅ met — `DissolutionManager::{is_expired, sweep, finalize_expired}` (real TTL sweep + typed residue finalization, hardening iter. D), the full 12-section validated config schema (Phase 8), and the existing hash-chained ledger `verify()`, all tested |
+| SSKΩ-9 | Production-hardened runtime profile: dissolution/TTL sweeps, ledger verification, deployment audit, documented limits. | ⚠️ **partial.** Real and tested: `DissolutionManager::{is_expired, sweep, finalize_expired}` (TTL sweep + typed residue finalization, hardening iter. D), the full 12-section validated config schema (Phase 8), and the hash-chained ledger `verify()`. **Not met — "production-hardened" and "deployment audit" fail on measurement.** On the first execution of this workspace on real Windows 11 hardware (2026-08-02) all four of the repo's own gates failed: `cargo build --workspace --all-targets` and `cargo test --workspace` did not compile, `cargo clippy --workspace --all-targets -- -D warnings` failed, and `cargo fmt --all -- --check` failed on 152 files. In addition the release workflow ships a source tarball rather than binaries, `Cargo.lock` was untracked with no toolchain pin / no MSRV / no `[profile.release]`, and no `LICENSE` file exists despite `Cargo.toml` declaring Apache-2.0. See `docs/WINDOWS_PRODUCT_ROADMAP.md` §1.1 and §3(c); restoring this rung is P0 + P6. |
 
 **Target of this document: close SSKΩ-3 through SSKΩ-9**, in the phase order of Section V.
 **Result: achieved** — every ladder row above is now `✅ met` (Phases 0-8 + hardening iterations

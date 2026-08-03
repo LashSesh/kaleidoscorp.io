@@ -1,16 +1,55 @@
 #![forbid(unsafe_code)]
 
+//! Local-only IPC authentication.
+//!
+//! # What replaced `SessionToken`
+//!
+//! This module used to mint a random per-connection `SessionToken`, documented
+//! as "required on every mutating request". It was not. It appeared in no
+//! `Request` variant, no DTO and no serialized form anywhere in the tree; the
+//! only production `CommandHandler` bound it as `_token` and never read it.
+//!
+//! Transmitting and verifying it would not have helped: the server mints the
+//! token, on the connection, and hands it to the very peer it is meant to
+//! authenticate. Comparing a value you just gave the peer, over the same
+//! connection, whose peer identity you already know from the transport, proves
+//! only that the peer can echo — zero bits of authentication, plus the
+//! *appearance* of a credential in any future audit.
+//!
+//! A capability token is meaningful only when minted by an authority the caller
+//! cannot reach, over a channel that does not otherwise carry identity. That is
+//! the daemon → broker case, where `ssk-netd-helper` already does it properly
+//! (a pre-shared `BrokerConfig::session_token` compared with
+//! `CapabilityToken::ct_eq`). That layer is real and untouched.
+//!
+//! So the token is gone and [`PeerIdentity`] takes its place on
+//! [`crate::server::CommandHandler`]: the handler now receives what the
+//! transport actually *proved*, not a value it invented.
+
 use serde::{Deserialize, Serialize};
 
-/// Per-session capability token minted at connect and required on every
-/// mutating request (`docs/DESKTOP_CLIENT_ARCHITECTURE.md` section F.5).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SessionToken(pub [u8; 16]);
+/// The verified identity of the peer on the far end of a connection.
+///
+/// Constructed only by a transport's authentication step — `unix::
+/// check_peer_same_user` or `transport_win::check_peer_same_user` — after that
+/// step has established the peer is the same OS principal as this daemon.
+/// Both variants exist on every platform so cross-platform callers (and their
+/// tests) compile everywhere; only one is ever produced at runtime.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum PeerIdentity {
+    /// Unix: the peer's uid, verified equal to this process's uid.
+    Uid(u32),
+    /// Windows: the peer's SID in string form, verified equal to this
+    /// process's SID.
+    Sid(String),
+}
 
-impl SessionToken {
-    #[must_use]
-    pub fn generate() -> Self {
-        Self(rand::random())
+impl std::fmt::Display for PeerIdentity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PeerIdentity::Uid(uid) => write!(f, "uid:{uid}"),
+            PeerIdentity::Sid(sid) => write!(f, "sid:{sid}"),
+        }
     }
 }
 
@@ -22,12 +61,13 @@ impl SessionToken {
 /// crate adds, scoped to `cfg(unix)` only, purely to satisfy that need.
 #[cfg(unix)]
 pub mod unix {
+    use super::PeerIdentity;
     use crate::error::IpcError;
 
     /// Verify that the peer on `stream` is running as the same OS user as
     /// this daemon process. Any other user is rejected — this is the whole
     /// local-only authentication boundary for the Unix transport.
-    pub fn check_peer_same_user(stream: &tokio::net::UnixStream) -> Result<(), IpcError> {
+    pub fn check_peer_same_user(stream: &tokio::net::UnixStream) -> Result<PeerIdentity, IpcError> {
         let cred = stream
             .peer_cred()
             .map_err(|e| IpcError::new("Permission", "IPC_PEER_CRED_FAILED", e.to_string()))?;
@@ -42,25 +82,43 @@ pub mod unix {
                 ),
             ));
         }
-        Ok(())
+        Ok(PeerIdentity::Uid(our_uid))
     }
 }
 
-/// Windows local-only authentication is a documented gap for this phase: full
-/// named-pipe client-SID verification would need a `windows-sys` dependency
-/// that Phase 2 deliberately does not add yet (see
-/// `docs/DESKTOP_CLIENT_ARCHITECTURE.md` section H / F.5). Until that ships,
-/// the named pipe's default DACL (same desktop session) is the only
-/// enforcement on Windows — do not treat this as equivalent to the Unix
-/// peer-credential check.
+/// Windows peer authentication. The FFI half lives in `ssk-winhost` (the one
+/// crate exempt from `unsafe_code = "forbid"`) and is injected here as a
+/// trait object; the *decision* — and its tests — live in this crate. See
+/// [`crate::transport_win`].
+///
+/// The former `windows::CLIENT_SID_CHECK_IMPLEMENTED: bool = false` is gone.
+/// A `bool` constant standing in for a security control is exactly the pattern
+/// this project's audit trail exists to eliminate: it cannot fail closed, it
+/// cannot be exercised by a test, and it read as a decision that had been made.
+/// What replaces it is a required constructor argument — `serve_named_pipe`
+/// will not compile without a real [`crate::transport_win::PeerAuthenticator`],
+/// so "unimplemented" is no longer a state the daemon can be built in.
 #[cfg(windows)]
-pub mod windows {
-    /// Placeholder documenting the known gap; intentionally not implemented.
-    pub const CLIENT_SID_CHECK_IMPLEMENTED: bool = false;
+pub use crate::transport_win::{
+    check_peer_same_user as check_windows_peer, PeerAuthenticator, Sid,
+};
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn peer_identity_displays_its_principal() {
+        assert_eq!(PeerIdentity::Uid(1000).to_string(), "uid:1000");
+        assert_eq!(
+            PeerIdentity::Sid("S-1-5-18".to_owned()).to_string(),
+            "sid:S-1-5-18"
+        );
+    }
 }
 
 #[cfg(all(test, unix))]
-mod tests {
+mod unix_tests {
     use super::*;
 
     #[tokio::test]
@@ -74,7 +132,9 @@ mod tests {
         let _client = client.expect("connect");
         let (server_stream, _addr) = accept_result.expect("accept");
 
-        unix::check_peer_same_user(&server_stream).expect("same-user peer must be accepted");
+        let peer =
+            unix::check_peer_same_user(&server_stream).expect("same-user peer must be accepted");
+        assert!(matches!(peer, PeerIdentity::Uid(_)));
     }
 
     /// Verifying rejection of a genuinely *different* OS user isn't feasible

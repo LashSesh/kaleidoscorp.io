@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use ssk_daemon::supervisor::Supervisor;
-use ssk_ipc::{CommandHandler, DaemonState, Event};
+use ssk_ipc::{CommandHandler, DaemonState, Event, PeerIdentity};
 use ssk_netcore::{AdapterRegistry, NetcoreDataPlane, RouteExecutor};
 use tokio::net::TcpListener;
 
@@ -17,7 +17,16 @@ fn supervisor() -> (Arc<Supervisor>, tempfile::TempDir) {
     let data_plane = Box::new(NetcoreDataPlane::new(Arc::new(RouteExecutor::new(
         AdapterRegistry::new(),
     ))));
-    (Arc::new(Supervisor::new(audit_path, data_plane)), dir)
+    // Kill-switch state is irrelevant to task-death transitions; `NoProvider`
+    // reports `Unknown`, which is what a process with no broker actually knows.
+    (
+        Arc::new(Supervisor::new(
+            audit_path,
+            data_plane,
+            Box::new(ssk_daemon::killswitch::NoProvider),
+        )),
+        dir,
+    )
 }
 
 async fn wait_for_state_changed_to(
@@ -61,14 +70,19 @@ async fn killed_task_transitions_to_degraded_when_a_profile_is_active() {
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let addr = listener.local_addr().expect("addr");
     let accept = tokio::spawn(async move { listener.accept().await });
-    let token = ssk_ipc::SessionToken::generate();
+    // `SessionToken` is gone; the handler now receives the identity the
+    // transport verified.
+    #[cfg(unix)]
+    let peer = PeerIdentity::Uid(0);
+    #[cfg(not(unix))]
+    let peer = PeerIdentity::Sid("S-1-5-21-0-0-0-1000".into());
     sup.handle(
         ssk_ipc::Request::ActivateProfile(ssk_ipc::ActivateProfileRequest {
             profile_id: "default".into(),
             dest_host: Some("127.0.0.1".into()),
             dest_port: Some(addr.port()),
         }),
-        &token,
+        &peer,
     )
     .await;
     assert_eq!(sup.current_state().await, DaemonState::Protected);

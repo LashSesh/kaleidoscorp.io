@@ -27,10 +27,10 @@ against `crates/` on this revision:
 | Kill-switch audit is hash-chained | `BoundaryAuditEntry{seq,prev_hash,entry_hash}`, `verify_audit()` recomputes+links | `ssk-boundary/src/lib.rs:376` | ✅ |
 | Kill-switch is auth-gated | `engage`/`release` require `AuthorizationManifest::is_valid_for(control_use)` | `ssk-boundary/src/lib.rs:283,309` | ✅ |
 | Service lifecycle gate | `ServiceHost::{stage,state,handshake_complete,health,audit_entries}` | `ssk-service-host/src/lib.rs:284+` | ✅ |
-| Session capability token | `struct SessionToken([u8;16])`, `generate()`, minted per named-pipe connection | `ssk-ipc/src/auth.rs:8`, `server.rs:160` | ✅ |
-| Named-pipe transport | `serve_named_pipe(pipe_name, handler)` | `ssk-ipc/src/server.rs:136` | ✅ |
-| **Client-SID check is a gap** | `auth::windows::CLIENT_SID_CHECK_IMPLEMENTED = false` | `ssk-ipc/src/auth.rs:59` | ⚠️ gap |
-| CBOR framing + frame cap | `[u32 len][ciborium body]`, `MAX_FRAME_LEN = 16 MiB` enforced on read | `ssk-ipc/src/framing.rs:15,51` | ✅ (generic) |
+| ~~Session capability token~~ | **REMOVED 2026-08-02.** `SessionToken` was minted per connection and handed to the handler, but was **never transmitted and never verified** — it authenticated nothing. P2 deleted it rather than keep a control that only looked like one. `ssk-netd-helper`'s `CapabilityToken` still exists and is populated by the broker's caller; the transport that mints it is P3 scope. | — | ❌ was theatre |
+| Named-pipe transport | `serve_named_pipe(pipe_name, handler, pipes, auth, limits)` — now takes an injected `PipeFactory` + `PeerAuthenticator` | `ssk-ipc/src/server.rs` | ✅ |
+| **Client-SID check** | `ImpersonateNamedPipeClient` + `TokenUser` in `ssk-winhost`, injected at `sskd`'s composition root; the old `bool` constant is deleted | `ssk-winhost/src/pipe.rs`, `ssk-ipc/src/auth.rs` | ✅ **closed 2026-08-02** (different-OS-user rejection: operator-validated) |
+| CBOR framing + frame cap | `[u32 len][ciborium body]`; P2 bounded the pre-auth allocation to **`MAX_REQUEST_FRAME_LEN = 64 KiB`** (was 16 MiB), plus a connection cap and a read timeout | `ssk-ipc/src/framing.rs:35` | ✅ |
 | Firewall enforcer (real) | `WindowsFirewallEnforcer` impl `BoundaryEnforcer` | `ssk-winhost/src/firewall.rs:486` | ✅ (Windows) |
 | System verdict surface | `SystemPipeline::{evaluate,verify_ledger}`, `SystemVerdict` | `ssk-system/src/lib.rs:81,120,265` | ✅ |
 | Forensic ledger verify | `AuditLedger::verify_against_head` | `ssk-netadmin/src/audit.rs:203` | ✅ |
@@ -174,8 +174,12 @@ Enforced, in order, before the verb runs:
    (e.g. 64 KiB) — a `CommandEnvelope` is tiny; anything larger is hostile → reject pre-decode.
 4. **Strict CBOR [NEW].** All broker DTOs derive `#[serde(deny_unknown_fields)]`; decode rejects
    unknown fields and trailing bytes. No lenient/partial decode of a security command.
-5. **Client-SID [NEW].** (Transport layer, §11) the connection is rejected unless the peer SID is on
-   the allow-list; `CLIENT_SID_CHECK_IMPLEMENTED` becomes a real check.
+5. **Client-SID — DONE 2026-08-02.** (Transport layer, §11) the connection is rejected unless the
+   peer SID matches. Implemented as `ImpersonateNamedPipeClient` + `TokenUser` in `ssk-winhost`,
+   injected into `ssk-ipc` as a `PeerAuthenticator` seam (`ssk-ipc` stays `forbid(unsafe_code)` and
+   owns the *decision*, never the syscall). The `CLIENT_SID_CHECK_IMPLEMENTED` constant is deleted.
+   Note the P2 semantics are **same-user**, matching the Unix twin `check_peer_same_user` — a broader
+   allow-list belongs with P3's SYSTEM/user privilege split.
 
 A response is `BrokerResponse::{Ok(status|payload), Rejected(reason), Failed(error)}` — a rejection
 is explicit and typed, never a silent drop.
@@ -320,7 +324,7 @@ packaging/signing. P0 is the security core they all sit on.
 | Phase | Scope | Status | Verified how |
 |---|---|---|---|
 | **P0** | Privileged broker core (auth, anti-replay, idempotency, state-version, durable ACL'd store, authoritative status, crash recovery) | ✅ **Done** | `ssk-netd-helper` — 12 Linux tests incl. crash-recovery + Inconsistent alarm; `cargo check` windows-msvc for the DACL edge |
-| **P0 transport** | Named-pipe **client-SID** auth end-to-end (`CLIENT_SID_CHECK_IMPLEMENTED`→real) | ⏳ **Deferred — Windows runner** | needs `windows-sys` FFI (unsafe → belongs in `ssk-winhost`); cross-checkable, not runnable on Linux |
+| **P0 transport** | Named-pipe **client-SID** auth end-to-end (`CLIENT_SID_CHECK_IMPLEMENTED`→real) | ✅ **Done** — 2026-08-02 | The Windows runner arrived. `ImpersonateNamedPipeClient` + `TokenUser` in `ssk-winhost`, injected at `sskd`'s composition root; the constant is deleted; the pipe carries an explicit DACL. Proven by **mutation** (a permissive authenticator turns the anonymous-impersonation test red), not merely by a passing test. **Different-OS-user rejection remains operator-validated** — see `docs/OPERATOR_VM_VALIDATION.md`. |
 | **P1** | Read-only panel: kill-switch / audit / connections / system-verdict views, 7-state machine, fail-closed error, frontend | ✅ **Done** | `ssk-tauri-bridge` — 20 Linux tests, machine-generated golden fixtures, pinned JSON wire strings; `cargo check` windows-msvc |
 | **P2** | Privileged control layer (engage/release envelope build + response map + stale-version retry) | ✅ **Done** | 5 Linux tests end-to-end vs. an in-process broker + mock enforcer |
 | **P2 glue** | `#[tauri::command]` write commands + WebView2 window | ⏳ **Deferred — webkit runner** | `ui/INTEGRATION.md` template; needs `wry`/`webkit2gtk` a headless CI lacks |
