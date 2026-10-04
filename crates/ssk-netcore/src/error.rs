@@ -14,6 +14,8 @@ use thiserror::Error;
 /// cause a caller can act on, never a silent `None`/`false`.
 #[derive(Debug, Error)]
 pub enum NetcoreError {
+    #[error("OpenVPN profile `{0}` is configured but broker integration is not available")]
+    OpenVpnNotReady(String),
     #[error("connect to {0} timed out after {1:?}")]
     Timeout(String, Duration),
     #[error("connection to {0} refused: {1}")]
@@ -45,6 +47,7 @@ impl NetcoreError {
     #[must_use]
     pub fn code(&self) -> &'static str {
         match self {
+            Self::OpenVpnNotReady(_) => "OPENVPN_NOT_READY",
             Self::Timeout(..) => "NETCORE_TIMEOUT",
             Self::ConnectionRefused(..) => "NETCORE_CONNECTION_REFUSED",
             Self::DnsResolutionFailed(..) => "NETCORE_DNS_FAILED",

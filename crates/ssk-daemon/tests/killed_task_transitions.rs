@@ -3,6 +3,11 @@
 //! `Supervisor::spawn_supervised` watchdog mechanism (`src/supervisor.rs`) —
 //! not a simulated call to `record_task_failure` directly.
 
+include!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../tests/support/routing_config.rs"
+));
+
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -24,6 +29,7 @@ fn supervisor() -> (Arc<Supervisor>, tempfile::TempDir) {
             audit_path,
             data_plane,
             Box::new(ssk_daemon::killswitch::NoProvider),
+            Ok(loopback_config()),
         )),
         dir,
     )

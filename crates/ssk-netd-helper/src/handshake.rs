@@ -57,10 +57,12 @@ use crate::protocol::CapabilityToken;
 /// in `ssk-winhost`.
 pub const PRIV_HANDSHAKE_MAGIC: [u8; 8] = *b"SSKBROKR";
 
-/// The newest protocol version this build speaks.
+/// The newest boundary-control protocol version this build speaks. VPN control
+/// opts into its separate v2 contract in `PrivilegedServer`; legacy clients keep
+/// this v1 hello and envelope unchanged.
 pub const PRIV_PROTOCOL_VERSION: u16 = 1;
 
-/// The oldest protocol version this build still accepts.
+/// The oldest boundary-control protocol version this build still accepts.
 ///
 /// Equal to [`PRIV_PROTOCOL_VERSION`] today because there has never been a
 /// shipped version 0. It is a separate constant so that raising the floor is a

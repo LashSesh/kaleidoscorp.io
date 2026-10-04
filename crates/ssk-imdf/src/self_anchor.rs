@@ -94,19 +94,26 @@ impl SelfAnchor {
 /// Domain tag for the L0 null-anchor commitment.
 const NULL_ANCHOR_DOMAIN: &str = "imdf/null-anchor/v1";
 
-/// The **L0 NullAnchor `Z`** (IMRT Def. 8.1): the internal, *prätemporal*
-/// ordering reference relative to which projections are ordered and recovered.
+/// The **L0 NullAnchor `Z_∂`** (IMRT Def. 8.1): the boundary-aperture holding
+/// the internal, *prätemporal* ordering material relative to which projections
+/// are ordered and recovered.
 ///
-/// Axiom A1 forbids `Z` from ever being *entered, emitted, or materialized as a
-/// locator*. That invariant is enforced structurally, not by convention:
+/// Axiom A1 forbids `Z_∂` from ever being *entered, emitted, or materialized as
+/// a locator*. That invariant is enforced structurally, not by convention:
 /// `NullAnchor` deliberately does **not** derive `Serialize`/`Deserialize`, so
 /// the compiler rejects placing it in any serialized atlas, ledger, or wire
-/// payload — it physically cannot cross a boundary. The *only* representation of
-/// `Z` that may cross a boundary is its content-address [`NullAnchor::commitment`]
-/// (a [`Digest`]); the raw `order_ref`/`recovery_root` never do. `Z` **orders** a
-/// [`SelfAnchor`] via [`NullAnchor::order`], binding the anchor's replay root to
-/// `Z`'s commitment so every reconstruction traces back to `Z` without exposing
-/// it (Def. 8.1: *Z ordnet S*).
+/// payload — it physically cannot cross a boundary. The *only* representation
+/// of `Z_∂` that may cross a boundary is its content-address
+/// [`NullAnchor::commitment`] (a [`Digest`]); the raw `order_ref`/
+/// `recovery_root` never do.
+///
+/// `NullAnchor` is deliberately **not** the type that couples — that capability
+/// lives on [`NullFixpoint`] (`N_int`), reachable only via [`NullAnchor::fixpoint`].
+/// Splitting the boundary-aperture (`Z_∂`, non-inhabitable raw material) from the
+/// coupling-active fixpoint (`N_int`, `Coupling(N_int) > 0`) means the *only*
+/// path from raw ordering material to a coupled [`SelfAnchor`] runs through a
+/// content-address digest — the compiler forces that step, so raw material can
+/// never be coupled directly.
 #[derive(Clone, Debug)]
 pub struct NullAnchor {
     order_ref: String,
@@ -126,7 +133,7 @@ impl NullAnchor {
     }
 
     /// The content-address commitment to this null anchor — the ONLY
-    /// representation of `Z` that may cross a boundary. `Z` itself never does.
+    /// representation of `Z_∂` that may cross a boundary. `Z_∂` itself never does.
     #[must_use]
     pub fn commitment(&self) -> Digest {
         #[derive(Serialize)]
@@ -146,10 +153,69 @@ impl NullAnchor {
         .expect("null-anchor form is serializable")
     }
 
+    /// Derive the `N_int` coupling fixpoint from this `Z_∂`'s commitment. This
+    /// is the *only* path from `NullAnchor` to a [`NullFixpoint`] — the raw
+    /// `order_ref`/`recovery_root` material never reaches a `NullFixpoint`
+    /// directly, only its already-hashed, boundary-safe commitment does.
+    #[must_use]
+    pub fn fixpoint(&self) -> NullFixpoint {
+        NullFixpoint(self.commitment())
+    }
+}
+
+/// The **L0 coupling fixpoint `N_int`** (IMRT Def. 8.1, Def. 15.3): the
+/// coupling-active counterpart to [`NullAnchor`]'s (`Z_∂`) boundary-aperture,
+/// `Coupling(N_int) > 0`.
+///
+/// Deliberately a distinct type from `NullAnchor`, not a re-labelling of it:
+/// there is no `From`/`Into` or other bridging trait between the two, and
+/// `NullFixpoint` never stores `order_ref`/`recovery_root` — only the already
+/// content-addressed [`Digest`] produced by [`NullAnchor::commitment`]. A
+/// caller cannot accidentally couple directly off `Z_∂`'s raw material; the
+/// compiler forces the commitment step in between via [`NullAnchor::fixpoint`].
+///
+/// `NullFixpoint` still deliberately does **not** derive `Serialize`: per
+/// Def. 15.3, `Π_0`/`N_int` is not itself a system state (`A ∩ X = ∅`) — only
+/// its *effect* (an ordered [`SelfAnchor`], produced by [`NullFixpoint::order`])
+/// is meant to cross a boundary, never the fixpoint handle itself.
+///
+/// This is a compile-time guarantee, not a convention — attempting to
+/// serialize a `NullFixpoint` is a compile error:
+///
+/// ```compile_fail
+/// let z = ssk_imdf::NullAnchor::new("o", "r");
+/// let fp = z.fixpoint();
+/// let _ = serde_json::to_string(&fp); // fails: NullFixpoint is not Serialize
+/// ```
+///
+/// Likewise, `NullAnchor` no longer exposes coupling directly — raw ordering
+/// material cannot be ordered without first passing through the commitment
+/// digest via [`NullAnchor::fixpoint`]:
+///
+/// ```compile_fail
+/// let z = ssk_imdf::NullAnchor::new("o", "r");
+/// let _ = z.order( // fails: NullAnchor has no method `order` anymore
+///     "s",
+///     "own",
+///     ssk_types::PolicyId::new("p"),
+///     ssk_types::KeyContextRef::new("k"),
+///     ssk_types::BoundaryRef::new("b"),
+/// );
+/// ```
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NullFixpoint(Digest);
+
+impl NullFixpoint {
+    /// The `Z_∂` commitment this fixpoint was derived from.
+    #[must_use]
+    pub fn commitment(&self) -> Digest {
+        self.0
+    }
+
     /// Order a [`SelfAnchor`] against this null fixpoint (A1: `Z` orders `S`).
-    /// The resulting anchor's replay root is bound to `Z`'s *commitment* (never
-    /// its raw material), so the reconstruction traces back to `Z` without
-    /// emitting it.
+    /// The resulting anchor's replay root is bound to `Z_∂`'s *commitment*
+    /// (never its raw material), so the reconstruction traces back to `Z_∂`
+    /// without emitting it.
     #[must_use]
     pub fn order(
         &self,
@@ -164,7 +230,7 @@ impl NullAnchor {
             owner,
             policy,
             key_context,
-            ReplayRoot::new(self.commitment().to_hex()),
+            ReplayRoot::new(self.0.to_hex()),
             boundary,
         )
     }
@@ -318,7 +384,7 @@ mod tests {
     #[test]
     fn null_anchor_orders_the_self_anchor_without_emitting_z() {
         let z = NullAnchor::new("order-secret", "recover-secret");
-        let anchor = z.order(
+        let anchor = z.fixpoint().order(
             "host-a",
             "alice",
             PolicyId::new("p"),
@@ -348,16 +414,60 @@ mod tests {
         let z1 = NullAnchor::new("o", "r");
         let z2 = NullAnchor::new("o", "different");
         let mk = |z: &NullAnchor| {
-            z.order(
-                "s",
-                "o",
-                PolicyId::new("p"),
-                KeyContextRef::new("kc"),
-                BoundaryRef::new("b"),
-            )
-            .replay_root
+            z.fixpoint()
+                .order(
+                    "s",
+                    "o",
+                    PolicyId::new("p"),
+                    KeyContextRef::new("kc"),
+                    BoundaryRef::new("b"),
+                )
+                .replay_root
         };
         assert_eq!(mk(&z1), mk(&z1));
         assert_ne!(mk(&z1), mk(&z2));
+    }
+
+    // The NullAnchor split (S1 item 2): Z_∂ (boundary-aperture) and N_int
+    // (coupling-active fixpoint) are genuinely un-conflatable, not just
+    // conventionally separated.
+    //
+    // 1. `NullFixpoint` is reachable ONLY via `NullAnchor::fixpoint` — there is
+    //    no constructor that takes raw order_ref/recovery_root material
+    //    directly, so the coupling-active type can never be built by
+    //    accidentally skipping the digest step.
+    // 2. Two `NullFixpoint`s derived from equal-material `NullAnchor`s are
+    //    equal; from different material they are different — `NullFixpoint`'s
+    //    identity is wholly determined by the Z_∂ commitment, it carries
+    //    nothing else (structurally, it has no other field to carry).
+    // 3. The coupling role is genuinely exercised through the fixpoint, not
+    //    the anchor: `NullFixpoint::order` produces the same ordered
+    //    `SelfAnchor` a direct `NullAnchor::order` used to.
+    #[test]
+    fn null_anchor_and_null_fixpoint_are_genuinely_un_conflatable() {
+        let z = NullAnchor::new("order-x", "recover-x");
+        let fp1 = z.fixpoint();
+        let fp2 = NullAnchor::new("order-x", "recover-x").fixpoint();
+        let fp_other = NullAnchor::new("order-y", "recover-x").fixpoint();
+
+        // Same material -> same fixpoint; different material -> different
+        // fixpoint. NullFixpoint's whole identity is the Z_∂ commitment.
+        assert_eq!(fp1, fp2);
+        assert_ne!(fp1, fp_other);
+        assert_eq!(fp1.commitment(), z.commitment());
+
+        // The coupling capability lives on NullFixpoint and produces the same
+        // ordering effect NullAnchor::order used to.
+        let ordered = fp1.order(
+            "scope",
+            "owner",
+            PolicyId::new("p"),
+            KeyContextRef::new("kc"),
+            BoundaryRef::new("b"),
+        );
+        assert_eq!(
+            ordered.replay_root,
+            ReplayRoot::new(z.commitment().to_hex())
+        );
     }
 }

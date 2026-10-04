@@ -1239,6 +1239,7 @@ name = "ssk-bcik"
 version = "0.1.0"
 dependencies = [
  "ssk-crypto",
+ "ssk-imdf",
  "ssk-locator",
  "ssk-types",
 ]
@@ -1275,6 +1276,7 @@ dependencies = [
  "getrandom 0.3.4",
  "serde",
  "serde_json",
+ "sha2",
  "ssk-boundary",
  "ssk-capture",
  "ssk-config",
@@ -1308,7 +1310,6 @@ dependencies = [
  "serde_json",
  "serde_yaml",
  "ssk-crypto",
- "ssk-gates",
  "ssk-privacy",
  "ssk-types",
  "thiserror",
@@ -1370,6 +1371,7 @@ dependencies = [
  "serde_yaml",
  "ssk-boundary",
  "ssk-config",
+ "ssk-desktop-client",
  "ssk-diag",
  "ssk-ipc",
  "ssk-netadmin",
@@ -1393,6 +1395,18 @@ dependencies = [
  "serde",
  "ssk-types",
  "thiserror",
+]
+
+[[package]]
+name = "ssk-desktop-client"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "ssk-ipc",
+ "ssk-ui-contract",
+ "ssk-winhost",
+ "tokio",
 ]
 
 [[package]]
@@ -1452,11 +1466,11 @@ dependencies = [
 name = "ssk-gates"
 version = "0.1.0"
 dependencies = [
- "serde",
  "ssk-bcik",
  "ssk-core",
  "ssk-crypto",
  "ssk-focus",
+ "ssk-imdf",
  "ssk-privacy",
  "ssk-types",
 ]
@@ -1565,6 +1579,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "ssk-netanalysis"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+]
+
+[[package]]
 name = "ssk-netcore"
 version = "0.1.0"
 dependencies = [
@@ -1585,9 +1610,11 @@ version = "0.1.0"
 dependencies = [
  "ciborium",
  "serde",
+ "serde_json",
  "ssk-boundary",
  "ssk-signature",
  "ssk-types",
+ "ssk-vpnctl",
  "tempfile",
  "thiserror",
  "tracing",
@@ -1637,6 +1664,7 @@ dependencies = [
  "ssk-focus",
  "ssk-gates",
  "ssk-identity",
+ "ssk-imdf",
  "ssk-locator",
  "ssk-privacy",
  "ssk-replay",
@@ -1680,19 +1708,13 @@ dependencies = [
 ]
 
 [[package]]
-name = "ssk-sim"
-version = "0.1.0"
-dependencies = [
- "ssk-types",
-]
-
-[[package]]
 name = "ssk-stitch"
 version = "0.1.0"
 dependencies = [
  "ssk-bcik",
  "ssk-core",
  "ssk-gates",
+ "ssk-imdf",
  "ssk-locator",
  "ssk-types",
 ]
@@ -1733,6 +1755,7 @@ dependencies = [
  "ssk-signature",
  "ssk-system",
  "ssk-types",
+ "ssk-ui-contract",
  "ssk-winhost",
  "thiserror",
 ]
@@ -1787,13 +1810,34 @@ dependencies = [
 ]
 
 [[package]]
+name = "ssk-ui-contract"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "ssk-vpnctl"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror",
+ "zeroize",
+]
+
+[[package]]
 name = "ssk-winhost"
 version = "0.1.0"
 dependencies = [
+ "chacha20poly1305",
  "ciborium",
  "getrandom 0.3.4",
  "serde",
  "serde_json",
+ "sha2",
+ "socket2",
  "ssk-boundary",
  "ssk-capture",
  "ssk-diag",
@@ -1802,11 +1846,13 @@ dependencies = [
  "ssk-service-host",
  "ssk-signature",
  "ssk-types",
+ "ssk-vpnctl",
  "tempfile",
  "tokio",
  "tracing",
  "windows-service",
  "windows-sys 0.59.0",
+ "zeroize",
 ]
 
 [[package]]
@@ -2419,6 +2465,7 @@ version = "1.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e13c156562582aa81c60cb29407084cdb54c4164760106ab78e6c5b0858cf64e"
 dependencies = [
+ "serde",
  "zeroize_derive",
 ]
 

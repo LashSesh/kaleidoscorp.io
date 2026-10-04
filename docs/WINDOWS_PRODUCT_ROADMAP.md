@@ -193,6 +193,33 @@ the very signature it then compares against, so all 11 spectral dimensions are i
 construction and the most expensive component in the codebase has zero influence and zero coverage.
 These are correctness defects in a fail-closed security system, not tuning issues.
 
+> **Corrected 2026-08-11 — all three code citations above are now stale.** The finding as originally
+> written is preserved because it is the historical record; what it names has since been fixed, and a
+> reader following those citations today lands on code that no longer does what this paragraph says.
+> Verified by reading the current tree:
+> - **`ssk-stitch` no longer hardcodes anything.** All four flags are computed predicates over real
+>   `MirrorFacet`/`LocatorFacet` fields: `seam_ok` (`crates/ssk-stitch/src/lib.rs:15-19`),
+>   `boundary_complete` (`:27-29`), `replay_ready` (`:37-39`), `focus_ready` (`:47-49`), consumed by
+>   `from_intent` at `:51-73`. The crate carries per-flag negative tests that each also assert the
+>   corresponding gate **rejects** (`:157-339`), which is the P5 item at `:683-685`.
+> - **`ssk-cli` passes `false`, not `true`.** `parallax_consistent: false, replay_equal: false`
+>   (`crates/ssk-cli/src/main.rs:1058-1059`), with the doc comment stating the reason — a caller with
+>   no real evidence must pass `false` so A3/A8 hold conservatively. This is the P5 item at `:682`.
+> - **`ssk-system` no longer builds `TargetProfile` from the signature it gates.** The signature gate
+>   now matches on `(skin.surface_tensor.last(), inputs.signature_baseline)`
+>   (`crates/ssk-system/src/lib.rs:151-161`) and returns `GateOutcomeKind::Hold` when there is no
+>   capture or no baseline — fail-closed, never a fabricated target. `ssk-cli` correspondingly passes
+>   `signature_baseline: None` on the fixture path (`crates/ssk-cli/src/main.rs:1067`).
+>
+> **What is *not* claimed closed.** P5's exit criterion "no gate in the vector is unconditionally
+> satisfied" (`:692`) is still open. The predicates are now real, but on the only surface where the
+> gate vector runs at all — `ssk-cli`'s `run`/`replay-verify`/`connect` — the sole input is a
+> hardcoded `sample_intent(valid_fixture)` (`crates/ssk-runtime/src/lib.rs:622-642`), so the gates are
+> evaluated against a fixture rather than a real connection. The vector is also not reachable from
+> `sskd` in any form; see `docs/adr/0008-flow-path-owns-the-per-connection-decision.md`. The
+> "~9 predicates" count in the paragraph above should therefore not be re-quoted as a current
+> measurement; it describes the pre-fix tree.
+
 **(c) CI is structurally incapable of catching any of this.**
 13 of 14 jobs run `ubuntu-latest`. The single Windows job runs three commands scoped to 1 of 44
 crates. `release.yml` builds `--release` on Linux, **discards the binaries, and tars the source.**
@@ -224,6 +251,19 @@ blocker register exists to prevent.
 - re-bless `ssk-core/tests/ui/*.stderr`
 - correct the doc overclaims — **including the two that are stale pessimistically** (the named-pipe
   server works)
+
+  > **Corrected 2026-08-11.** "The two" was accurate when written on 2026-08-02 and is now itself the
+  > stale number. As of today **at least seven** doc claims are stale-pessimistically wrong, i.e. they
+  > understate the product. The four that `README.md` carried under "Known-broken on Windows" are all
+  > fixed and are now corrected in place there, each with a code citation: the named-pipe *client*
+  > exists (`crates/ssk-ipc/src/client.rs:34`, `:49-53`), `ssk --version` works
+  > (`crates/ssk-cli/src/main.rs:194`), the `/dev/urandom` doctor probe is gone
+  > (`crates/ssk-diag/src/entropy.rs:97`, regression test at `:215-221`), and netsh classification is
+  > exit-code-only (`crates/ssk-winhost/src/firewall.rs:670-679`, test `add_is_exit_code_only` at
+  > `:1626`). Three more are in this document's own §3(b) — all three of that finding's code
+  > citations have been fixed; see the dated correction attached there.
+  > A stale-pessimistic claim is the same class of defect as an overclaim: a reader cannot tell which
+  > direction a wrong document is wrong in, so both are corrected the same way, in place and dated.
 
 **Exit:** on a clean Windows checkout, `build --all-targets`, `clippy -D warnings` and
 `fmt --check` exit 0; `cargo test --workspace` **compiles and runs to completion**, with every
@@ -682,6 +722,13 @@ runs `ssk doctor` green, performs an engage/release cycle, updates to a newer si
 uninstalls cleanly leaving no service and no firewall rule.
 
 ### P7 — Desktop GUI  ·  effort XL
+
+**2026-09-24 update:** The frontend has been extracted to `ui/desktop`, with
+an independent DTO crate, versioned snapshot contract, injected read adapters,
+fixture preview and a separate Node test job. The previous snapshot type gap
+and single-file UI coupling described below are addressed. The historical
+assessment below still describes additional host/product work; the current
+[modular UI status](MODULAR_DESKTOP_UI.md) records the implemented boundary.
 
 *Goal: the thing a user double-clicks. Last on purpose.*
 

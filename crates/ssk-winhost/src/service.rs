@@ -1373,8 +1373,10 @@ mod tests {
 
     /// A probe answering from a fixed table; anything not in the table is
     /// [`ProbeError::NotFound`].
+    #[cfg(windows)]
     struct FakeProbe(std::collections::BTreeMap<PathBuf, PathSecurity>);
 
+    #[cfg(windows)]
     impl FakeProbe {
         fn new(entries: Vec<(&str, PathSecurity)>) -> Self {
             Self(
@@ -1386,6 +1388,7 @@ mod tests {
         }
     }
 
+    #[cfg(windows)]
     impl PathSecurityProbe for FakeProbe {
         fn inspect(&self, path: &Path) -> Result<PathSecurity, ProbeError> {
             self.0.get(path).cloned().ok_or(ProbeError::NotFound)
@@ -1394,8 +1397,10 @@ mod tests {
 
     /// A probe that must never be consulted — proves a refusal happened purely
     /// from the path, before any filesystem or ACL access.
+    #[cfg(windows)]
     struct NeverProbe;
 
+    #[cfg(windows)]
     impl PathSecurityProbe for NeverProbe {
         fn inspect(&self, path: &Path) -> Result<PathSecurity, ProbeError> {
             panic!("probe must not be consulted for {}", path.display());

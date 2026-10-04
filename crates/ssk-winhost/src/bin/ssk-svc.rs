@@ -377,12 +377,14 @@ mod windows_svc {
     struct ControlPlane {
         broker: Arc<Broker>,
         host: Arc<PrivilegedPipeHost>,
-        /// `Some(reason)` when the allow-list could not be used and every
-        /// mutating verb will be refused.
+        /// `Some(reason)` when the boundary allow-list could not be used and
+        /// every boundary mutation will be refused. VPN authority is separate.
         read_only: Option<String>,
         /// `Ok` carries what startup reconciliation actually did. An `Err` is
         /// **not** fatal — see [`build_control_plane`].
         reconcile: Result<ReconcileReport, String>,
+        vpn: Option<ssk_netd_helper::vpn::Service>,
+        vpn_unavailable: Option<String>,
     }
 
     /// Steps 2–6 of the header's list. Step 1 (`ensure_state_dir`) already ran,
@@ -414,6 +416,7 @@ mod windows_svc {
     fn build_control_plane(
         state_dir: Option<&Path>,
         reconcile: ReconcilePolicy,
+        vpn_configuration: Result<ssk_winhost::vpn_service::Configuration, String>,
     ) -> Result<ControlPlane, String> {
         let state_dir = state_dir.ok_or_else(|| {
             "no usable state directory; the store, the allow-list and the journal all live there"
@@ -429,16 +432,29 @@ mod windows_svc {
         // Step 3. Degrades, never fails.
         let authz = authz_file::load(state_dir);
         let read_only = authz.reason().map(str::to_owned);
-        let pipe_config = match &authz {
-            AuthzLoad::Granted { client_sids, .. } => {
-                let refs: Vec<&str> = client_sids.iter().map(String::as_str).collect();
-                PrivilegedPipeHostConfig::for_allow_list(&refs)
-                    .map_err(|e| format!("the pipe descriptor could not be built: {e}"))?
+        let vpn_clients: Vec<String> = vpn_configuration
+            .as_ref()
+            .map(|c| c.client_sids().into_iter().collect())
+            .unwrap_or_default();
+        let boundary_clients = match &authz {
+            AuthzLoad::Granted { client_sids, .. } => Some(client_sids.as_slice()),
+            _ => None,
+        };
+        let mut pipe_config = PrivilegedPipeHostConfig::read_only_fallback();
+        pipe_config.sddl =
+            ssk_winhost::pipe::sddl_for_control_domains(boundary_clients, &vpn_clients)
+                .map_err(|e| format!("the pipe descriptor could not be built: {e}"))?;
+        let token = session_token();
+        let vpn_started = vpn_configuration.and_then(|c| {
+            if token == CapabilityToken([0; 16]) {
+                return Err("VPN requires a random session token".into());
             }
-            // Reachability without authority: the pipe admits INTERACTIVE so a
-            // severed machine stays diagnosable, and the authorizer below
-            // refuses every mutating verb with the reason.
-            AuthzLoad::ReadOnly { .. } => PrivilegedPipeHostConfig::read_only_fallback(),
+            c.start(token)
+                .map_err(|e| format!("VPN worker/journal unavailable: {e}"))
+        });
+        let (vpn, vpn_unavailable) = match vpn_started {
+            Ok(s) => (Some(s), None),
+            Err(e) => (None, Some(e)),
         };
 
         // Step 4.
@@ -446,7 +462,7 @@ mod windows_svc {
             .map_err(|e| format!("the broker principal is not well formed: {e}"))?;
         let scope = BoundaryScope::all_egress();
         let config = BrokerConfig {
-            session_token: session_token(),
+            session_token: token,
             actuation_auth: AuthorizationManifest::new(
                 BROKER_PRINCIPAL,
                 "system",
@@ -489,6 +505,8 @@ mod windows_svc {
             host: Arc::new(host),
             read_only,
             reconcile,
+            vpn,
+            vpn_unavailable,
         })
     }
 
@@ -569,7 +587,11 @@ mod windows_svc {
             START_WAIT_HINT,
         ))?;
 
-        let plane = match build_control_plane(state_dir, ReconcilePolicy::EnforceJournal) {
+        let mut plane = match build_control_plane(
+            state_dir,
+            ReconcilePolicy::EnforceJournal,
+            ssk_winhost::vpn_service::Configuration::open(),
+        ) {
             Ok(plane) => plane,
             Err(reason) => {
                 tracing::error!(
@@ -606,12 +628,15 @@ mod windows_svc {
                  and releasable, but nothing here establishes that enforcement matches the journal"
             ),
         }
+        if let Some(reason) = &plane.vpn_unavailable {
+            tracing::warn!(target: "ssk.lifecycle", reason = %reason, "VPN control unavailable; boundary control remains independent");
+        }
         if let Some(reason) = &plane.read_only {
             tracing::error!(
                 target: "ssk.lifecycle",
                 reason = %reason,
-                "no usable allow-list; every mutating verb will be refused and the pipe carries \
-                 the degraded descriptor. Status remains readable on purpose."
+                "no usable boundary allow-list; every boundary mutation will be refused. \
+                 Boundary status remains readable; VPN authorization is independent."
             );
         }
         tracing::info!(
@@ -628,11 +653,12 @@ mod windows_svc {
         for index in 0..LISTENER_THREADS {
             let host = Arc::clone(&plane.host);
             let broker = Arc::clone(&plane.broker);
+            let vpn = plane.vpn.as_ref().map(|service| service.broker());
             let spawned = std::thread::Builder::new()
                 .name(format!("ssk-priv-{index}"))
                 .spawn(move || {
                     let mut lease_ids = CsprngLeaseIds::default();
-                    match host.run_listener(&broker, &mut lease_ids) {
+                    match host.run_listener_with_vpn(&broker, &mut lease_ids, vpn.as_deref()) {
                         Ok(report) => tracing::info!(
                             target: "ssk.lifecycle",
                             listener = index,
@@ -699,6 +725,9 @@ mod windows_svc {
             STOP_WAIT_HINT,
         ))?;
         plane.host.stop_signal().stop();
+        if let Some(vpn) = &plane.vpn {
+            vpn.request_shutdown();
+        }
         for handle in listeners {
             // Joining rather than detaching: a listener still inside
             // `serve_connection` holds the broker's op-lock across a durable
@@ -719,10 +748,20 @@ mod windows_svc {
             "every privileged listener has stopped"
         );
 
+        let vpn_clean = plane.vpn.as_mut().is_none_or(|vpn| {
+            let status = vpn.shutdown();
+            let clean = status.audit_healthy && status.phase == ssk_netd_helper::vpn::Phase::Shutdown;
+            if !clean { tracing::error!(target: "ssk.lifecycle", status = ?status, "VPN shutdown requires operator recovery"); }
+            clean
+        });
         status_handle.set_service_status(service_status(
             ServiceState::Stopped,
             ServiceControlAccept::empty(),
-            ServiceExitCode::Win32(0),
+            if vpn_clean {
+                ServiceExitCode::Win32(0)
+            } else {
+                ServiceExitCode::ServiceSpecific(0x5353_4B02)
+            },
             0,
             Duration::default(),
         ))?;
@@ -809,7 +848,11 @@ mod windows_svc {
         /// healthy.
         #[test]
         fn no_state_directory_means_no_control_plane() {
-            let Err(reason) = build_control_plane(None, ReconcilePolicy::ObserveOnly) else {
+            let Err(reason) = build_control_plane(
+                None,
+                ReconcilePolicy::ObserveOnly,
+                Err("VPN disabled in scratch test".into()),
+            ) else {
                 panic!("a host with no state directory must refuse to serve")
             };
             assert!(reason.contains("state directory"), "{reason}");
@@ -826,7 +869,11 @@ mod windows_svc {
                 BUILD
             ));
             // Deliberately not created.
-            let Err(reason) = build_control_plane(Some(&dir), ReconcilePolicy::ObserveOnly) else {
+            let Err(reason) = build_control_plane(
+                Some(&dir),
+                ReconcilePolicy::ObserveOnly,
+                Err("VPN disabled in scratch test".into()),
+            ) else {
                 panic!("an unprovisioned store directory must refuse to serve")
             };
             assert!(reason.contains("receipt store"), "{reason}");
@@ -855,7 +902,11 @@ mod windows_svc {
             // attempt an OS mutation, and `ObserveOnly` is contractually
             // side-effect free. What that costs is stated on
             // `build_control_plane`: the enforcing path is unexercised here.
-            let Ok(plane) = build_control_plane(Some(&dir), ReconcilePolicy::ObserveOnly) else {
+            let Ok(plane) = build_control_plane(
+                Some(&dir),
+                ReconcilePolicy::ObserveOnly,
+                Err("VPN disabled in scratch test".into()),
+            ) else {
                 panic!("a provisioned store directory is enough to build a control plane")
             };
 

@@ -14,6 +14,7 @@
 //! the same length-prefixed canonical CBOR the server already speaks
 //! ([`crate::framing`]).
 
+#[cfg(windows)]
 use std::time::Duration;
 
 use crate::error::IpcError;
@@ -24,7 +25,9 @@ use crate::server::{Request, Response};
 /// before giving up. Every instance being momentarily in use is normal under
 /// concurrency, not a failure; a server that is not running fails immediately
 /// with a different error and never reaches this path.
+#[cfg(windows)]
 const CONNECT_RETRY_BUDGET: Duration = Duration::from_secs(2);
+#[cfg(windows)]
 const CONNECT_RETRY_INTERVAL: Duration = Duration::from_millis(20);
 
 #[cfg(unix)]

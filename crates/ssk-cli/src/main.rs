@@ -1,5 +1,7 @@
 #![forbid(unsafe_code)]
 
+mod vpn;
+
 use clap::{Parser, Subcommand};
 use serde::Serialize;
 use ssk_boundary::{BoundaryProbe, BoundaryScope, EnforcementReceipt, KillSwitchState, Presence};
@@ -306,6 +308,11 @@ enum Command {
 
 #[derive(Subcommand)]
 enum WinHostCommand {
+    /// Manage protected VPN configuration/packages and held service sessions.
+    Vpn {
+        #[command(subcommand)]
+        command: vpn::Command,
+    },
     /// Report whether this build carries the privileged Windows backends and
     /// what an operator must do to exercise them.
     Doctor,
@@ -2485,6 +2492,7 @@ fn winhost_local_advisory_observation(scope: &BoundaryScope) -> ssk_boundary::Bo
 
 fn winhost_command(command: &WinHostCommand, json: bool) -> Result<(), AppError> {
     match command {
+        WinHostCommand::Vpn { command } => vpn::run(command, json),
         WinHostCommand::Doctor => winhost_doctor(json),
         WinHostCommand::Capture => winhost_capture(json),
         WinHostCommand::Killswitch { command } => match command {
@@ -5360,6 +5368,8 @@ fn default_policy_engine() -> PolicyEngine {
             description: "allow internal low-risk traffic".into(),
             priority: 10,
             criteria: MatchCriteria {
+                dest_host: None,
+                dest_port: None,
                 app_prefix: None,
                 dest_suffix: Some(".internal".into()),
                 protocol: None,
@@ -5373,6 +5383,8 @@ fn default_policy_engine() -> PolicyEngine {
             description: "route high-risk external traffic via socks5".into(),
             priority: 20,
             criteria: MatchCriteria {
+                dest_host: None,
+                dest_port: None,
                 app_prefix: None,
                 dest_suffix: None,
                 protocol: None,
@@ -5388,6 +5400,8 @@ fn default_policy_engine() -> PolicyEngine {
             description: "default profile: allow low-risk traffic direct".into(),
             priority: 30,
             criteria: MatchCriteria {
+                dest_host: None,
+                dest_port: None,
                 app_prefix: None,
                 dest_suffix: None,
                 protocol: None,
@@ -6898,8 +6912,7 @@ mod tests {
     #[test]
     fn off_windows_the_kill_switch_refuses_rather_than_reporting_a_clean_machine() {
         let err = broker_open(ClientHello::new(LeaseKind::Session))
-            .err()
-            .expect("there is no privileged control plane off Windows");
+            .expect_err("there is no privileged control plane off Windows");
         assert_eq!(err.machine_code, "KILLSWITCH_BROKER_UNSUPPORTED");
         assert_eq!(err.class.exit_code(), 21);
         assert!(err

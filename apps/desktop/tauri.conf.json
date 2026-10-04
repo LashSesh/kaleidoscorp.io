@@ -1,0 +1,16 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "ScorpioSync Diagnose",
+  "version": "0.1.0",
+  "identifier": "io.kaleidoscorp.scorpiosync.diagnostics",
+  "build": { "frontendDist": "../../ui/desktop/dist" },
+  "app": {
+    "withGlobalTauri": true,
+    "windows": [],
+    "security": {
+      "csp": "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self'; connect-src ipc: http://ipc.localhost; object-src 'none'; base-uri 'none'; form-action 'none'; frame-src 'none'; frame-ancestors 'none'",
+      "capabilities": ["read-panel"]
+    }
+  },
+  "bundle": { "active": false }
+}

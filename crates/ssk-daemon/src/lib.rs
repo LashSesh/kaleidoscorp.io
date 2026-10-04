@@ -18,6 +18,7 @@ pub mod config_load;
 pub mod killswitch;
 pub mod lock;
 pub mod paths;
+pub mod routing;
 pub mod shutdown;
 pub mod state;
 pub mod supervisor;

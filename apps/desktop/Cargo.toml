@@ -1,0 +1,31 @@
+[package]
+name = "ssk-desktop"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+
+# Keep the native webview toolchain outside the core workspace and lockfile.
+[workspace]
+
+[features]
+default = ["custom-protocol"]
+custom-protocol = ["tauri/custom-protocol"]
+
+[target.'cfg(windows)'.dependencies]
+ssk-desktop-client = { path = "../../crates/ssk-desktop-client" }
+ssk-ui-contract = { path = "../../crates/ssk-ui-contract" }
+tauri = { version = "2", default-features = false, features = ["wry", "compression"] }
+
+[target.'cfg(windows)'.build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[target.'cfg(windows)'.dev-dependencies]
+tauri = { version = "2", default-features = false, features = ["wry", "compression", "test"] }
+ssk-ipc = { path = "../../crates/ssk-ipc" }
+ssk-winhost = { path = "../../crates/ssk-winhost" }
+tempfile = "3"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
+
+[profile.dev]
+debug = 0
+incremental = false

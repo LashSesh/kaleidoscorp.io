@@ -1,0 +1,28 @@
+{
+  "schema_version": 1,
+  "panel_state": "degraded",
+  "kill_switch": {
+    "audit_head_hex": "0000000000000000000000000000000000000000000000000000000000000000",
+    "audit_len": 1,
+    "is_alarm": true,
+    "journal_claims_engaged": true,
+    "logical_state": "engaged",
+    "os_rule": "unknown",
+    "protection_confirmed": false,
+    "receipt": {
+      "prior_state": "flowing",
+      "receipt_id_hex": "0000000000000000000000000000000000000000000000000000000000000000",
+      "scope_label": "all-egress"
+    },
+    "recovery": "consistent",
+    "severity": "alarm",
+    "state_version": 1
+  },
+  "audit": null,
+  "connections": {
+    "live_supported": false,
+    "parse_anomaly": false,
+    "rows": [],
+    "source_id": "mock-source"
+  }
+}

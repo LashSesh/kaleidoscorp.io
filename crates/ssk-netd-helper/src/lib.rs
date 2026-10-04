@@ -58,6 +58,7 @@ pub mod recover;
 pub mod server;
 pub mod status;
 pub mod store;
+pub mod vpn;
 
 #[cfg(test)]
 pub(crate) mod testing;

@@ -90,6 +90,7 @@ ssk-winhost = { path = "../ssk-winhost", version = "0.1.0" }
 getrandom = "0.3"
 
 [dev-dependencies]
+ssk-desktop-client = { path = "../ssk-desktop-client", version = "0.1.0" }
 tempfile.workspace = true
 serde_yaml.workspace = true
 # `tests/kill_switch_status.rs` drives a REAL `ssk_netd_helper::Broker` behind a

@@ -60,6 +60,6 @@ pub use replay::{
     RunTransition, StabilityCertificate,
 };
 pub use self_anchor::{
-    BcikCrossing, DomeLocator, LocatorAddressId, NullAnchor, SelfAnchor, SelfAnchorId,
+    BcikCrossing, DomeLocator, LocatorAddressId, NullAnchor, NullFixpoint, SelfAnchor, SelfAnchorId,
 };
 pub use wavefront::{BirefringentSplit, Parallax, Ray, RaySet, SplitAxis, Wavefront};

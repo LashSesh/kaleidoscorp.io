@@ -34,18 +34,38 @@ decision half of that role only — see the status box above.
 
 ## Positioning
 
+> **Diagram correction (2026-08-11).** This diagram used to begin `ssk-runtime (produces outbound
+> connection intents) → ssk-netadmin`. **That edge has never existed, in either direction.**
+> `ssk-runtime` does not depend on `ssk-netadmin` (`crates/ssk-runtime/Cargo.toml:7-24`) and
+> `ssk-netadmin` does not depend on `ssk-runtime` (`crates/ssk-netadmin/Cargo.toml:15-23`).
+> `ssk_types::ConnectionIntent` (`crates/ssk-types/src/lib.rs:622-628`) has no field that can hold a
+> destination host or port, so it could not be the input to this layer even in principle;
+> `FlowDescriptor` (`crates/ssk-netadmin/src/flow.rs:31-42`) can and does. The real producer is
+> `sskd`. See `docs/adr/0008-flow-path-owns-the-per-connection-decision.md`.
+
 ```
-ssk-runtime  (produces outbound connection intents)
-      │
+ssk-cli  ──IPC──►  sskd  (ssk-daemon)
+      │        constructs the FlowDescriptor itself
+      │        (crates/ssk-daemon/src/supervisor.rs:543-553)
       ▼
 ssk-netadmin  (classifies, enforces policy, plans a route)
+      │        PolicyEngine::evaluate → RouteOrchestrator::plan  (supervisor.rs:554-558)
       │        ── it does NOT intercept; there is no ingress (P4)
       ├─► Direct TCP/IP
       ├─► SOCKS5 proxy
       ├─► HTTP CONNECT tunnel
       ├─► TLS tunnel
       └─► DNS override / split-horizon
+              │  executed by ssk-netcore's RouteExecutor, dispatched at supervisor.rs:582
+              ▼
+        the real destination
 ```
+
+`ssk-runtime` / `ssk-gates` / `ssk-bcik` are **not** on this path. They form a separate decision
+core with its own entry point — `ssk-cli`'s `run` / `replay-verify` / `connect` subcommands
+(`crates/ssk-cli/src/main.rs:206`, `:214`, `:225`), each driving a hardcoded
+`sample_intent(valid_fixture)`. Nothing in `ssk-netadmin` calls into it and nothing in it calls into
+`ssk-netadmin`.
 
 Integration bindings:
 - `ssk-interop`: attestation MAC verification for peer identity

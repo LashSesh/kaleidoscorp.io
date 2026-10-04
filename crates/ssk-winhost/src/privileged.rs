@@ -617,8 +617,17 @@ impl PrivilegedPipeHost {
         broker: &Broker,
         lease_ids: &mut dyn LeaseIdSource,
     ) -> io::Result<ListenerReport> {
+        self.run_listener_with_vpn(broker, lease_ids, None)
+    }
+
+    pub fn run_listener_with_vpn(
+        &self,
+        broker: &Broker,
+        lease_ids: &mut dyn LeaseIdSource,
+        vpn: Option<&ssk_netd_helper::vpn::Broker>,
+    ) -> io::Result<ListenerReport> {
         let rt = Builder::new_current_thread().enable_all().build()?;
-        let server = PrivilegedServer::with_limiter(broker, self.limiter.clone());
+        let server = PrivilegedServer::with_limiter(broker, self.limiter.clone()).with_vpn(vpn);
         let mut report = ListenerReport::default();
         let mut first_instance = self.first.acquire()?;
 

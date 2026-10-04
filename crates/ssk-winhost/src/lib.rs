@@ -110,11 +110,38 @@
 pub mod authz_file;
 pub mod connections;
 pub mod firewall;
+pub mod network_etw;
+pub mod network_snapshot;
 pub mod observer;
 pub mod pipe;
 pub mod privilege;
 pub mod service;
 pub mod state_dir;
+pub mod vpn_profiles;
+
+#[cfg(windows)]
+pub mod vpn_process;
+
+#[cfg(windows)]
+pub mod vpn_launch;
+
+#[cfg(windows)]
+mod vpn_installation;
+
+#[cfg(windows)]
+mod vpn_endpoint;
+
+#[cfg(windows)]
+pub mod vpn_service;
+
+#[cfg(windows)]
+pub mod vpn_journal;
+
+#[cfg(windows)]
+pub mod vpn_deployment;
+
+#[cfg(windows)]
+pub mod vpn_configuration;
 
 #[cfg(windows)]
 pub mod privileged;

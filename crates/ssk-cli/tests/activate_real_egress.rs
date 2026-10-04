@@ -22,6 +22,11 @@
 //! Readiness is now a real connection to the daemon's endpoint instead of a
 //! `Path::exists`, because a named pipe has no file to look for.
 
+include!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../tests/support/routing_config.rs"
+));
+
 use std::net::TcpListener;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
@@ -61,6 +66,7 @@ fn spawn_daemon() -> DaemonProcess {
     let stderr = std::fs::File::create(state_dir.path().join("sskd.err")).expect("stderr capture");
     let child = Command::new(sskd_path)
         .env("SSK_STATE_DIR", state_dir.path())
+        .env("SSK_CONFIG_PATH", write_loopback_config(state_dir.path()))
         .stderr(Stdio::from(stderr))
         .spawn()
         .expect("spawn sskd");

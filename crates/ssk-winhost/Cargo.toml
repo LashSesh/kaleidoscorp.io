@@ -51,8 +51,15 @@ getrandom = "0.3"
 # ignored line. Both already in the graph via `ssk-diag`/`ssk-config`.
 serde = { workspace = true }
 serde_json = { workspace = true }
+ciborium = { workspace = true }
+ssk-vpnctl = { path = "../ssk-vpnctl", version = "0.1.0" }
+zeroize = "1"
+sha2.workspace = true
 
 [target.'cfg(windows)'.dependencies]
+# Already pinned in the workspace lockfile; no new workspace dependency edge.
+chacha20poly1305 = { version = "0.10.1", default-features = false, features = ["alloc"] }
+socket2 = "0.6"
 windows-sys = { version = "0.59", features = [
     "Win32_Foundation",
     "Win32_Networking_WinSock",
@@ -85,6 +92,11 @@ windows-sys = { version = "0.59", features = [
     "Win32_System_Pipes",
     "Win32_System_SystemServices",
     "Win32_System_Threading",
+    "Win32_System_Diagnostics_Etw",
+    "Win32_System_Time",
+    "Win32_System_JobObjects",
+    "Win32_System_SystemInformation",
+    "Win32_Storage_FileSystem",
 ] }
 windows-service = "0.8.1"
 # The Windows named-pipe authentication seam. `ssk-ipc` defines the traits
@@ -139,7 +151,3 @@ tokio = { version = "1", features = [
     "time",
     "io-util",
 ] }
-# `privileged.rs`'s tests build a `ClientHello` frame by hand, so the assertion
-# that the transport reads what a real client wrote does not share an encoder
-# with the transport under test.
-ciborium = { workspace = true }

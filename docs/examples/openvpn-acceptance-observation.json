@@ -1,0 +1,10 @@
+{
+  "schema": 1,
+  "case_id": "H02",
+  "outcome": "blocked",
+  "started_unix_ms": 0,
+  "ended_unix_ms": 0,
+  "observed": "NOT EXECUTED. Replace with actual observations and the reason for any blocked or failed result.",
+  "sanitized": false,
+  "evidence": []
+}

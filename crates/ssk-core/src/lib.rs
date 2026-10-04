@@ -6,9 +6,9 @@ extern crate alloc;
 use alloc::format;
 use alloc::vec;
 use ssk_types::{
-    ConnectionIntent, CoreNode, CostBudget, FacetId, FaultKind, HashAlg, IdentityRay,
-    KeyContextRef, LocatorKind, LocatorRay, LocatorTypeSet, MirrorFacet, ObjectKind, OrbitSeed,
-    Orientation, PhaseVector, ReplayNeed, ResidueKind, ResiduePolicy, ResidueRef, RiskBudget,
+    ConnectionIntent, CoreNode, CostBudget, FacetId, FacetOrientation, FaultKind, HashAlg,
+    IdentityRay, KeyContextRef, LocatorKind, LocatorRay, LocatorTypeSet, MirrorFacet, ObjectKind,
+    OrbitSeed, PhaseVector, ReplayNeed, ResidueKind, ResiduePolicy, ResidueRef, RiskBudget,
     RouteClass, Sector, SessionId, SessionIntent, TimingClass, TraceId, TransportClass,
 };
 
@@ -85,7 +85,7 @@ impl<'c> MirrorOrbit<'c> {
             core: self.core.id.clone(),
             phase: phase.clone(),
             // Phase 1 placeholder — no orientation logic exists yet.
-            orientation: Orientation::Forward,
+            orientation: FacetOrientation::Forward,
             sector,
             key_ctx: KeyContextRef::new(format!("orbit:{}:key-ctx", self.core.id.0 .0)),
             session: SessionId::new(format!("orbit:{}:session", self.core.id.0 .0)),

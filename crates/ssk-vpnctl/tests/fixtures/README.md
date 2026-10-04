@@ -1,0 +1,1 @@
+This JSON document contains synthetic, non-cryptographic fixture material. It must never be installed or used as VPN credentials. The parser tests validate the directive boundary; a real OpenVPN client must reject these fake certificates and keys.

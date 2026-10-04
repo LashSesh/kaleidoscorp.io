@@ -41,6 +41,31 @@ mod tests {
     use tokio::net::TcpListener;
 
     #[tokio::test]
+    async fn openvpn_cannot_be_disguised_as_a_tcp_proxy_hop() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let mut registry = AdapterRegistry::new();
+        registry.register(AdapterDescriptor {
+            adapter_id: "vpn".into(),
+            kind: AdapterKind::OpenVpn,
+            address: "127.0.0.1".into(),
+            port,
+            metadata: vec![],
+        });
+        let route = RouteKind::SingleHop(ssk_netadmin::HopSpec::new("vpn", "127.0.0.1", port));
+        let error = RouteExecutor::new(registry)
+            .connect(&route, ("127.0.0.1", port))
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), "OPENVPN_NOT_READY");
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), listener.accept())
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
     async fn direct_route_really_connects_to_a_real_local_listener() {
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let addr = listener.local_addr().expect("addr");

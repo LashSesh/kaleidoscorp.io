@@ -1,0 +1,36 @@
+{
+  "schema_version": 1,
+  "panel_state": "inconsistent",
+  "kill_switch": {
+    "audit_head_hex": "0000000000000000000000000000000000000000000000000000000000000000",
+    "audit_len": 0,
+    "is_alarm": true,
+    "journal_claims_engaged": true,
+    "logical_state": "engaged",
+    "os_rule": "unknown",
+    "protection_confirmed": false,
+    "receipt": null,
+    "recovery": "inconsistent",
+    "severity": "alarm",
+    "state_version": 0
+  },
+  "audit": {
+    "entries": [
+      {
+        "actor": "operator",
+        "entry_hash_hex": "0000000000000000000000000000000000000000000000000000000000000000",
+        "from_state": "armed",
+        "kind": "engage",
+        "reason": null,
+        "seq": 0,
+        "to_state": "engaged"
+      }
+    ],
+    "entry_count": 1,
+    "head_hex": "0000000000000000000000000000000000000000000000000000000000000000",
+    "integrity": {
+      "status": "unverified"
+    }
+  },
+  "connections": null
+}

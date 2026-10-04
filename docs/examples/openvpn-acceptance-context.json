@@ -1,0 +1,21 @@
+{
+  "schema": 1,
+  "vm_id": "REPLACE_WITH_DISPOSABLE_VM_ID",
+  "snapshot_id": "REPLACE_WITH_CLEAN_SNAPSHOT_ID",
+  "windows_build": "REPLACE_WITH_EXACT_WINDOWS_BUILD",
+  "locale": "en-US",
+  "disposable_vm": false,
+  "isolated_network": false,
+  "test_credentials_only": false,
+  "operator_sid": "S-1-5-21-1-2-3-1003",
+  "granted_sid": "S-1-5-21-1-2-3-1001",
+  "ungranted_sid": "S-1-5-21-1-2-3-1002",
+  "admin_without_grant_sid": "S-1-5-21-1-2-3-1003",
+  "source_revision": "0000000000000000000000000000000000000000",
+  "worktree_dirty": true,
+  "distribution": "REPLACE_WITH_APPROVED_OPENVPN_DISTRIBUTION_AND_VERSION",
+  "driver_version": "REPLACE_WITH_DRIVER_VERSION",
+  "approved_manifest_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+  "driver_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+  "configuration_sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+}

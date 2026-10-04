@@ -22,6 +22,11 @@
 //! than the file check on both platforms: a socket file appears at `bind`, well
 //! before the accept loop runs.
 
+include!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../tests/support/routing_config.rs"
+));
+
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -89,6 +94,7 @@ async fn spawn_daemon() -> (DaemonProcess, DaemonClient) {
     let stderr = std::fs::File::create(state_dir.path().join("sskd.err")).expect("stderr capture");
     let child = Command::new(env!("CARGO_BIN_EXE_sskd"))
         .env("SSK_STATE_DIR", state_dir.path())
+        .env("SSK_CONFIG_PATH", write_loopback_config(state_dir.path()))
         .stderr(Stdio::from(stderr))
         .spawn()
         .expect("spawn sskd");

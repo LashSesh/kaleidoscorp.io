@@ -6,21 +6,18 @@ use std::sync::Arc;
 use ssk_ipc::server::{BoxFuture, CommandHandler, Request, Response};
 use ssk_ipc::{
     AdapterHealthSummaryDto, AuditEntryDto, DaemonState, DoctorCheckDto, DoctorReportDto,
-    ExplainResponse, FlowInspectionDto, IpcError, PeerIdentity, ProfileSummaryDto, RouteTraceDto,
-    StatusDto, VerifyAuditChainResponse,
+    ExplainResponse, IpcError, PeerIdentity, ProfileSummaryDto, RouteTraceDto, StatusDto,
+    VerifyAuditChainResponse,
 };
 use ssk_netadmin::audit::AuditOutcome;
-use ssk_netadmin::policy::MatchCriteria;
-use ssk_netadmin::route::AdapterRegistryEntry;
-use ssk_netadmin::{
-    FlowDescriptor, FlowRecord, ForensicEntry, HopSpec, PolicyAction, PolicyEngine, PolicyRule,
-    ProtocolKind, RiskLevel, RouteKind, RouteOrchestrator,
-};
+use ssk_netadmin::{FlowDescriptor, FlowRecord, ForensicEntry, ProtocolKind, RiskLevel, RouteKind};
 use ssk_netcore::{DataPlane, EgressSession};
 use ssk_tensor::GenericFileLedgerBackend;
 use tokio::sync::Mutex;
 
+use crate::config_load::DaemonConfigError;
 use crate::killswitch::{KillSwitchProvider, KillSwitchView};
+use crate::routing::ConfiguredRouting;
 use crate::state::StateMachine;
 
 type PersistedAuditLedger =
@@ -42,7 +39,9 @@ struct Inner {
     state: StateMachine,
     active_profile: Option<String>,
     audit: PersistedAuditLedger,
-    audit_seq: u64,
+    config: Result<ssk_config::LoadedConfig, IpcError>,
+    routing: ConfiguredRouting,
+    activation_error: Option<IpcError>,
     data_plane: Box<dyn DataPlane>,
     /// The real, live egress session backing `Active`/`Protected` state.
     /// `None` whenever the daemon is not really holding an open connection —
@@ -51,6 +50,114 @@ struct Inner {
     /// Set from the real session's adapter chain at activation time; never
     /// hardcoded `true`.
     dns_protected: bool,
+}
+
+impl Inner {
+    fn clear_egress(&mut self) {
+        // Drop closes the transport even when a graceful shutdown would wait
+        // on an unresponsive peer. Failure paths must not retain an old session.
+        self.active_egress = None;
+        self.active_profile = None;
+        self.dns_protected = false;
+    }
+
+    fn refuse_activation(&mut self, error: IpcError) -> Response {
+        self.clear_egress();
+        let state = if self.config.is_err() {
+            DaemonState::ConfigInvalid
+        } else {
+            DaemonState::FailClosed
+        };
+        let unchanged = self.state.current() == state
+            && self
+                .activation_error
+                .as_ref()
+                .is_some_and(|old| old.code == error.code && old.message == error.message);
+        if !unchanged {
+            tracing::error!(code = %error.code, error = %error, "activation refused");
+            self.state.transition(state, &error.message);
+            self.state.emit(ssk_ipc::Event::Warning {
+                code: error.code.clone(),
+                message: error.message.clone(),
+            });
+        }
+        self.activation_error = Some(error.clone());
+        Response::Err(error)
+    }
+
+    fn record_activation(
+        &mut self,
+        flow_id: &str,
+        route: &RouteKind,
+        outcome: AuditOutcome,
+    ) -> Result<(), IpcError> {
+        // Refuse a corrupt existing chain, including a change during connect.
+        // This is prefix integrity, not an independently anchored checkpoint.
+        self.audit.verify()?;
+        let seq = u64::try_from(self.audit.len()?).map_err(|_| {
+            IpcError::new(
+                "Integrity",
+                "AUDIT_SEQUENCE_EXHAUSTED",
+                "audit sequence exhausted",
+            )
+        })?;
+        let entry = self.audit.record(
+            format!("activate-{seq}"),
+            flow_id,
+            None,
+            None,
+            route,
+            outcome,
+            0,
+        )?;
+        // Deriving the sequence from the persisted ledger prevents a restart
+        // from reusing activate-0 and keeps events aligned with entry IDs.
+        self.state.emit(ssk_ipc::Event::AuditAppended {
+            seq,
+            entry_hash: entry.entry_hash,
+        });
+        Ok(())
+    }
+
+    fn status(&mut self, view: KillSwitchView) -> StatusDto {
+        let audit_head = match self.audit.entries() {
+            Ok(entries) => entries.last().map(|entry| entry.entry_hash.clone()),
+            Err(error) => {
+                if self.config.is_ok() {
+                    self.refuse_activation(error.into());
+                }
+                None
+            }
+        };
+        let (kill_switch, broker_error) = kill_switch_fields(view);
+        let mut last_error = self.activation_error.clone();
+        if let Some(broker_error) = broker_error {
+            if let Some(error) = &mut last_error {
+                // The activation failure takes priority, but an unknown
+                // kill-switch must remain explicitly visible on the wire.
+                error
+                    .next_steps
+                    .push(format!("{}: {}", broker_error.code, broker_error.message));
+                error.next_steps.extend(broker_error.next_steps);
+            } else {
+                last_error = Some(broker_error);
+            }
+        }
+        StatusDto {
+            state: self.state.current(),
+            active_profile: self.active_profile.clone(),
+            adapters: self
+                .active_egress
+                .as_ref()
+                .map(adapter_health_from_session)
+                .unwrap_or_default(),
+            dns_protected: self.dns_protected,
+            kill_switch,
+            audit_head,
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            last_error,
+        }
+    }
 }
 
 /// Build the two `StatusDto` fields that carry the kill-switch answer.
@@ -79,19 +186,46 @@ impl Supervisor {
     /// unelevated machine can stand up. Pass
     /// [`crate::killswitch::NoProvider`] when there is no broker to ask — it
     /// answers `Unknown`, never `NotEngaged`.
+    /// `config` is mandatory: a failed load keeps diagnosis reachable in
+    /// `ConfigInvalid` and cannot be replaced by implicit defaults here.
     #[must_use]
     pub fn new(
         audit_path: PathBuf,
         data_plane: Box<dyn DataPlane>,
         kill_switch: Box<dyn KillSwitchProvider>,
+        config: Result<ssk_config::LoadedConfig, DaemonConfigError>,
     ) -> Self {
+        // Even callers constructing LoadedConfig directly must validate it.
+        let config = config
+            .and_then(|loaded| {
+                loaded.config.validate()?;
+                Ok(loaded)
+            })
+            .map_err(|error| {
+                IpcError::new("Config", "CONFIG_INVALID", error.to_string()).with_next_step(
+                    "Fix SSK_CONFIG_PATH and its configuration, then restart the daemon.",
+                )
+            });
+        let routing = ConfiguredRouting::new(
+            &config
+                .as_ref()
+                .map(|loaded| loaded.config.routing.clone())
+                .unwrap_or_default(),
+        );
+        let mut state = StateMachine::default();
+        let activation_error = config.as_ref().err().cloned();
+        if let Some(error) = &activation_error {
+            state.transition(DaemonState::ConfigInvalid, &error.message);
+        }
         Self {
             kill_switch,
             inner: Mutex::new(Inner {
-                state: StateMachine::default(),
+                state,
                 active_profile: None,
                 audit: PersistedAuditLedger::persisted(audit_path),
-                audit_seq: 0,
+                config,
+                routing,
+                activation_error,
                 data_plane,
                 active_egress: None,
                 dns_protected: false,
@@ -169,63 +303,6 @@ impl Supervisor {
     }
 }
 
-fn reference_policy_engine() -> PolicyEngine {
-    // Same reference ruleset as `ssk-cli`'s `default_policy_engine` /
-    // `default_route_orchestrator` (`crates/ssk-cli/src/main.rs`). Real
-    // policy evaluation and route planning — not a stub — using a built-in
-    // demo ruleset until Phase 5's config-driven profile model ships.
-    PolicyEngine::new(vec![
-        PolicyRule {
-            rule_id: "allow-internal".into(),
-            description: "allow internal low-risk traffic".into(),
-            priority: 10,
-            criteria: MatchCriteria {
-                app_prefix: None,
-                dest_suffix: Some(".internal".into()),
-                protocol: None,
-                min_risk: None,
-                max_risk: Some(RiskLevel::Low),
-            },
-            action: PolicyAction::Allow,
-        },
-        PolicyRule {
-            rule_id: "proxy-high-risk".into(),
-            description: "route high-risk external traffic via socks5".into(),
-            priority: 20,
-            criteria: MatchCriteria {
-                app_prefix: None,
-                dest_suffix: None,
-                protocol: None,
-                min_risk: Some(RiskLevel::High),
-                max_risk: None,
-            },
-            action: PolicyAction::Redirect {
-                adapter_id: "socks5-exit".into(),
-            },
-        },
-        PolicyRule {
-            rule_id: "allow-low-risk-direct".into(),
-            description: "default profile: allow low-risk traffic direct".into(),
-            priority: 30,
-            criteria: MatchCriteria {
-                app_prefix: None,
-                dest_suffix: None,
-                protocol: None,
-                min_risk: None,
-                max_risk: Some(RiskLevel::Low),
-            },
-            action: PolicyAction::Allow,
-        },
-    ])
-}
-
-fn reference_route_orchestrator() -> RouteOrchestrator {
-    RouteOrchestrator::new(vec![AdapterRegistryEntry {
-        adapter_id: "socks5-exit".into(),
-        default_hop: HopSpec::new("socks5-exit", "proxy.corp.com", 1080),
-    }])
-}
-
 fn parse_protocol(s: &str) -> ProtocolKind {
     match s.to_ascii_lowercase().as_str() {
         "udp" => ProtocolKind::Udp,
@@ -271,31 +348,6 @@ fn parse_risk(s: &str) -> RiskLevel {
     }
 }
 
-/// The profiles this daemon actually knows about — the **single source of
-/// truth** for both `ListProfiles` and `ActivateProfile`.
-///
-/// Before this existed, `ListProfiles` hardcoded `"default"` and
-/// `ActivateProfile` never compared anything: `req.profile_id` was only
-/// `format!`ed into a flow id and stored. An auditor activated
-/// `totally-made-up-profile` and received `Protected` plus a hash-chained
-/// audit entry — the ledger cryptographically attesting to protection under a
-/// profile that does not exist. The ledger was not wrong about the hash; it
-/// was wrong about the world, which is the worst failure mode a tamper-evident
-/// record has.
-///
-/// Today the registry is exactly one entry. When a config-driven registry
-/// replaces the constant, the `activate ⊆ list` invariant is inherited rather
-/// than reimplemented, because both arms read this function.
-fn known_profiles() -> &'static [ProfileSummaryDto] {
-    static PROFILES: std::sync::OnceLock<Vec<ProfileSummaryDto>> = std::sync::OnceLock::new();
-    PROFILES.get_or_init(|| {
-        vec![ProfileSummaryDto {
-            id: "default".into(),
-            name: "Default".into(),
-        }]
-    })
-}
-
 /// Longest accepted `profile_id`.
 const MAX_PROFILE_ID_LEN: usize = 64;
 
@@ -307,7 +359,7 @@ enum ProfileRejection {
     /// Failed the shape check: empty, over-long, or containing bytes outside
     /// `[a-z0-9._-]`.
     Malformed,
-    /// Well-formed, but not in [`known_profiles`].
+    /// Well-formed, but not in the configured registry.
     Unknown,
 }
 
@@ -323,7 +375,7 @@ enum ProfileRejection {
 /// process running as the same user, which is precisely the reach this check
 /// exists to bound. Authentication narrowed the attacker set; it did not remove
 /// the need for input validation on a value that reaches a hash-chained ledger.
-fn validate_profile_id(id: &str) -> Result<(), ProfileRejection> {
+fn validate_profile_id(id: &str, profiles: &[ProfileSummaryDto]) -> Result<(), ProfileRejection> {
     if id.is_empty()
         || id.len() > MAX_PROFILE_ID_LEN
         || !id.bytes().all(|b| {
@@ -332,14 +384,14 @@ fn validate_profile_id(id: &str) -> Result<(), ProfileRejection> {
     {
         return Err(ProfileRejection::Malformed);
     }
-    if !known_profiles().iter().any(|p| p.id == id) {
+    if !profiles.iter().any(|p| p.id == id) {
         return Err(ProfileRejection::Unknown);
     }
     Ok(())
 }
 
-fn known_profile_ids() -> String {
-    known_profiles()
+fn known_profile_ids(profiles: &[ProfileSummaryDto]) -> String {
+    profiles
         .iter()
         .map(|p| p.id.as_str())
         .collect::<Vec<_>>()
@@ -413,36 +465,15 @@ impl CommandHandler for Supervisor {
         Box::pin(async move {
             match req {
                 Request::GetStatus => {
-                    let inner = self.inner.lock().await;
-                    let audit_head = inner
-                        .audit
-                        .entries()
-                        .ok()
-                        .and_then(|entries| entries.last().map(|e| e.entry_hash.clone()));
-                    let adapters = inner
-                        .active_egress
-                        .as_ref()
-                        .map(adapter_health_from_session)
-                        .unwrap_or_default();
-                    // The authoritative answer comes from the privileged
-                    // broker, not from this process. Until P3 there was no
-                    // broker to ask and this was a literal `false`; now that
-                    // one exists, a hardcoded `false` would be a fabricated
-                    // safe-looking value rather than an honest absence.
-                    let (kill_switch, last_error) = kill_switch_fields(self.kill_switch.view());
-                    Response::Status(StatusDto {
-                        state: inner.state.current(),
-                        active_profile: inner.active_profile.clone(),
-                        adapters,
-                        dns_protected: inner.dns_protected,
-                        kill_switch,
-                        audit_head,
-                        version: env!("CARGO_PKG_VERSION").to_string(),
-                        last_error,
-                    })
+                    let mut inner = self.inner.lock().await;
+                    Response::Status(inner.status(self.kill_switch.view()))
                 }
                 Request::ActivateProfile(req) => {
                     let mut inner = self.inner.lock().await;
+                    if let Err(error) = &inner.config {
+                        let error = error.clone();
+                        return inner.refuse_activation(error);
+                    }
 
                     // Validation runs before *anything* with a side effect —
                     // before the `Activating` transition, before the
@@ -468,14 +499,15 @@ impl CommandHandler for Supervisor {
                     // unbounded append is a disk-exhaustion DoS against the one
                     // artifact that must survive. The rejection is observable
                     // as an event and a log line instead.
-                    if let Err(rejection) = validate_profile_id(&req.profile_id) {
+                    let profiles = inner.routing.profiles();
+                    if let Err(rejection) = validate_profile_id(&req.profile_id, &profiles) {
                         let (code, message) = match rejection {
                             ProfileRejection::Malformed => (
                                 "PROFILE_ID_INVALID",
                                 format!(
                                     "profile_id must be 1..={MAX_PROFILE_ID_LEN} characters of \
                                      [a-z0-9._-]; known profiles: {}",
-                                    known_profile_ids()
+                                    known_profile_ids(&profiles)
                                 ),
                             ),
                             ProfileRejection::Unknown => (
@@ -483,7 +515,7 @@ impl CommandHandler for Supervisor {
                                 format!(
                                     "no profile `{}` is configured; known profiles: {}",
                                     req.profile_id,
-                                    known_profile_ids()
+                                    known_profile_ids(&profiles)
                                 ),
                             ),
                         };
@@ -505,6 +537,8 @@ impl CommandHandler for Supervisor {
                         );
                     }
 
+                    inner.clear_egress();
+                    inner.activation_error = None;
                     inner
                         .state
                         .transition(DaemonState::Activating, "activate_profile requested");
@@ -538,8 +572,19 @@ impl CommandHandler for Supervisor {
                         }
                     };
 
-                    let engine = reference_policy_engine();
-                    let orchestrator = reference_route_orchestrator();
+                    if !ssk_config::routing::valid_host(&dest_host) || dest_port == 0 {
+                        return inner.refuse_activation(IpcError::new(
+                            "Usage",
+                            "DEST_INVALID",
+                            "destination requires a valid hostname/IP and nonzero port",
+                        ));
+                    }
+
+                    let engine = inner
+                        .routing
+                        .engine(&req.profile_id)
+                        .expect("validated profile");
+                    let orchestrator = &inner.routing.orchestrator;
                     let flow = FlowRecord::new(
                         format!("activate:{}", req.profile_id),
                         0,
@@ -554,11 +599,11 @@ impl CommandHandler for Supervisor {
                     let planned = engine.evaluate(&flow).and_then(|decision| {
                         orchestrator
                             .plan(&flow, &decision)
-                            .map(|candidate| candidate.route)
+                            .map(|candidate| (decision, candidate.route))
                     });
 
-                    let route = match planned {
-                        Ok(route) => route,
+                    let (decision, route) = match planned {
+                        Ok(plan) => plan,
                         Err(err) => {
                             inner.active_profile = None;
                             inner.state.transition(
@@ -569,19 +614,39 @@ impl CommandHandler for Supervisor {
                         }
                     };
 
-                    let outcome = if matches!(route, RouteKind::Denied { .. }) {
-                        AuditOutcome::Denied
-                    } else {
-                        AuditOutcome::Dispatched
+                    let admission = match inner.routing.orchestrator.admit(&flow, &decision) {
+                        Ok(admission) => admission,
+                        Err(error) => {
+                            if let Err(audit_error) =
+                                inner.record_activation(&flow.flow_id, &route, AuditOutcome::Denied)
+                            {
+                                return inner.refuse_activation(audit_error);
+                            }
+                            return inner.refuse_activation(error.into());
+                        }
                     };
-                    let seq = inner.audit_seq;
-                    inner.audit_seq += 1;
-
-                    match inner
-                        .data_plane
-                        .connect_route(&route, (&dest_host, dest_port))
-                        .await
-                    {
+                    // A durable intent precedes every network attempt. It is
+                    // explicitly pending, never a fabricated successful dispatch.
+                    if let Err(error) = inner.record_activation(
+                        &flow.flow_id,
+                        &route,
+                        AuditOutcome::DispatchPending,
+                    ) {
+                        return inner.refuse_activation(error);
+                    }
+                    let connected = inner.data_plane.connect_route(admission).await;
+                    let outcome = if connected.is_ok() {
+                        AuditOutcome::Dispatched
+                    } else {
+                        AuditOutcome::FailClosed
+                    };
+                    if let Err(error) = inner.record_activation(&flow.flow_id, &route, outcome) {
+                        // Keep the new session local until its result is durable.
+                        // Drop closes it before any failure response or event.
+                        drop(connected);
+                        return inner.refuse_activation(error);
+                    }
+                    match connected {
                         Ok(session) => {
                             inner.dns_protected = dns_protected_for(&dest_host, &session);
                             let reason =
@@ -591,6 +656,8 @@ impl CommandHandler for Supervisor {
                             inner.state.transition(DaemonState::Protected, reason);
                         }
                         Err(err) => {
+                            inner.activation_error =
+                                Some(IpcError::new("Runtime", err.code(), err.to_string()));
                             inner.active_profile = None;
                             inner.dns_protected = false;
                             inner.state.transition(
@@ -600,58 +667,7 @@ impl CommandHandler for Supervisor {
                         }
                     }
 
-                    let record_outcome = if inner.state.current() == DaemonState::Protected {
-                        outcome
-                    } else {
-                        AuditOutcome::FailClosed
-                    };
-                    let entry_hash = inner
-                        .audit
-                        .record(
-                            format!("activate-{seq}"),
-                            flow.flow_id.clone(),
-                            None,
-                            None,
-                            &route,
-                            record_outcome,
-                            0,
-                        )
-                        .ok()
-                        .map(|e| e.entry_hash);
-                    if let Some(entry_hash) = entry_hash {
-                        inner
-                            .state
-                            .emit(ssk_ipc::Event::AuditAppended { seq, entry_hash });
-                    }
-
-                    let state = inner.state.current();
-                    let active_profile = inner.active_profile.clone();
-                    let adapters = inner
-                        .active_egress
-                        .as_ref()
-                        .map(adapter_health_from_session)
-                        .unwrap_or_default();
-                    let dns_protected = inner.dns_protected;
-                    let audit_head = inner
-                        .audit
-                        .entries()
-                        .ok()
-                        .and_then(|entries| entries.last().map(|e| e.entry_hash.clone()));
-                    // Same source of truth as `GetStatus`. Reporting the
-                    // kill-switch on the activation response too is what stops
-                    // a client that only ever activates from being told
-                    // "kill_switch: false" forever.
-                    let (kill_switch, last_error) = kill_switch_fields(self.kill_switch.view());
-                    Response::Status(StatusDto {
-                        state,
-                        active_profile,
-                        adapters,
-                        dns_protected,
-                        kill_switch,
-                        audit_head,
-                        version: env!("CARGO_PKG_VERSION").to_string(),
-                        last_error,
-                    })
+                    Response::Status(inner.status(self.kill_switch.view()))
                 }
                 Request::Deactivate(req) => {
                     let mut inner = self.inner.lock().await;
@@ -677,14 +693,12 @@ impl CommandHandler for Supervisor {
                     }
                     inner.active_profile = None;
                     inner.dns_protected = false;
-                    inner
-                        .state
-                        .transition(DaemonState::Inactive, "deactivate requested");
-                    let audit_head = inner
-                        .audit
-                        .entries()
-                        .ok()
-                        .and_then(|entries| entries.last().map(|e| e.entry_hash.clone()));
+                    let state = if inner.config.is_err() {
+                        DaemonState::ConfigInvalid
+                    } else {
+                        DaemonState::Inactive
+                    };
+                    inner.state.transition(state, "deactivate requested");
 
                     // Deactivating this daemon's own egress session says
                     // nothing about the privileged broker's kill-switch: the
@@ -692,56 +706,34 @@ impl CommandHandler for Supervisor {
                     // a `release_kill_switch=true` here does not reach the
                     // broker (routing that verb through it is P3 CLI work, not
                     // done). So this is re-read, not assumed released.
-                    let (kill_switch, last_error) = kill_switch_fields(self.kill_switch.view());
-                    Response::Status(StatusDto {
-                        state: DaemonState::Inactive,
-                        active_profile: None,
-                        adapters: vec![],
-                        dns_protected: false,
-                        kill_switch,
-                        audit_head,
-                        version: env!("CARGO_PKG_VERSION").to_string(),
-                        last_error,
-                    })
+                    Response::Status(inner.status(self.kill_switch.view()))
                 }
                 Request::ListProfiles => {
-                    // Same source of truth `ActivateProfile` validates
-                    // against, so `list` and `activate` cannot drift apart.
-                    // Phase 5 (config v3) replaces the constant registry with
-                    // a config-driven one; the invariant survives that change
-                    // because both arms read `known_profiles()`.
-                    Response::Profiles(known_profiles().to_vec())
-                }
-                Request::InspectFlow { flow_id } => {
-                    let engine = reference_policy_engine();
-                    let flow = FlowRecord::new(
-                        &flow_id,
-                        0,
-                        FlowDescriptor::new(
-                            "unknown-app",
-                            "unknown.host",
-                            0,
-                            ProtocolKind::Tcp,
-                            RiskLevel::Low,
-                        ),
-                    );
-                    match engine.evaluate(&flow) {
-                        Ok(decision) => Response::FlowInspection(FlowInspectionDto {
-                            descriptor: flow.descriptor.clone(),
-                            matched_rule: decision.matched_rule.clone(),
-                            action: decision.action.clone(),
-                            route: ssk_netadmin::RouteKind::Denied {
-                                reason: "inspect_flow does not execute a route, only classifies"
-                                    .into(),
-                            },
-                            requires_attestation: false,
-                        }),
-                        Err(err) => Response::Err(err.into()),
+                    let inner = self.inner.lock().await;
+                    match &inner.config {
+                        Ok(_) => Response::Profiles(inner.routing.profiles()),
+                        Err(error) => Response::Err(error.clone()),
                     }
                 }
+                Request::InspectFlow { flow_id: _ } => Response::Err(IpcError::new(
+                    "Runtime",
+                    "FLOW_NOT_FOUND",
+                    "No captured flow is available; use trace-route for a policy preview.",
+                )),
                 Request::TraceRoute(req) => {
-                    let engine = reference_policy_engine();
-                    let orchestrator = reference_route_orchestrator();
+                    let inner = self.inner.lock().await;
+                    if let Err(error) = &inner.config {
+                        return Response::Err(error.clone());
+                    }
+                    let profile = inner
+                        .active_profile
+                        .as_ref()
+                        .unwrap_or(&inner.routing.default_profile);
+                    let engine = inner
+                        .routing
+                        .engine(profile)
+                        .expect("validated default/active profile");
+                    let orchestrator = &inner.routing.orchestrator;
                     let flow = FlowRecord::new(
                         "trace",
                         0,
@@ -765,6 +757,7 @@ impl CommandHandler for Supervisor {
                                 ssk_netadmin::RouteKind::MultiHop(hops) => {
                                     hops.iter().map(|h| h.adapter_id.clone()).collect()
                                 }
+                                RouteKind::OpenVpn { adapter_id, .. } => vec![adapter_id.clone()],
                                 _ => vec![],
                             };
                             Response::RouteTrace(RouteTraceDto {
@@ -818,9 +811,46 @@ impl CommandHandler for Supervisor {
                         }),
                     }
                 }
-                Request::RunDoctor => Response::Doctor(DoctorReportDto {
-                    checks: run_doctor_checks(),
-                }),
+                Request::RunDoctor => {
+                    let inner = self.inner.lock().await;
+                    let mut checks = run_doctor_checks();
+                    let (ok, detail, next_step) = match &inner.config {
+                        Ok(loaded) => (
+                            true,
+                            format!(
+                                "validated startup config v{}; routing uses validated configured profiles (unmatched flows denied)",
+                                loaded.config.version
+                            ),
+                            None,
+                        ),
+                        Err(error) => (
+                            false,
+                            error.message.clone(),
+                            error.next_steps.first().cloned(),
+                        ),
+                    };
+                    checks.push(DoctorCheckDto {
+                        name: "config".into(),
+                        ok,
+                        detail,
+                        next_step,
+                    });
+                    if let Ok(loaded) = &inner.config {
+                        for adapter in &loaded.config.routing.adapters {
+                            if matches!(
+                                adapter.transport,
+                                ssk_config::routing::AdapterTransport::OpenVpn { .. }
+                            ) {
+                                checks.push(DoctorCheckDto {
+                                    name: format!("openvpn:{}", adapter.id), ok: false,
+                                    detail: "OPENVPN_NOT_READY: profile configured; privileged broker lifecycle is not implemented".into(),
+                                    next_step: Some("OpenVPN activation requires the forthcoming broker integration; no direct fallback is permitted.".into()),
+                                });
+                            }
+                        }
+                    }
+                    Response::Doctor(DoctorReportDto { checks })
+                }
                 Request::ExplainError(req) => Response::Explain(explain_code(&req.code)),
                 Request::SubscribeEvents(_req) => {
                     // Actual event delivery happens out-of-band over the
@@ -835,15 +865,40 @@ impl CommandHandler for Supervisor {
 
 fn explain_code(code: &str) -> ExplainResponse {
     let (summary, details, next_steps): (&str, &str, Vec<&str>) = match code {
+        "OPENVPN_NOT_READY" => (
+            "The configured OpenVPN adapter is not available in this build.",
+            "A broker-managed OpenVPN lifecycle and verified tunnel binding are not implemented. This selection opens no direct connection.",
+            vec!["Keep the VPN requirement in the profile; OpenVPN support must be completed before activating it."],
+        ),
+        "ATTESTATION_REQUIRED" => (
+            "The matched rule requires a verified attestation.",
+            "The daemon does not yet accept flow-bound attestation evidence. Required attestation denies dispatch.",
+            vec!["Complete the flow-bound attestation verifier before activating this rule."],
+        ),
+        "DEST_INVALID" => (
+            "The destination is invalid.",
+            "A hostname or literal IP and a nonzero port are required.",
+            vec!["Pass a valid --dest host:port."],
+        ),
+        "CONFIG_INVALID" => (
+            "The daemon's startup configuration is invalid or unreadable.",
+            "Activation is disabled; status and diagnostics remain available. Deactivation does not clear the configuration error.",
+            vec!["Fix SSK_CONFIG_PATH and its configuration, then restart the daemon."],
+        ),
+        "LEDGER_IO_FAILED" => (
+            "The audit ledger could not be read or durably written.",
+            "Activation requires a durable intent before dispatch and a durable result before Protected. A connection without that result is closed.",
+            vec!["Inspect the ledger path, available storage and permissions; preserve the existing ledger before recovery."],
+        ),
+        "AUDIT_SEQUENCE_EXHAUSTED" => (
+            "The audit sequence cannot represent another entry.",
+            "The daemon refuses activation instead of reusing an audit identifier.",
+            vec!["Preserve and archive the ledger using an approved retention procedure before recovery."],
+        ),
         "NO_POLICY_MATCH" => (
             "No policy rule matched this flow.",
             "The policy engine evaluates rules by priority; when none match, the flow is denied fail-closed.",
             vec!["Add a policy rule covering this destination/app/risk combination."],
-        ),
-        "ATTESTATION_REQUIRED" => (
-            "Attestation is required but was not presented.",
-            "The matched route requires a verified capability attestation before dispatch.",
-            vec!["Present a signed attestation for this flow."],
         ),
         "ATTESTATION_INVALID" => (
             "Attestation verification failed.",
@@ -872,11 +927,6 @@ fn explain_code(code: &str) -> ExplainResponse {
             "The flow was denied by fail-closed policy.",
             "No rule explicitly allowed this flow, so it was denied rather than silently passed.",
             vec!["Add an explicit policy rule if this traffic should be allowed."],
-        ),
-        "CONFIG_INVALID" => (
-            "The configuration file failed validation.",
-            "Config validation is fail-closed: an invalid file is rejected rather than partially applied.",
-            vec!["Fix the reported field and reload."],
         ),
         "INSECURE_KEY_REJECTED" => (
             "An all-zero attestation/MAC key was rejected.",
@@ -915,6 +965,10 @@ fn explain_code(code: &str) -> ExplainResponse {
 
 #[cfg(test)]
 mod tests {
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../tests/support/routing_config.rs"
+    ));
     use super::*;
     use ssk_netcore::{AdapterRegistry, NetcoreDataPlane, RouteExecutor};
     use tokio::net::TcpListener;
@@ -933,7 +987,10 @@ mod tests {
     ) -> (Supervisor, tempfile::TempDir) {
         let dir = tempfile::tempdir().expect("tempdir");
         let audit_path = dir.path().join("audit.json");
-        (Supervisor::new(audit_path, data_plane, kill_switch), dir)
+        (
+            Supervisor::new(audit_path, data_plane, kill_switch, Ok(loopback_config())),
+            dir,
+        )
     }
 
     /// A provider that answers a fixed view, so the DTO projection can be
@@ -1014,13 +1071,15 @@ mod tests {
         (listener, "127.0.0.1".to_string(), addr.port())
     }
 
-    /// A real, guaranteed-closed port: bound then immediately dropped, so
-    /// connecting to it genuinely fails (`ECONNREFUSED`), never simulated.
-    async fn unreachable_dest() -> (String, u16) {
-        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
-        let port = listener.local_addr().expect("addr").port();
-        drop(listener);
-        ("127.0.0.1".to_string(), port)
+    /// Reserve the port without listening. Keeping the socket alive prevents
+    /// another parallel test from reusing a supposedly closed destination.
+    fn unreachable_dest() -> (tokio::net::TcpSocket, String, u16) {
+        let socket = tokio::net::TcpSocket::new_v4().expect("socket");
+        socket
+            .bind("127.0.0.1:0".parse().expect("address"))
+            .expect("bind");
+        let port = socket.local_addr().expect("addr").port();
+        (socket, "127.0.0.1".to_string(), port)
     }
 
     /// The identity a transport would have verified. Every test drives the
@@ -1077,7 +1136,7 @@ mod tests {
     #[tokio::test]
     async fn activate_with_no_route_fails_closed() {
         let (sup, _dir) = supervisor_with(real_data_plane());
-        let (host, port) = unreachable_dest().await;
+        let (_reserved, host, port) = unreachable_dest();
         let resp = call(
             &sup,
             Request::ActivateProfile(ssk_ipc::ActivateProfileRequest {
@@ -1091,6 +1150,11 @@ mod tests {
             Response::Status(status) => assert_eq!(status.state, DaemonState::FailClosed),
             other => panic!("unexpected response: {other:?}"),
         }
+        let inner = sup.inner.lock().await;
+        let entries = inner.audit.entries().expect("persisted failed attempt");
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].outcome, AuditOutcome::DispatchPending);
+        assert_eq!(entries[1].outcome, AuditOutcome::FailClosed);
     }
 
     #[tokio::test]
@@ -1119,7 +1183,7 @@ mod tests {
     #[tokio::test]
     async fn deactivate_requires_kill_switch_release_when_fail_closed() {
         let (sup, _dir) = supervisor_with(real_data_plane());
-        let (host, port) = unreachable_dest().await;
+        let (_reserved, host, port) = unreachable_dest();
         call(
             &sup,
             Request::ActivateProfile(ssk_ipc::ActivateProfileRequest {
@@ -1188,117 +1252,6 @@ mod tests {
             other => panic!("unexpected response: {other:?}"),
         }
         accept.await.expect("join").expect("accept");
-    }
-
-    #[tokio::test]
-    async fn trace_route_classifies_high_risk_via_socks5() {
-        let (sup, _dir) = supervisor_with(real_data_plane());
-        let resp = call(
-            &sup,
-            Request::TraceRoute(ssk_ipc::RouteTraceRequest {
-                app_id: Some("browser".into()),
-                dest_host: "risky.example.com".into(),
-                dest_port: 443,
-                protocol: "https".into(),
-                risk: "high".into(),
-            }),
-        )
-        .await;
-        match resp {
-            Response::RouteTrace(dto) => {
-                assert!(matches!(dto.route, ssk_netadmin::RouteKind::SingleHop(_)));
-                assert_eq!(dto.hops, vec!["socks5-exit".to_string()]);
-            }
-            other => panic!("unexpected response: {other:?}"),
-        }
-    }
-
-    /// `trace_route_classifies_high_risk_via_socks5` above proves the
-    /// *plan*; this proves the *dispatch* — that the daemon's reference
-    /// `socks5-exit` adapter (the same one `main.rs` registers in its real
-    /// `AdapterRegistry`) genuinely round-trips a SOCKS5 handshake when a
-    /// real `RouteExecutor` is pointed at a real (fake, but wire-protocol
-    /// compliant) SOCKS5 server — not just Direct, which every other test
-    /// in this module exercises.
-    #[tokio::test]
-    async fn high_risk_route_really_dispatches_through_a_real_socks5_proxy() {
-        use ssk_netadmin::adapter::{AdapterDescriptor, AdapterKind};
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
-        let proxy_addr = listener.local_addr().expect("addr");
-        tokio::spawn(async move {
-            let (mut sock, _) = listener.accept().await.expect("accept");
-            let mut greeting = [0u8; 2];
-            sock.read_exact(&mut greeting).await.expect("greeting");
-            let mut methods = vec![0u8; greeting[1] as usize];
-            sock.read_exact(&mut methods).await.expect("methods");
-            sock.write_all(&[0x05, 0x00]).await.expect("method reply");
-
-            let mut head = [0u8; 4];
-            sock.read_exact(&mut head).await.expect("req head");
-            let mut len = [0u8; 1];
-            sock.read_exact(&mut len).await.expect("domain len");
-            let mut domain = vec![0u8; len[0] as usize];
-            sock.read_exact(&mut domain).await.expect("domain");
-            let mut port = [0u8; 2];
-            sock.read_exact(&mut port).await.expect("port");
-            assert_eq!(&domain, b"risky.example.com");
-
-            sock.write_all(&[0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
-                .await
-                .expect("success reply");
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        });
-
-        let engine = reference_policy_engine();
-        let flow = FlowRecord::new(
-            "high-risk-flow",
-            0,
-            FlowDescriptor::new(
-                "browser",
-                "risky.example.com",
-                443,
-                ProtocolKind::Https,
-                RiskLevel::High,
-            ),
-        );
-        let decision = engine.evaluate(&flow).expect("policy eval");
-        assert_eq!(
-            decision.action,
-            PolicyAction::Redirect {
-                adapter_id: "socks5-exit".into()
-            },
-            "the real policy engine must select the socks5-exit redirect for high risk"
-        );
-
-        // `reference_route_orchestrator()`'s `HopSpec` hardcodes a
-        // non-functional placeholder address (`proxy.corp.com:1080` — a
-        // demo value, same as `ssk-cli`'s `default_route_orchestrator`),
-        // exactly like a real deployment's config would name a real relay.
-        // To prove *dispatch* rather than *planning* for real, this test
-        // builds the same `RouteKind::SingleHop("socks5-exit", ...)` shape
-        // the real orchestrator would plan, but pointed at this test's own
-        // real, reachable fake proxy instead of the placeholder domain.
-        let route = ssk_netadmin::route::RouteKind::SingleHop(HopSpec::new(
-            "socks5-exit",
-            "127.0.0.1",
-            proxy_addr.port(),
-        ));
-        let mut registry = AdapterRegistry::new();
-        registry.register(AdapterDescriptor {
-            adapter_id: "socks5-exit".into(),
-            kind: AdapterKind::Socks5,
-            address: "127.0.0.1".into(),
-            port: proxy_addr.port(),
-            metadata: vec![],
-        });
-        let executor = RouteExecutor::new(registry);
-        let session = executor
-            .connect(&route, ("risky.example.com", 443))
-            .await
-            .expect("the socks5-exit route must really dispatch through the proxy");
-        assert_eq!(session.chain(), &[AdapterKind::Socks5]);
     }
 
     #[tokio::test]
@@ -1483,7 +1436,7 @@ mod tests {
 
         for profile in &listed {
             assert!(
-                validate_profile_id(&profile.id).is_ok(),
+                validate_profile_id(&profile.id, &listed).is_ok(),
                 "`{}` is listed, so it must be activatable",
                 profile.id
             );
@@ -1491,7 +1444,7 @@ mod tests {
         for candidate in ["default-", "defaul", "defaultx", "other", "profile.1"] {
             let is_listed = listed.iter().any(|p| p.id == candidate);
             assert_eq!(
-                validate_profile_id(candidate).is_ok(),
+                validate_profile_id(candidate, &listed).is_ok(),
                 is_listed,
                 "`{candidate}` must be activatable exactly when it is listed"
             );
@@ -1504,7 +1457,15 @@ mod tests {
         match call(&sup, Request::ListProfiles).await {
             Response::Profiles(p) => {
                 let ids: Vec<_> = p.iter().map(|x| x.id.clone()).collect();
-                let known: Vec<_> = known_profiles().iter().map(|x| x.id.clone()).collect();
+                let known: Vec<_> = sup
+                    .inner
+                    .lock()
+                    .await
+                    .routing
+                    .profiles()
+                    .iter()
+                    .map(|x| x.id.clone())
+                    .collect();
                 assert_eq!(ids, known);
             }
             other => panic!("unexpected response: {other:?}"),

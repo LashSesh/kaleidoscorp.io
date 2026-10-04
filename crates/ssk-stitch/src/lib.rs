@@ -1,7 +1,8 @@
 #![forbid(unsafe_code)]
 
 use ssk_types::{
-    ConnectionIntent, HealthStatus, MirrorFacet, Orientation, RouteClass, StitchCandidate, StitchId,
+    ConnectionIntent, FacetOrientation, HealthStatus, MirrorFacet, RouteClass, StitchCandidate,
+    StitchId,
 };
 
 /// Whether the `facet`/`locator` crossing this candidate is about to attempt
@@ -44,7 +45,7 @@ fn replay_ready(facet: &MirrorFacet, locator: &ssk_types::LocatorFacet) -> bool 
 /// `MirrorFacet` field about the facet's own relationship to its core that
 /// isn't already spoken for elsewhere.
 fn focus_ready(facet: &MirrorFacet) -> bool {
-    facet.orientation == Orientation::Forward
+    facet.orientation == FacetOrientation::Forward
 }
 
 pub fn from_intent(
@@ -75,7 +76,12 @@ pub fn from_intent(
 mod tests {
     use super::*;
     use ssk_gates::{BcikGate, BoundaryGate, FocusGate, Gate, GateCtx, ReplayGate};
+    use ssk_imdf::closure::FourPiClosure;
     use ssk_types::*;
+
+    fn fresh_closure() -> FourPiClosure {
+        FourPiClosure::new(TraceId::new("stitch-test-closure"))
+    }
 
     fn sample_core() -> CoreNode {
         CoreNode {
@@ -94,7 +100,7 @@ mod tests {
             id: FacetId::of(&"f1", HashAlg::Blake3).expect("hash"),
             core: CoreId::new("c1"),
             phase: PhaseVector::zero(),
-            orientation: Orientation::Forward,
+            orientation: FacetOrientation::Forward,
             sector: Sector::Identity,
             key_ctx: KeyContextRef::new("kc"),
             session: SessionId::new("sess"),
@@ -155,7 +161,10 @@ mod tests {
         let sc = from_intent(sample_intent(), facet, sample_locator());
         assert!(!sc.seam_ok, "seam_ok must be false with an empty trace");
         assert!(
-            matches!(BcikGate.evaluate(&sc, &GateCtx), GateVerdict::Reject(_)),
+            matches!(
+                BcikGate.evaluate(&sc, &GateCtx, &mut fresh_closure()),
+                GateVerdict::Reject(_)
+            ),
             "BcikGate must reject a candidate whose seam_ok is false"
         );
     }
@@ -167,7 +176,10 @@ mod tests {
         let sc = from_intent(sample_intent(), sample_facet(), locator);
         assert!(!sc.seam_ok, "seam_ok must be false when locator is Down");
         assert!(
-            matches!(BcikGate.evaluate(&sc, &GateCtx), GateVerdict::Reject(_)),
+            matches!(
+                BcikGate.evaluate(&sc, &GateCtx, &mut fresh_closure()),
+                GateVerdict::Reject(_)
+            ),
             "BcikGate must reject a candidate whose locator health is not Live"
         );
     }
@@ -182,7 +194,10 @@ mod tests {
             "seam_ok must be false when the route is Denied"
         );
         assert!(
-            matches!(BcikGate.evaluate(&sc, &GateCtx), GateVerdict::Reject(_)),
+            matches!(
+                BcikGate.evaluate(&sc, &GateCtx, &mut fresh_closure()),
+                GateVerdict::Reject(_)
+            ),
             "BcikGate must reject a candidate whose route is Denied"
         );
     }
@@ -192,7 +207,7 @@ mod tests {
         let sc = from_intent(sample_intent(), sample_facet(), sample_locator());
         assert!(sc.seam_ok);
         assert!(matches!(
-            BcikGate.evaluate(&sc, &GateCtx),
+            BcikGate.evaluate(&sc, &GateCtx, &mut fresh_closure()),
             GateVerdict::Pass(_)
         ));
     }
@@ -209,7 +224,10 @@ mod tests {
             "boundary_complete must be false with an empty BoundaryRef"
         );
         assert!(
-            matches!(BoundaryGate.evaluate(&sc, &GateCtx), GateVerdict::Reject(_)),
+            matches!(
+                BoundaryGate.evaluate(&sc, &GateCtx, &mut fresh_closure()),
+                GateVerdict::Reject(_)
+            ),
             "BoundaryGate must reject a candidate whose boundary_complete is false"
         );
     }
@@ -224,7 +242,10 @@ mod tests {
             "boundary_complete must be false with an empty ResidueRef"
         );
         assert!(
-            matches!(BoundaryGate.evaluate(&sc, &GateCtx), GateVerdict::Reject(_)),
+            matches!(
+                BoundaryGate.evaluate(&sc, &GateCtx, &mut fresh_closure()),
+                GateVerdict::Reject(_)
+            ),
             "BoundaryGate must reject a candidate whose boundary_complete is false"
         );
     }
@@ -234,7 +255,7 @@ mod tests {
         let sc = from_intent(sample_intent(), sample_facet(), sample_locator());
         assert!(sc.boundary_complete);
         assert!(matches!(
-            BoundaryGate.evaluate(&sc, &GateCtx),
+            BoundaryGate.evaluate(&sc, &GateCtx, &mut fresh_closure()),
             GateVerdict::Pass(_)
         ));
     }
@@ -251,7 +272,10 @@ mod tests {
             "replay_ready must be false with an empty session id"
         );
         assert!(
-            matches!(ReplayGate.evaluate(&sc, &GateCtx), GateVerdict::Reject(_)),
+            matches!(
+                ReplayGate.evaluate(&sc, &GateCtx, &mut fresh_closure()),
+                GateVerdict::Reject(_)
+            ),
             "ReplayGate must reject a candidate whose replay_ready is false"
         );
     }
@@ -266,7 +290,10 @@ mod tests {
             "replay_ready must be false when locator.ttl is zero"
         );
         assert!(
-            matches!(ReplayGate.evaluate(&sc, &GateCtx), GateVerdict::Reject(_)),
+            matches!(
+                ReplayGate.evaluate(&sc, &GateCtx, &mut fresh_closure()),
+                GateVerdict::Reject(_)
+            ),
             "ReplayGate must reject a candidate whose replay_ready is false"
         );
     }
@@ -276,7 +303,7 @@ mod tests {
         let sc = from_intent(sample_intent(), sample_facet(), sample_locator());
         assert!(sc.replay_ready);
         assert!(matches!(
-            ReplayGate.evaluate(&sc, &GateCtx),
+            ReplayGate.evaluate(&sc, &GateCtx, &mut fresh_closure()),
             GateVerdict::Pass(_)
         ));
     }
@@ -286,14 +313,17 @@ mod tests {
     #[test]
     fn focus_ready_is_false_when_facet_orientation_is_reverse_and_focus_gate_rejects() {
         let mut facet = sample_facet();
-        facet.orientation = Orientation::Reverse;
+        facet.orientation = FacetOrientation::Reverse;
         let sc = from_intent(sample_intent(), facet, sample_locator());
         assert!(
             !sc.focus_ready,
             "focus_ready must be false for a Reverse-oriented facet"
         );
         assert!(
-            matches!(FocusGate.evaluate(&sc, &GateCtx), GateVerdict::Reject(_)),
+            matches!(
+                FocusGate.evaluate(&sc, &GateCtx, &mut fresh_closure()),
+                GateVerdict::Reject(_)
+            ),
             "FocusGate must reject a candidate whose focus_ready is false"
         );
     }
@@ -303,7 +333,7 @@ mod tests {
         let sc = from_intent(sample_intent(), sample_facet(), sample_locator());
         assert!(sc.focus_ready);
         assert!(matches!(
-            FocusGate.evaluate(&sc, &GateCtx),
+            FocusGate.evaluate(&sc, &GateCtx, &mut fresh_closure()),
             GateVerdict::Pass(_)
         ));
     }

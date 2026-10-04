@@ -6,9 +6,10 @@ pub mod pch;
 use ssk_bcik::Bcik;
 use ssk_core::MirrorOrbit;
 use ssk_crypto::Blake3HashProvider;
+use ssk_imdf::closure::FourPiClosure;
 use ssk_types::{
-    BoundaryResidue, CrossOutcome, GateId, GateOutcomeKind, GateReport, GateReportId, GateVerdict,
-    GateWitness, ResidueId, ResidueKind, Severity, StitchCandidate,
+    BoundaryResidue, GateId, GateOutcomeKind, GateReport, GateReportId, GateVerdict, GateWitness,
+    ResidueId, ResidueKind, Severity, StitchCandidate,
 };
 
 /// Risk score above which the Fiber gate rejects a locator.
@@ -32,7 +33,16 @@ pub trait Gate: Send + Sync {
     fn required(&self) -> bool;
     /// Typed residue emitted on failure.
     fn residue_on_fail(&self) -> ResidueKind;
-    fn evaluate(&self, sc: &StitchCandidate, ctx: &GateCtx) -> GateVerdict;
+    /// `closure` is the seam-scoped `FourPiClosure` accumulator for the one
+    /// candidate being gated in this `GateVector::evaluate` call (S1 item 1
+    /// close-out) — every gate except `BcikGate` ignores it, exactly as they
+    /// already ignore `ctx`, with zero semantic change.
+    fn evaluate(
+        &self,
+        sc: &StitchCandidate,
+        ctx: &GateCtx,
+        closure: &mut FourPiClosure,
+    ) -> GateVerdict;
 }
 
 fn pass(id: GateId) -> GateVerdict {
@@ -84,7 +94,12 @@ macro_rules! simple_gate {
                 $residue
             }
 
-            fn evaluate(&self, sc: &StitchCandidate, _ctx: &GateCtx) -> GateVerdict {
+            fn evaluate(
+                &self,
+                sc: &StitchCandidate,
+                _ctx: &GateCtx,
+                _closure: &mut FourPiClosure,
+            ) -> GateVerdict {
                 if $check(sc) {
                     pass($id)
                 } else {
@@ -124,7 +139,12 @@ impl Gate for MirrorGate {
         ResidueKind::Identity
     }
 
-    fn evaluate(&self, sc: &StitchCandidate, _ctx: &GateCtx) -> GateVerdict {
+    fn evaluate(
+        &self,
+        sc: &StitchCandidate,
+        _ctx: &GateCtx,
+        _closure: &mut FourPiClosure,
+    ) -> GateVerdict {
         if MirrorOrbit::for_core(&sc.core).recover(&sc.facet).is_ok() {
             pass(GateId::Mirror)
         } else {
@@ -165,13 +185,36 @@ impl Gate for BcikGate {
         ResidueKind::Boundary
     }
 
-    fn evaluate(&self, sc: &StitchCandidate, _ctx: &GateCtx) -> GateVerdict {
+    fn evaluate(
+        &self,
+        sc: &StitchCandidate,
+        _ctx: &GateCtx,
+        closure: &mut FourPiClosure,
+    ) -> GateVerdict {
         let provider = Blake3HashProvider;
         let mut bcik = Bcik::new(&provider);
-        if matches!(
-            bcik.cross(&sc.facet, &sc.locator, ssk_types::FiberType::Data, sc),
-            CrossOutcome::Closed(_)
-        ) {
+        // Cross for real: this records a genuine orientation pass into the
+        // caller-owned `closure` (seeding it so a later, real second crossing
+        // of this identical seam -- run_to_outcome's own materialization
+        // crossing -- can honestly evaluate 4pi-closure) and emits a genuine
+        // residue into `bcik`'s own register on structural failure. The
+        // return value is deliberately NOT this gate's pass/fail signal:
+        // gating on matches!(_, Closed(_)) would make BcikGate reject every
+        // candidate forever, since a lone first pass over a fresh closure can
+        // never close (Satz 12.4 needs a second, agreeing pass). BCIK A3
+        // (boundary existence) is this gate's own obligation; A4 (closure) is
+        // materialization's separate, stronger one (Satz 9.2) -- unchanged
+        // from every gate's pre-S1 behavior, since seam_ok && boundary_complete
+        // was always exactly what a lone crossing used to decide Closed vs
+        // Residue before S1 required a second pass.
+        let _ = bcik.cross(
+            &sc.facet,
+            &sc.locator,
+            ssk_types::FiberType::Data,
+            sc,
+            closure,
+        );
+        if sc.seam_ok && sc.boundary_complete {
             pass(GateId::Bcik)
         } else {
             reject(
@@ -204,7 +247,12 @@ impl Gate for HypercubeGate {
         ResidueKind::Boundary
     }
 
-    fn evaluate(&self, sc: &StitchCandidate, _ctx: &GateCtx) -> GateVerdict {
+    fn evaluate(
+        &self,
+        sc: &StitchCandidate,
+        _ctx: &GateCtx,
+        _closure: &mut FourPiClosure,
+    ) -> GateVerdict {
         match crate::pch::Hypercube::default().check(sc) {
             crate::pch::PchOutcome::Pass => pass(GateId::Hypercube),
             crate::pch::PchOutcome::Hold { axis, reason } => hold(
@@ -243,7 +291,12 @@ impl Gate for CapabilityGate {
         ResidueKind::Capability
     }
 
-    fn evaluate(&self, sc: &StitchCandidate, _ctx: &GateCtx) -> GateVerdict {
+    fn evaluate(
+        &self,
+        sc: &StitchCandidate,
+        _ctx: &GateCtx,
+        _closure: &mut FourPiClosure,
+    ) -> GateVerdict {
         match &sc.capability {
             None => reject(
                 GateId::Capability,
@@ -297,7 +350,12 @@ impl Gate for PrivacyGate {
         ResidueKind::Correlation
     }
 
-    fn evaluate(&self, sc: &StitchCandidate, _ctx: &GateCtx) -> GateVerdict {
+    fn evaluate(
+        &self,
+        sc: &StitchCandidate,
+        _ctx: &GateCtx,
+        _closure: &mut FourPiClosure,
+    ) -> GateVerdict {
         if ssk_privacy::linkability_score(&sc.locator) > PRIVACY_LINKABILITY_THRESHOLD {
             reject(
                 GateId::Privacy,
@@ -382,13 +440,13 @@ impl GateVector {
     /// `residues` regardless of which outcome wins the resolution (no silent
     /// loss), not only the residue of the winning bucket.
     #[must_use]
-    pub fn evaluate(&self, sc: &StitchCandidate) -> GateReport {
+    pub fn evaluate(&self, sc: &StitchCandidate, closure: &mut FourPiClosure) -> GateReport {
         let ctx = GateCtx;
         let mut witnesses = Vec::new();
         let (mut hold, mut refine, mut quarantine, mut reject) = (None, None, None, None);
 
         for gate in &self.gates {
-            match gate.evaluate(sc, &ctx) {
+            match gate.evaluate(sc, &ctx, closure) {
                 GateVerdict::Pass(w) => witnesses.push(w),
                 GateVerdict::Hold(r) => {
                     hold.get_or_insert(r);
@@ -437,7 +495,16 @@ impl GateVector {
 /// `ssk-core` naming `GateVector`) is what keeps the graph acyclic.
 impl ssk_core::connection::GateAuthority for GateVector {
     fn evaluate(&self, sc: &StitchCandidate) -> GateReport {
-        GateVector::evaluate(self, sc)
+        // `ssk-core`'s `GateAuthority` trait is deliberately minimal (a
+        // dependency-inversion boundary `ssk-core` must not gain an
+        // `ssk-imdf` edge across) and this typestate path has no shared
+        // accumulator from a prior real crossing to reuse. Standalone,
+        // single-use closure -- honestly disclosed, not a regression: see
+        // the design's item-2 verdict for why `TensorMaterializationSink`
+        // (the only real consumer of a `Connection<GatePassed>::materialize`)
+        // is in the same position.
+        let mut standalone = FourPiClosure::new(sc.facet.trace.clone());
+        GateVector::evaluate(self, sc, &mut standalone)
     }
 }
 
@@ -463,7 +530,7 @@ mod tests {
                 id: FacetId::of(&"f1", HashAlg::Blake3).expect("hash"),
                 core: CoreId::new("c1"),
                 phase: PhaseVector::zero(),
-                orientation: Orientation::Forward,
+                orientation: FacetOrientation::Forward,
                 sector: Sector::Identity,
                 key_ctx: KeyContextRef::new("kc"),
                 session: SessionId::new("sess"),
@@ -497,6 +564,10 @@ mod tests {
         }
     }
 
+    fn fresh_closure() -> FourPiClosure {
+        FourPiClosure::new(TraceId::new("gate-test-closure"))
+    }
+
     fn sample_capability_witness() -> CapabilityWitness {
         CapabilityWitness {
             id: CapabilityId::of(&"gate-test-capability", HashAlg::Blake3).expect("hash"),
@@ -518,7 +589,7 @@ mod tests {
     fn gate_vector_fail_closed() {
         let mut sc = candidate();
         sc.capability = None;
-        let report = GateVector::with_all_default().evaluate(&sc);
+        let report = GateVector::with_all_default().evaluate(&sc, &mut fresh_closure());
         assert_eq!(report.outcome, GateOutcomeKind::Reject);
     }
 
@@ -528,7 +599,10 @@ mod tests {
         let mut sc = candidate();
         sc.seam_ok = false;
         assert!(
-            matches!(gate.evaluate(&sc, &GateCtx), GateVerdict::Reject(_)),
+            matches!(
+                gate.evaluate(&sc, &GateCtx, &mut fresh_closure()),
+                GateVerdict::Reject(_)
+            ),
             "Hypercube must reject when seam_ok is false"
         );
     }
@@ -537,7 +611,10 @@ mod tests {
     fn hypercube_gate_passes_intact_seam() {
         let gate = HypercubeGate;
         let sc = candidate();
-        assert!(matches!(gate.evaluate(&sc, &GateCtx), GateVerdict::Pass(_)));
+        assert!(matches!(
+            gate.evaluate(&sc, &GateCtx, &mut fresh_closure()),
+            GateVerdict::Pass(_)
+        ));
     }
 
     #[test]
@@ -546,7 +623,10 @@ mod tests {
         let mut sc = candidate();
         sc.locator.risk_score = FIBER_RISK_THRESHOLD + 1;
         assert!(
-            matches!(gate.evaluate(&sc, &GateCtx), GateVerdict::Reject(_)),
+            matches!(
+                gate.evaluate(&sc, &GateCtx, &mut fresh_closure()),
+                GateVerdict::Reject(_)
+            ),
             "Fiber must reject risk_score > FIBER_RISK_THRESHOLD"
         );
     }
@@ -556,7 +636,10 @@ mod tests {
         let gate = FiberGate;
         let mut sc = candidate();
         sc.locator.risk_score = FIBER_RISK_THRESHOLD;
-        assert!(matches!(gate.evaluate(&sc, &GateCtx), GateVerdict::Pass(_)));
+        assert!(matches!(
+            gate.evaluate(&sc, &GateCtx, &mut fresh_closure()),
+            GateVerdict::Pass(_)
+        ));
     }
 
     #[test]
@@ -567,7 +650,10 @@ mod tests {
         sc.locator.risk_score = PRIVACY_LINKABILITY_THRESHOLD + 1;
         // linkability_score = risk_score (untrusted) = 51 > 50
         assert!(
-            matches!(gate.evaluate(&sc, &GateCtx), GateVerdict::Reject(_)),
+            matches!(
+                gate.evaluate(&sc, &GateCtx, &mut fresh_closure()),
+                GateVerdict::Reject(_)
+            ),
             "Privacy must reject when linkability score exceeds threshold"
         );
     }
@@ -576,14 +662,17 @@ mod tests {
     fn privacy_gate_passes_low_linkability() {
         let gate = PrivacyGate;
         let sc = candidate(); // trusted, risk_score=1 → linkability=0
-        assert!(matches!(gate.evaluate(&sc, &GateCtx), GateVerdict::Pass(_)));
+        assert!(matches!(
+            gate.evaluate(&sc, &GateCtx, &mut fresh_closure()),
+            GateVerdict::Pass(_)
+        ));
     }
 
     #[test]
     fn gate_vector_rejects_fiber_high_risk() {
         let mut sc = candidate();
         sc.locator.risk_score = 60; // passes Locator (≤70) but fails Fiber (>50)
-        let report = GateVector::with_all_default().evaluate(&sc);
+        let report = GateVector::with_all_default().evaluate(&sc, &mut fresh_closure());
         assert_eq!(report.outcome, GateOutcomeKind::Reject);
     }
 
@@ -596,7 +685,7 @@ mod tests {
     fn reject_is_never_masked_by_a_simultaneous_hold() {
         let mut sc = candidate();
         sc.locator.risk_score = 90;
-        let report = GateVector::with_all_default().evaluate(&sc);
+        let report = GateVector::with_all_default().evaluate(&sc, &mut fresh_closure());
         assert_eq!(
             report.outcome,
             GateOutcomeKind::Reject,
@@ -619,11 +708,15 @@ mod tests {
     fn worsening_risk_never_produces_a_milder_outcome() {
         let mut milder = candidate();
         milder.locator.risk_score = 60;
-        let milder_outcome = GateVector::with_all_default().evaluate(&milder).outcome;
+        let milder_outcome = GateVector::with_all_default()
+            .evaluate(&milder, &mut fresh_closure())
+            .outcome;
 
         let mut worse = candidate();
         worse.locator.risk_score = 90;
-        let worse_outcome = GateVector::with_all_default().evaluate(&worse).outcome;
+        let worse_outcome = GateVector::with_all_default()
+            .evaluate(&worse, &mut fresh_closure())
+            .outcome;
 
         assert_eq!(milder_outcome, GateOutcomeKind::Reject);
         assert_eq!(
@@ -640,7 +733,7 @@ mod tests {
     fn hypercube_hold_resolves_to_hold_not_refine() {
         let mut sc = candidate();
         sc.locator.risk_score = 71; // > RiskProjector's ceiling of 70 -> Hold
-        let verdict = HypercubeGate.evaluate(&sc, &GateCtx);
+        let verdict = HypercubeGate.evaluate(&sc, &GateCtx, &mut fresh_closure());
         assert!(
             matches!(verdict, GateVerdict::Hold(_)),
             "RiskProjector over the ceiling must Hold: {verdict:?}"
@@ -649,7 +742,7 @@ mod tests {
         let vector = GateVector {
             gates: vec![Box::new(HypercubeGate) as Box<dyn Gate>],
         };
-        let report = vector.evaluate(&sc);
+        let report = vector.evaluate(&sc, &mut fresh_closure());
         assert_eq!(
             report.outcome,
             GateOutcomeKind::Hold,
@@ -678,7 +771,12 @@ mod tests {
             ResidueKind::Boundary
         }
 
-        fn evaluate(&self, sc: &StitchCandidate, _ctx: &GateCtx) -> GateVerdict {
+        fn evaluate(
+            &self,
+            sc: &StitchCandidate,
+            _ctx: &GateCtx,
+            _closure: &mut FourPiClosure,
+        ) -> GateVerdict {
             self.count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             reject(self.id, ResidueKind::Boundary, "spy always rejects", sc)
         }
@@ -700,7 +798,7 @@ mod tests {
             .map(|s| Box::new(ArcGate(s.clone())) as Box<dyn Gate>)
             .collect();
         let vector = GateVector { gates };
-        let report = vector.evaluate(&candidate());
+        let report = vector.evaluate(&candidate(), &mut fresh_closure());
         assert_eq!(report.outcome, GateOutcomeKind::Reject);
         for spy in &spies {
             assert_eq!(
@@ -730,8 +828,13 @@ mod tests {
             self.0.residue_on_fail()
         }
 
-        fn evaluate(&self, sc: &StitchCandidate, ctx: &GateCtx) -> GateVerdict {
-            self.0.evaluate(sc, ctx)
+        fn evaluate(
+            &self,
+            sc: &StitchCandidate,
+            ctx: &GateCtx,
+            closure: &mut FourPiClosure,
+        ) -> GateVerdict {
+            self.0.evaluate(sc, ctx, closure)
         }
     }
 }

@@ -9,9 +9,9 @@
 //! fabricate a green" a typed value.
 //!
 //! **Nothing here launches a webview or touches Windows.** The `#[tauri::command]`
-//! glue and the WebView2 window are provided as a documented integration
-//! template (`ui/INTEGRATION.md`), wired on a webkit-equipped runner; the live
-//! Windows connection capture is deferred to P3. Linux CI verifies exactly the
+//! glue and the WebView2 window remain pending (`ui/INTEGRATION.md`).
+//! The standalone frontend is in `ui/desktop` at the repository root; its
+//! wire types live in `ssk-ui-contract`. Linux CI verifies the
 //! pure projection logic + the DTO/JSON wire contract + the state machine, and
 //! nothing more.
 //!

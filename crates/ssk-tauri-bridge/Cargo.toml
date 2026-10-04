@@ -11,13 +11,12 @@ license.workspace = true
 # compiles ONLY this portable core — no webview, no Windows.
 #
 # The #[tauri::command] glue + WebView2 window and the ts-rs TypeScript export
-# are intentionally NOT compiled here (they need a webkit2gtk/wry runner and a
-# JS toolchain that headless CI lacks). They are provided as a documented
-# integration template (see ui/INTEGRATION.md) to be wired on a webview runner,
-# exactly the boundary the plan defers. This keeps P1 green with zero new
-# external dependencies.
+# are not implemented here. The standalone frontend at ui/desktop has its own
+# Node-only test job; wire types live in ssk-ui-contract. See ui/INTEGRATION.md
+# for the remaining desktop host work. The default Rust build needs no webview.
 
 [dependencies]
+ssk-ui-contract = { path = "../ssk-ui-contract", version = "0.1.0" }
 ssk-netd-helper = { path = "../ssk-netd-helper", version = "0.1.0" }
 ssk-boundary = { path = "../ssk-boundary", version = "0.1.0" }
 ssk-winhost = { path = "../ssk-winhost", version = "0.1.0" }

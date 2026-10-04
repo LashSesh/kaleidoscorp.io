@@ -19,9 +19,10 @@ members = [
   "crates/ssk-config",
   "crates/ssk-interop",
   "crates/ssk-runtime",
-  "crates/ssk-sim",
   "crates/ssk-netadmin",
+  "crates/ssk-netanalysis",
   "crates/ssk-netcore",
+  "crates/ssk-vpnctl",
   "crates/ssk-signature",
   "crates/ssk-imdf",
   "crates/ssk-capture",
@@ -46,6 +47,8 @@ members = [
   "crates/ssk-daemon",
   "crates/ssk-netd-helper",
   "crates/ssk-tauri-bridge",
+  "crates/ssk-ui-contract",
+  "crates/ssk-desktop-client",
 ]
 
 [workspace.package]
@@ -67,7 +70,7 @@ repository = "https://github.com/LashSesh/kaleidoscorp.io"
 # key only supplies a value for inheritance. No member manifest currently
 # declares `rust-version.workspace = true`, so nothing checks this today. Two
 # follow-ups are required before this line means anything:
-#   1. add `rust-version.workspace = true` to the 44 member manifests, and
+#   1. add `rust-version.workspace = true` to the 45 member manifests, and
 #   2. add a CI leg that actually builds on 1.85.
 # Until (2) runs green, 1.85 is a claim about the dependency graph only -- the
 # workspace's own sources have never been compiled by a 1.85 toolchain.
@@ -100,7 +103,7 @@ toml = "0.8"
 # In the traffic path once P4 lands. Optimise for speed, not size -- the
 # binaries are a few MB and distribution size is not a constraint.
 opt-level = 3
-# Cross-crate inlining across a 44-crate workspace, where the hot paths
+# Cross-crate inlining across a 45-crate workspace, where the hot paths
 # (framing, hashing, the executor) are split across crate boundaries. "thin"
 # rather than "fat": fat LTO on this many crates costs a large amount of
 # single-threaded link time and memory for a marginal gain over thin +

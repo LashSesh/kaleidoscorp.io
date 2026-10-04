@@ -609,8 +609,8 @@ fn a_client_speaking_only_a_future_version_is_refused_with_both_ranges() {
     let state = Arc::new(MockState::default());
     let broker = privileged_broker(state, operator_authorizer());
     let mut hello = ClientHello::new(LeaseKind::Session);
-    hello.min_protocol_version = PRIV_PROTOCOL_VERSION + 1;
-    hello.max_protocol_version = PRIV_PROTOCOL_VERSION + 1;
+    hello.min_protocol_version = ssk_netd_helper::vpn::protocol::PROTOCOL_VERSION + 1;
+    hello.max_protocol_version = ssk_netd_helper::vpn::protocol::PROTOCOL_VERSION + 1;
 
     let (outcome, _) = serve_scripted(&broker, framed(&hello));
     assert_eq!(
@@ -618,8 +618,8 @@ fn a_client_speaking_only_a_future_version_is_refused_with_both_ranges() {
         ConnectionOutcome::Refused(HandshakeReject::VersionMismatch {
             server_min: PRIV_MIN_PROTOCOL_VERSION,
             server_max: PRIV_PROTOCOL_VERSION,
-            client_min: PRIV_PROTOCOL_VERSION + 1,
-            client_max: PRIV_PROTOCOL_VERSION + 1,
+            client_min: ssk_netd_helper::vpn::protocol::PROTOCOL_VERSION + 1,
+            client_max: ssk_netd_helper::vpn::protocol::PROTOCOL_VERSION + 1,
         })
     );
 }
@@ -1185,4 +1185,71 @@ fn the_wire_is_nothing_but_length_prefixed_cbor() {
         frames += 1;
     }
     assert_eq!(frames, 1);
+}
+
+#[test]
+fn vpn_version_three_without_a_configured_domain_reports_unavailable() {
+    use ssk_netd_helper::vpn;
+    let state = Arc::new(MockState::default());
+    let broker = privileged_broker(state.clone(), operator_authorizer());
+    let mut bytes = framed(&vpn::client::hello());
+    bytes.extend(framed(&vpn::Request {
+        session_token: CapabilityToken([0x5a; 16]),
+        nonce: Nonce([1; 16]),
+        idempotency_key: IdempotencyKey([1; 16]),
+        expected_revision: 0,
+        command: vpn::Command {
+            verb: vpn::Verb::Prepare,
+            profile: "corp".into(),
+        },
+    }));
+    let (outcome, transport) = serve_scripted(&broker, bytes);
+    assert!(matches!(
+        outcome,
+        ConnectionOutcome::Served {
+            frames: 1,
+            claim_dropped: false,
+            ..
+        }
+    ));
+    let response: vpn::Response =
+        ciborium::de::from_reader(&transport.frames_written()[1][..]).unwrap();
+    assert_eq!(response, vpn::Response::Rejected(vpn::Reject::Unavailable));
+    assert_eq!(state.engage_calls.load(Ordering::SeqCst), 0);
+    assert!(broker.leases().is_empty());
+}
+
+#[test]
+fn vpn_version_three_cannot_adopt_a_boundary_lease_or_negotiate_a_pinned_claim() {
+    let state = Arc::new(MockState::default());
+    let broker = privileged_broker(state, operator_authorizer());
+    for pinned in [true, false] {
+        let mut hello = ssk_netd_helper::vpn::client::hello();
+        if pinned {
+            hello.lease_kind = LeaseKind::Pinned;
+        } else {
+            hello.adopt_lease = Some(LeaseId([1; 16]));
+        }
+        let (outcome, _) = serve_scripted(&broker, framed(&hello));
+        assert!(matches!(
+            outcome,
+            ConnectionOutcome::Refused(HandshakeReject::Malformed(_))
+        ));
+        assert!(broker.leases().is_empty());
+    }
+}
+
+#[test]
+fn obsolete_vpn_version_two_is_rejected_before_command_dispatch() {
+    let state = Arc::new(MockState::default());
+    let broker = privileged_broker(state.clone(), operator_authorizer());
+    let mut hello = ssk_netd_helper::vpn::client::hello();
+    hello.min_protocol_version = 2;
+    hello.max_protocol_version = 2;
+    let (outcome, _) = serve_scripted(&broker, framed(&hello));
+    assert!(matches!(
+        outcome,
+        ConnectionOutcome::Refused(HandshakeReject::VersionMismatch { .. })
+    ));
+    assert_eq!(state.engage_calls.load(Ordering::SeqCst), 0);
 }

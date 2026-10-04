@@ -36,6 +36,7 @@
 //! system denies the flow and records a forensic entry.
 
 pub mod adapter;
+pub mod admission;
 pub mod attestation;
 pub mod audit;
 pub mod control;

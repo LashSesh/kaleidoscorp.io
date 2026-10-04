@@ -1,5 +1,12 @@
 # Desktop GUI Roadmap (Post-Core)
 
+Current implementation boundary (2026-09-24):
+[modular UI and versioned read contract](MODULAR_DESKTOP_UI.md).
+The standalone browser preview and a Windows Tauri host are runnable. The host
+reads real daemon status; see [backend connection](DESKTOP_BACKEND_CONNECTION.md).
+Verified protection observations, distribution and the proposed write APIs below
+remain pending.
+
 Recommended stack: **Tauri**.
 
 ## Scope

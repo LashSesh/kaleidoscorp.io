@@ -17,6 +17,8 @@ license.workspace = true
 ssk-types = { path = "../ssk-types", version = "0.1.0" }
 ssk-signature = { path = "../ssk-signature", version = "0.1.0" }
 ssk-boundary = { path = "../ssk-boundary", version = "0.1.0" }
+ssk-vpnctl = { path = "../ssk-vpnctl", version = "0.1.0" }
+serde_json = { workspace = true, features = ["raw_value"] }
 serde = { workspace = true }
 ciborium = { workspace = true }
 thiserror = { workspace = true }

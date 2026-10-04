@@ -8,6 +8,40 @@ permissions:
   contents: read
 
 jobs:
+  desktop_ui:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '24'
+      - run: npm --prefix ui/desktop test
+      - run: npm --prefix ui/desktop run build
+
+  desktop_host:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '24'
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          workspaces: apps/desktop
+      - run: npm --prefix ui/desktop run build
+      - run: cargo fmt --manifest-path apps/desktop/Cargo.toml -- --check
+      - run: cargo clippy --manifest-path apps/desktop/Cargo.toml --all-targets --locked -- -D warnings
+      - run: cargo build --manifest-path apps/desktop/Cargo.toml --locked
+      - run: cargo test --manifest-path apps/desktop/Cargo.toml --locked
+      # The explicit WebView startup smoke test needs an interactive Windows session.
+
   # ---------------------------------------------------------------------------
   # The four core gates -- `fmt --check`, `clippy -D warnings`,
   # `build --workspace --all-targets`, `test --workspace` -- run on BOTH
@@ -45,6 +79,10 @@ jobs:
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       - run: cargo build --workspace --all-targets
       - run: cargo test --workspace
+      - name: Check read-only VM host assessment with synthetic facts
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: .\scripts\tests\openvpn-vm-host-probe.tests.ps1
 
   # `PROPTEST_CASES=32 cargo test` (inline env-var prefix) is POSIX-shell-only
   # syntax and is a parse error under PowerShell, so it is set via `env:`

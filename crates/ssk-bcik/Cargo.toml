@@ -8,6 +8,7 @@ license.workspace = true
 ssk-types = { path = "../ssk-types", version = "0.1.0" }
 ssk-locator = { path = "../ssk-locator", version = "0.1.0" }
 ssk-crypto = { path = "../ssk-crypto", version = "0.1.0" }
+ssk-imdf = { path = "../ssk-imdf", version = "0.1.0" }
 
 [lints]
 workspace = true

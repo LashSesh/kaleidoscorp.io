@@ -1,0 +1,12 @@
+{
+  "name": "@kaleidoscorp/desktop-ui",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": { "node": ">=22" },
+  "scripts": {
+    "build": "node tools/package.mjs",
+    "dev": "node tools/serve.mjs",
+    "test": "node --test tests/*.test.js"
+  }
+}

@@ -248,7 +248,7 @@ mod tests {
                     CoreId::new("other")
                 },
                 phase: PhaseVector::zero(),
-                orientation: Orientation::Forward,
+                orientation: FacetOrientation::Forward,
                 sector: Sector::Identity,
                 key_ctx: KeyContextRef::new("kc"),
                 session: SessionId::new("sess"),

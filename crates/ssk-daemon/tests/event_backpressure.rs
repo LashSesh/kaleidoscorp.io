@@ -4,6 +4,11 @@
 //! duplicating) `ssk-daemon`'s lower-level `state::tests` unit test, which
 //! exercises the same guarantee directly on `StateMachine`.
 
+include!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../tests/support/routing_config.rs"
+));
+
 use std::sync::Arc;
 
 use ssk_daemon::supervisor::Supervisor;
@@ -40,6 +45,7 @@ async fn lagging_subscriber_observes_lagged_during_real_activity() {
         audit_path,
         data_plane,
         Box::new(ssk_daemon::killswitch::NoProvider),
+        Ok(loopback_config()),
     );
 
     // A real, reachable local listener each `ActivateProfile` really

@@ -165,6 +165,14 @@ struct Listening {
 
 impl Listening {
     fn start(name: &str, broker: Arc<Broker>) -> Self {
+        Self::start_with_vpn(name, broker, None)
+    }
+
+    fn start_with_vpn(
+        name: &str,
+        broker: Arc<Broker>,
+        vpn: Option<Arc<ssk_netd_helper::vpn::Broker>>,
+    ) -> Self {
         let sid = current_user_sid().expect("sid");
         let host = Arc::new(
             PrivilegedPipeHost::new(PrivilegedPipeHostConfig {
@@ -181,7 +189,7 @@ impl Listening {
             let host = Arc::clone(&host);
             std::thread::spawn(move || {
                 let mut ids = CsprngLeaseIds::default();
-                match host.run_listener(&broker, &mut ids) {
+                match host.run_listener_with_vpn(&broker, &mut ids, vpn.as_deref()) {
                     Ok(_report) => {}
                     Err(e) => panic!("listener failed: {e}"),
                 }
@@ -561,4 +569,122 @@ fn a_silent_peer_does_not_wedge_the_listener() {
         .expect("the listener must recover");
     c.status().expect("status");
     assert_eq!(listening.host.accepted(), 2);
+}
+
+#[test]
+fn vpn_v3_authenticates_real_pipe_peer_and_never_dispatches_boundary_commands() {
+    use ssk_netd_helper::{
+        framing::{read_frame, write_frame},
+        vpn::{
+            self,
+            journal::{Record, Store},
+        },
+        IdempotencyKey, Nonce,
+    };
+    struct Memory(Vec<Record>);
+    impl Store for Memory {
+        fn load(&mut self) -> std::io::Result<Vec<Record>> {
+            Ok(self.0.clone())
+        }
+        fn append(&mut self, record: &Record) -> std::io::Result<()> {
+            self.0.push(record.clone());
+            Ok(())
+        }
+    }
+    struct NoLaunch;
+    impl vpn::Backend for NoLaunch {
+        fn prepare(
+            &mut self,
+            _: &ssk_vpnctl::ProfileId,
+            _: &AtomicBool,
+            _: &mut dyn FnMut(vpn::ProcessIdentity) -> bool,
+        ) -> Result<Box<dyn vpn::LiveSession>, vpn::PrepareError> {
+            panic!("a status-only grant must never launch")
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let state = Arc::new(MockState::default());
+    let boundary = Arc::new(broker(
+        dir.path(),
+        state.clone(),
+        &[(this_user(), ControlVerb::EngageKillSwitch)],
+    ));
+    let policy = vpn::Policy::parse(
+        &serde_json::to_vec(&serde_json::json!({"schema":1,"grants":[
+            {"sid":current_user_sid().unwrap(),"profile":"corp","verbs":["status"]}
+        ]}))
+        .unwrap(),
+    )
+    .unwrap();
+    let mut service = vpn::Service::start(
+        policy,
+        CapabilityToken([9; 16]),
+        Box::new(Memory(vec![])),
+        NoLaunch,
+    )
+    .unwrap();
+    let name = unique_pipe_name("vpn-v3");
+    let listening = Listening::start_with_vpn(&name, boundary.clone(), Some(service.broker()));
+    {
+        let mut client = vpn::client::Client::connect(client(&name)).unwrap();
+        assert!(matches!(
+            client
+                .send(
+                    vpn::Command {
+                        verb: vpn::Verb::Status,
+                        profile: "corp".into()
+                    },
+                    0,
+                    IdempotencyKey([1; 16]),
+                    Nonce([1; 16])
+                )
+                .unwrap(),
+            vpn::Response::Status(_)
+        ));
+        assert_eq!(
+            client
+                .send(
+                    vpn::Command {
+                        verb: vpn::Verb::Prepare,
+                        profile: "corp".into()
+                    },
+                    1,
+                    IdempotencyKey([2; 16]),
+                    Nonce([2; 16])
+                )
+                .unwrap(),
+            vpn::Response::Rejected(vpn::Reject::Unauthorized)
+        );
+    }
+    {
+        let mut transport = client(&name);
+        write_frame(
+            &mut transport,
+            &vpn::client::hello(),
+            ssk_netd_helper::MAX_HANDSHAKE_FRAME,
+        )
+        .unwrap();
+        let _: ssk_netd_helper::ServerHandshake =
+            read_frame(&mut transport, ssk_netd_helper::MAX_HANDSHAKE_FRAME).unwrap();
+        let legacy = ssk_netd_helper::CommandEnvelope {
+            session_token: CapabilityToken([9; 16]),
+            nonce: Nonce([3; 16]),
+            idempotency_key: IdempotencyKey([3; 16]),
+            expected_state_version: 0,
+            command: ssk_netd_helper::Command::EngageKillSwitch,
+        };
+        write_frame(&mut transport, &legacy, vpn::protocol::MAX_FRAME).unwrap();
+        let response: vpn::Response = read_frame(&mut transport, vpn::protocol::MAX_FRAME).unwrap();
+        assert_eq!(response, vpn::Response::Rejected(vpn::Reject::Malformed));
+    }
+    {
+        // v1 remains usable on the same listener with a v3 domain attached.
+        let mut legacy =
+            PrivilegedClient::connect(client(&name), CountingNonces(0), session_hello()).unwrap();
+        assert_eq!(legacy.status().unwrap().state_version, 0);
+    }
+    drop(listening);
+    assert_eq!(state.engage_calls.load(Ordering::SeqCst), 0);
+    assert!(boundary.leases().is_empty());
+    assert_eq!(service.shutdown().phase, vpn::Phase::Shutdown);
 }

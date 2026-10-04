@@ -26,6 +26,11 @@
 //! daemon reports the broker's authoritative answer, and that when it cannot
 //! obtain one it says so instead of reporting "off".
 
+include!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../tests/support/routing_config.rs"
+));
+
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
@@ -331,6 +336,7 @@ async fn daemon_status(source: SocketBrokerSource) -> (StatusDto, KillSwitchView
         dir.path().join("audit.json"),
         real_data_plane(),
         Box::new(Arc::clone(&cached)),
+        Ok(loopback_config()),
     );
     let dto = match sup
         .handle(ssk_ipc::server::Request::GetStatus, &ipc_peer())

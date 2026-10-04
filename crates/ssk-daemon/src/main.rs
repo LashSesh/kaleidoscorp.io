@@ -20,8 +20,7 @@ use ssk_daemon::paths::Layout;
 use ssk_daemon::shutdown::{Shutdown, ShutdownReason};
 use ssk_daemon::supervisor::Supervisor;
 use ssk_ipc::Endpoint;
-use ssk_netadmin::adapter::{AdapterDescriptor, AdapterKind};
-use ssk_netcore::{AdapterRegistry, NetcoreDataPlane, RouteExecutor};
+use ssk_netcore::{NetcoreDataPlane, RouteExecutor};
 
 const BINARY: &str = "sskd";
 const BUILD: &str = env!("CARGO_PKG_VERSION");
@@ -244,31 +243,22 @@ fn spawn_kill_switch_poller(
 
 async fn serve(layout: &Layout, endpoint: Endpoint, lock: &DaemonLock) -> ExitCode {
     let config_path = std::env::var_os("SSK_CONFIG_PATH").map(PathBuf::from);
-    match load_daemon_config(config_path.as_deref()) {
+    let config = load_daemon_config(config_path.as_deref());
+    match &config {
         Ok(loaded) => {
             tracing::info!(migrated_from = ?loaded.migrated_from, "config loaded");
         }
         Err(err) => {
-            // Fail-closed: still start (so a client can connect and
-            // diagnose), but the daemon never engages protection with an
-            // invalid config. Wiring this into a live `config_invalid` state
-            // is Phase 5 work once the supervisor owns config, not just audit.
-            tracing::error!(%err, "config invalid; starting with defaults, protection unavailable");
+            // Keep IPC available for diagnosis. The supervisor owns this
+            // failure and refuses activation until a corrected restart.
+            tracing::error!(%err, "config invalid; activation disabled, diagnostics available");
         }
     }
 
-    // Real adapter registry matching `supervisor::reference_route_orchestrator`'s
-    // reference `socks5-exit` hop — the real dispatch counterpart to that
-    // reference route plan. A future config-driven profile model (Phase 5)
-    // will replace this with adapters sourced from validated config.
-    let mut registry = AdapterRegistry::new();
-    registry.register(AdapterDescriptor {
-        adapter_id: "socks5-exit".into(),
-        kind: AdapterKind::Socks5,
-        address: "proxy.corp.com".into(),
-        port: 1080,
-        metadata: vec![],
-    });
+    let registry = config
+        .as_ref()
+        .map(|loaded| ssk_daemon::routing::ConfiguredRouting::new(&loaded.config.routing).adapters)
+        .unwrap_or_default();
     let executor = Arc::new(RouteExecutor::new(registry));
     let data_plane = Box::new(NetcoreDataPlane::new(executor));
     let (kill_switch, kill_switch_refresher) = build_kill_switch_view();
@@ -276,6 +266,7 @@ async fn serve(layout: &Layout, endpoint: Endpoint, lock: &DaemonLock) -> ExitCo
         layout.audit_path(),
         data_plane,
         kill_switch,
+        config,
     ));
 
     // The kill-switch poller. It must exist for the supervisor's answer to be

@@ -18,6 +18,9 @@ ssk-bcik = { path = "../ssk-bcik", version = "0.1.0" }
 # ssk-gates, so this stays a dev-only edge — ssk-gates already depends on
 # ssk-bcik, not on ssk-stitch, so no cycle is introduced.
 ssk-gates = { path = "../ssk-gates", version = "0.1.0" }
+# Same test module: every BcikGate/BoundaryGate/ReplayGate/FocusGate::evaluate
+# call now needs a real `&mut FourPiClosure` accumulator argument.
+ssk-imdf = { path = "../ssk-imdf", version = "0.1.0" }
 
 [lints]
 workspace = true

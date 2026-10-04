@@ -1,5 +1,10 @@
 # Kaleidoscorp Desktop Privacy Client — Formal Implementation Architecture
 
+> Implementation update (2026-09-24): a modular UI and a Windows Tauri host now
+> read daemon status. [Current desktop/backend boundary](DESKTOP_BACKEND_CONNECTION.md)
+> supersedes the older GUI availability findings below; broad control and verified
+> protection displays remain future work.
+
 > Status: **Architecture specification** (no code in this document).
 > Scope: Turn the existing ScorpioSync-Kaleidoscorp Ω *decision-modeling core* into a
 > product-grade, cross-platform desktop privacy client whose runtime can really route,
@@ -165,7 +170,6 @@ Status tags per the legend. Evidence is file:line.
 | `ssk-privacy` | **[2]** | `linkability_score = risk` (untrusted) or `risk/2` (trusted); wired into Privacy gate (threshold 50) but is a one-line heuristic, not anonymity analysis. | `crates/ssk-privacy/src/lib.rs` |
 | `ssk-crypto` | **[1]** (was [3] stub) | **Phase 1:** `SignatureProvider` (`Ed25519KeyPair`/`Ed25519Verifier`) and `AeadProvider` (`ChaCha20Poly1305Provider`) now implemented behind the `crypto` feature. `KeyAgreementProvider`/`CapabilityWitnessProvider` remain unimplemented (not required yet). | `crates/ssk-crypto/src/lib.rs` |
 | `ssk-audit` | **[2]** misnamed | 12-line single-record trace-hash helper; **not** a ledger. Real ledgers are in `ssk-tensor` + `ssk-netadmin`. | `crates/ssk-audit/src/lib.rs` |
-| `ssk-sim` | **[2]** stub-level | `evaluate()` returns a summary. | `crates/ssk-sim/src/lib.rs` |
 
 ### B.4 CLI command surface (`ssk` binary)
 

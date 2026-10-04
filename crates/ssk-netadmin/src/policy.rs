@@ -28,8 +28,14 @@ pub enum PolicyAction {
 }
 
 /// Match criteria for a policy rule.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MatchCriteria {
+    /// Exact destination hostname or literal IP, without resolving DNS.
+    #[serde(default)]
+    pub dest_host: Option<String>,
+    /// Destination port. None matches any port.
+    #[serde(default)]
+    pub dest_port: Option<u16>,
     /// Glob-style app identifier prefix.  `None` matches any app.
     pub app_prefix: Option<String>,
     /// Destination hostname suffix (e.g. `".example.com"`).  `None` = any.
@@ -53,8 +59,33 @@ impl MatchCriteria {
                 return false;
             }
         }
+        if self
+            .dest_port
+            .is_some_and(|port| port != d.destination_port)
+        {
+            return false;
+        }
+        if let Some(host) = &self.dest_host {
+            let equal = match (
+                host.parse::<std::net::IpAddr>(),
+                d.destination_host.parse::<std::net::IpAddr>(),
+            ) {
+                (Ok(left), Ok(right)) => left == right,
+                _ => host
+                    .trim_end_matches('.')
+                    .eq_ignore_ascii_case(d.destination_host.trim_end_matches('.')),
+            };
+            if !equal {
+                return false;
+            }
+        }
         if let Some(suffix) = &self.dest_suffix {
-            if !d.destination_host.ends_with(suffix.as_str()) {
+            let host = d
+                .destination_host
+                .trim_end_matches('.')
+                .to_ascii_lowercase();
+            let suffix = suffix.trim_matches('.').to_ascii_lowercase();
+            if suffix.is_empty() || !(host == suffix || host.ends_with(&format!(".{suffix}"))) {
                 return false;
             }
         }
@@ -168,6 +199,28 @@ mod tests {
     use super::*;
     use crate::flow::{FlowDescriptor, FlowRecord};
 
+    #[test]
+    fn configured_destinations_match_domain_boundaries_ports_and_ip_values() {
+        let mut criteria = MatchCriteria {
+            dest_suffix: Some("corp.example".into()),
+            dest_port: Some(443),
+            ..MatchCriteria::default()
+        };
+        for host in ["corp.example", "API.CORP.EXAMPLE."] {
+            assert!(criteria.matches(&make_flow("app", host, RiskLevel::Low)));
+        }
+        for host in ["evilcorp.example", "corp.example.attacker.test"] {
+            assert!(!criteria.matches(&make_flow("app", host, RiskLevel::Low)));
+        }
+        let mut wrong_port = make_flow("app", "corp.example", RiskLevel::Low);
+        wrong_port.descriptor.destination_port = 80;
+        assert!(!criteria.matches(&wrong_port));
+        criteria.dest_suffix = None;
+        criteria.dest_host = Some("::1".into());
+        assert!(criteria.matches(&make_flow("app", "0:0:0:0:0:0:0:1", RiskLevel::Low)));
+        assert!(!criteria.matches(&make_flow("app", "::2", RiskLevel::Low)));
+    }
+
     fn make_flow(app: &str, host: &str, risk: RiskLevel) -> FlowRecord {
         FlowRecord::new(
             format!("flow-{app}"),
@@ -183,6 +236,8 @@ mod tests {
             description: "allow internal low-risk traffic".into(),
             priority: 10,
             criteria: MatchCriteria {
+                dest_host: None,
+                dest_port: None,
                 app_prefix: None,
                 dest_suffix: Some(".internal".into()),
                 protocol: None,
@@ -213,6 +268,8 @@ mod tests {
             description: "route high-risk flows through proxy".into(),
             priority: 5,
             criteria: MatchCriteria {
+                dest_host: None,
+                dest_port: None,
                 app_prefix: None,
                 dest_suffix: None,
                 protocol: None,
@@ -242,6 +299,8 @@ mod tests {
                 description: "deny blocked destinations".into(),
                 priority: 1,
                 criteria: MatchCriteria {
+                    dest_host: None,
+                    dest_port: None,
                     app_prefix: None,
                     dest_suffix: Some(".blocked".into()),
                     protocol: None,
@@ -255,6 +314,8 @@ mod tests {
                 description: "allow everything else".into(),
                 priority: 100,
                 criteria: MatchCriteria {
+                    dest_host: None,
+                    dest_port: None,
                     app_prefix: None,
                     dest_suffix: None,
                     protocol: None,

@@ -11,7 +11,7 @@ ssk-core = { path = "../ssk-core", version = "0.1.0" }
 ssk-crypto = { path = "../ssk-crypto", version = "0.1.0" }
 ssk-focus = { path = "../ssk-focus", version = "0.1.0" }
 ssk-privacy = { path = "../ssk-privacy", version = "0.1.0" }
-serde.workspace = true
+ssk-imdf = { path = "../ssk-imdf", version = "0.1.0" }
 
 [lints]
 workspace = true

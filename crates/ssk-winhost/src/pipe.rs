@@ -415,6 +415,29 @@ pub fn sddl_for_read_only_fallback_pipe() -> String {
     format!("O:SYD:P(A;;GA;;;SY)(A;;{mask};;;IU)(A;;{mask};;;BA){MEDIUM_INTEGRITY_SACL}")
 }
 
+/// Admission is the union of both domains; authority remains per request.
+/// Preserve interactive diagnostics when boundary authorization is degraded.
+pub fn sddl_for_control_domains(
+    boundary: Option<&[String]>,
+    vpn: &[String],
+) -> Result<String, PipeSecurityError> {
+    let mut clients: std::collections::BTreeSet<&str> = vpn.iter().map(String::as_str).collect();
+    if let Some(boundary) = boundary {
+        clients.extend(boundary.iter().map(String::as_str));
+    }
+    if clients.is_empty() && boundary.is_none() {
+        return Ok(sddl_for_read_only_fallback_pipe());
+    }
+    let mut sddl = sddl_for_system_owned_pipe(&clients.into_iter().collect::<Vec<_>>())?;
+    if boundary.is_none() {
+        sddl.truncate(sddl.len() - MEDIUM_INTEGRITY_SACL.len());
+        sddl.push_str(&format!(
+            "(A;;{CLIENT_RIGHTS_NO_INSTANCE_CREATE};;;IU){MEDIUM_INTEGRITY_SACL}"
+        ));
+    }
+    Ok(sddl)
+}
+
 #[cfg(windows)]
 mod sys {
     //! Thin, named re-exports of the Win32 surface this module uses.

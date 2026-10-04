@@ -116,6 +116,7 @@ pub enum ConnectionOutcome {
 pub struct PrivilegedServer<'a> {
     broker: &'a Broker,
     limiter: ConnectionLimiter,
+    vpn: Option<&'a crate::vpn::Broker>,
 }
 
 impl<'a> PrivilegedServer<'a> {
@@ -125,6 +126,7 @@ impl<'a> PrivilegedServer<'a> {
         PrivilegedServer {
             broker,
             limiter: ConnectionLimiter::default(),
+            vpn: None,
         }
     }
 
@@ -132,7 +134,16 @@ impl<'a> PrivilegedServer<'a> {
     /// several accept loops.
     #[must_use]
     pub fn with_limiter(broker: &'a Broker, limiter: ConnectionLimiter) -> Self {
-        PrivilegedServer { broker, limiter }
+        PrivilegedServer {
+            broker,
+            limiter,
+            vpn: None,
+        }
+    }
+
+    pub fn with_vpn(mut self, vpn: Option<&'a crate::vpn::Broker>) -> Self {
+        self.vpn = vpn;
+        self
     }
 
     #[must_use]
@@ -173,7 +184,24 @@ impl<'a> PrivilegedServer<'a> {
             Err(e) => return ConnectionOutcome::TransportFailed(e),
         };
 
-        let version = match negotiate(&hello) {
+        // Version 3 is an explicit, VPN-only connection. Never reinterpret a
+        // malformed VPN frame as a legacy boundary command (or vice versa).
+        let vpn_connection = hello.min_protocol_version == crate::vpn::protocol::PROTOCOL_VERSION
+            && hello.max_protocol_version == crate::vpn::protocol::PROTOCOL_VERSION
+            && hello.magic == PRIV_HANDSHAKE_MAGIC;
+        if vpn_connection && (hello.adopt_lease.is_some() || hello.lease_kind != LeaseKind::Session)
+        {
+            return self.refuse(
+                transport,
+                HandshakeReject::Malformed("VPN connections cannot adopt boundary claims".into()),
+            );
+        }
+        let negotiation = if vpn_connection {
+            Ok(crate::vpn::protocol::PROTOCOL_VERSION)
+        } else {
+            negotiate(&hello)
+        };
+        let version = match negotiation {
             Ok(v) => v,
             Err(reason) => return self.refuse(transport, reason),
         };
@@ -226,7 +254,11 @@ impl<'a> PrivilegedServer<'a> {
             protocol_version: version,
             session_token: self.broker.session_token(),
             lease,
-            state_version: self.broker.status().state_version,
+            state_version: if vpn_connection {
+                0
+            } else {
+                self.broker.status().state_version
+            },
         });
         if let Err(e) = write_frame(transport, &accepted, MAX_HANDSHAKE_FRAME) {
             return ConnectionOutcome::TransportFailed(e);
@@ -234,11 +266,31 @@ impl<'a> PrivilegedServer<'a> {
 
         let mut frames = 0u64;
         loop {
-            let body = match read_frame_bytes(transport, MAX_PRIV_FRAME) {
+            let frame_limit = if vpn_connection {
+                crate::vpn::protocol::MAX_FRAME
+            } else {
+                MAX_PRIV_FRAME
+            };
+            let body = match read_frame_bytes(transport, frame_limit) {
                 Ok(body) => body,
                 Err(FrameError::Transport(crate::framing::TransportError::Closed)) => break,
                 Err(e) => return ConnectionOutcome::TransportFailed(e),
             };
+            if vpn_connection {
+                use crate::vpn::{Reject, Response};
+                let response = match crate::vpn::protocol::decode(&body) {
+                    Err(reason) => Response::Rejected(reason),
+                    Ok(request) => match self.vpn {
+                        Some(vpn) => vpn.handle(peer, request),
+                        None => Response::Rejected(Reject::Unavailable),
+                    },
+                };
+                frames += 1;
+                if let Err(e) = write_frame(transport, &response, frame_limit) {
+                    return ConnectionOutcome::TransportFailed(e);
+                }
+                continue;
+            }
             let response = match decode_envelope(&body) {
                 // A malformed *body* is answerable: the peer gets a typed
                 // rejection and the channel stays synchronised, because the
@@ -256,6 +308,14 @@ impl<'a> PrivilegedServer<'a> {
             }
         }
 
+        if vpn_connection {
+            return ConnectionOutcome::Served {
+                frames,
+                lease,
+                lease_kind: LeaseKind::Session,
+                claim_dropped: false,
+            };
+        }
         // The connection ended. A session claim dies with it — that is what
         // makes the refcount unable to leak — and a pinned claim deliberately
         // does not.

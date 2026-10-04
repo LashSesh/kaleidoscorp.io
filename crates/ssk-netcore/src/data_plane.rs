@@ -4,6 +4,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
+use ssk_netadmin::admission::AdmissionToken;
 use ssk_netadmin::route::RouteKind;
 
 use crate::error::NetcoreError;
@@ -32,8 +33,7 @@ pub trait DataPlane: Send + Sync {
     /// `Protected` state and a real kill-switch teardown).
     fn connect_route<'a>(
         &'a self,
-        route: &'a RouteKind,
-        target: (&'a str, u16),
+        admission: AdmissionToken,
     ) -> BoxFuture<'a, Result<EgressSession, NetcoreError>>;
 }
 
@@ -61,9 +61,12 @@ impl DataPlane for NetcoreDataPlane {
 
     fn connect_route<'a>(
         &'a self,
-        route: &'a RouteKind,
-        target: (&'a str, u16),
+        admission: AdmissionToken,
     ) -> BoxFuture<'a, Result<EgressSession, NetcoreError>> {
-        Box::pin(async move { self.executor.connect(route, target).await })
+        Box::pin(async move {
+            self.executor
+                .connect(admission.route(), admission.target())
+                .await
+        })
     }
 }

@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "id": "company-managed",
+  "remote_ip": "192.0.2.10",
+  "remote_port": 1194,
+  "transport": "udp",
+  "server_name": "vpn.example.test",
+  "ca_pem": "-----BEGIN CERTIFICATE-----\nRklYVFVSRQ==\n-----END CERTIFICATE-----\n",
+  "certificate_pem": "-----BEGIN CERTIFICATE-----\nRklYVFVSRQ==\n-----END CERTIFICATE-----\n",
+  "private_key_pem": "-----BEGIN PRIVATE KEY-----\nRklYVFVSRV9OT1RfQV9SRUFMX0tFWQ==\n-----END PRIVATE KEY-----\n",
+  "tls_crypt_key": "-----BEGIN OpenVPN Static key V1-----\n0123456789abcdef0123456789abcdef\n0123456789abcdef0123456789abcdef\n0123456789abcdef0123456789abcdef\n0123456789abcdef0123456789abcdef\n0123456789abcdef0123456789abcdef\n0123456789abcdef0123456789abcdef\n0123456789abcdef0123456789abcdef\n0123456789abcdef0123456789abcdef\n0123456789abcdef0123456789abcdef\n0123456789abcdef0123456789abcdef\n0123456789abcdef0123456789abcdef\n0123456789abcdef0123456789abcdef\n0123456789abcdef0123456789abcdef\n0123456789abcdef0123456789abcdef\n0123456789abcdef0123456789abcdef\n0123456789abcdef0123456789abcdef\n-----END OpenVPN Static key V1-----\n"
+}
