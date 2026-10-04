@@ -1,5 +1,31 @@
 # Product Contract Matrix
 
+> ## STATUS BOX — 2026-08-02 · this matrix is no longer the source of truth
+>
+> **Read [`docs/WINDOWS_PRODUCT_ROADMAP.md`](docs/WINDOWS_PRODUCT_ROADMAP.md) first.** It was written
+> from the first execution of this workspace on real Windows 11 hardware and supersedes the
+> forward-looking parts of this matrix. Everything below this box is a **dated audit artifact from
+> 2026-07-04** plus a same-day implementation update; its value is that it records what was true when
+> written. It is not being rewritten, and it is not current status.
+>
+> Rows the first real Windows run changed:
+>
+> | Row | What changed |
+> |---|---|
+> | **Cross-platform scope** | The claim *"Windows named-pipe path is `#[cfg(windows)]` and per its own doc never compiled/tested"* is **wrong**. The named-pipe **server** works: `sskd.exe` binds `\\.\pipe\kaleidoscorp-sskd` and returned a valid 116-byte `Response::Status` DTO to a hand-written .NET client over the CBOR framing. The real gap is the **client**: none exists in the tree, so the CLI control plane is dead on Windows (roadmap P2). Separately quantified: 13 of 14 CI jobs ran `ubuntu-latest`, the one `windows-latest` job covered 1 of 44 crates, and all four of the repo's own gates failed on Windows (roadmap P0). |
+> | **Netcore / adapter invariants** | The update box's "real egress" credit is correct but incomplete. `ssk-netcore`'s handshakes are genuine, but **no application bytes ever move**: `EgressSession::transport_mut` (`crates/ssk-netcore/src/session.rs:63`) has zero callers of any kind. |
+> | **Traffic capture / control** | Still absent as capture-for-routing, and the "Never fabricate flows" honesty marker still holds. New since this matrix: `ssk winhost capture` enumerates 45–72 real IPv4 flows unelevated via IP Helper — real *observation*, not ingress, and not wired into the pipeline (roadmap P5). |
+> | **Fail-closed behavior (with real teeth)** | A real OS-level kill-switch now exists (`ssk winhost killswitch`, netsh firewall rules with a persisted rollback receipt) — this row's "no enforcement teeth" is no longer literally true. But **no successful engage→release cycle has ever been observed on any machine in any locale**, and on non-English Windows engage aborts before adding a rule. Worse, the receipt path is **SEC-1** in the roadmap: a forged `%TEMP%` receipt drives an elevated `netsh delete rule` (Critical). |
+> | **Installability** | `ssk-winhost service install` now uses the `windows-service` crate and returns a true Win32 access-denied when unelevated, so the SCM path is real. But it creates a LocalSystem service with **no check that the image path is protected**, and `RUNBOOK_WINDOWS.md:101-103` instructs pointing it at the user-writable build tree — **SEC-2**, Critical. |
+> | **Packaging** | Unchanged and confirmed: `release.yml:20` tars source only, the built binaries are discarded, and there is no Windows artifact at all (roadmap P6). This row's contradiction against `README.md`'s "packages platform binaries" has been fixed on the README side. |
+> | **Desktop / CLI responsibility** | `ssk-tauri-bridge` now exists, but as a leaf crate with **zero consumers in either direction**, no Tauri scaffold, no buttons and no inputs. Still no GUI (roadmap P7). |
+> | **Security boundaries & abuse prevention** | Materially worse than this row assumes. The Windows IPC surface is **unauthenticated** — the server performs no peer check, the pipe has no `SECURITY_ATTRIBUTES`, and two auditors drove privileged verbs from unrelated unelevated processes with zero credentials; one activated a nonexistent profile and got `Protected` plus a hash-chained audit entry attesting to protection that never existed (**SEC-3**). The "absence of a data plane means no reachable exfiltration surface" reasoning no longer covers the privileged Windows layer. |
+> | **Real integration-level tests** | Partially closed: `ssk-netcore` has real tests against live listeners. Still open: no test drives ingress→dispatch→arrival, because that capability does not exist. |
+>
+> The matrix's five "more than a research simulation" criteria are **still not all met**: (1) is met
+> only for a destination the operator types by hand, (3) has teeth only via the unverified
+> kill-switch, and (2)/(4) remain as recorded.
+
 > **IMPLEMENTATION UPDATE (post-audit, same day).** The rows below marked **Release Blocker: YES** for "Netcore / adapter invariants", "Route planning", "Daemon responsibility", "DNS / proxy / VPN / routing integration", and "Materialization & host-writes" (durable persistence in a product path) are **partially superseded**: `crates/ssk-netcore/` now provides real Direct/SOCKS5/HTTP-CONNECT/TLS/DNS execution and real health probing, dispatched by `ssk-daemon` (mock removed from production) and reachable via `ssk activate --dest host:port`, proven by real tests including two real-binary system tests (`ssk-daemon/tests/round_trip.rs`, `ssk-cli/tests/activate_real_egress.rs`). The daemon's audit-ledger row is also superseded: activation now records real, hash-chain-verified entries, not a vacuous chain. **Still an accurate Release Blocker**: `ssk-capture`/traffic capture (unchanged, absent), a desktop GUI, installability/packaging (release still ships source, not binaries), cross-platform scope (still Linux-only CI), config-driven multi-profile support, and a system-wide (as opposed to per-session) kill switch. Do not read this box as "the contract is now fulfilled" — re-derive each row's current truth from the evidence cited here plus `RELEASE_BLOCKER_REGISTER.md`'s update box before relying on it.
 
 > **Status:** Working audit artifact. Evidence-backed against the tree on branch `claude/rust-arch-audit-gaps-immuk1` (2026-07-04). Every "Current Evidence" cell cites `file:line` from the code as it stands. This document deliberately separates *code-artifact maturity* (is the Rust real, tested, deterministic?) from *product-capability maturity* (does the shipped binary do the thing the README promises to a user?). The two diverge sharply, and that divergence is the subject of this file.

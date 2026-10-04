@@ -117,6 +117,9 @@ impl RouteExecutor {
         target: (&str, u16),
     ) -> Result<EgressSession, NetcoreError> {
         match route {
+            RouteKind::OpenVpn { profile_id, .. } => {
+                Err(NetcoreError::OpenVpnNotReady(profile_id.clone()))
+            }
             RouteKind::Denied { reason } => Err(NetcoreError::PolicyDenied(reason.clone())),
             RouteKind::Direct => self.connect_direct(target).await,
             RouteKind::SingleHop(hop) => {
@@ -181,6 +184,9 @@ impl RouteExecutor {
                     .ok_or_else(|| NetcoreError::UnknownAdapter(hop.adapter_id.clone()))
             })
             .collect::<Result<_, _>>()?;
+        if descriptors.iter().any(|d| d.kind == AdapterKind::OpenVpn) {
+            return Err(NetcoreError::OpenVpnNotReady("unbound OpenVPN hop".into()));
+        }
 
         let first = &hops[0];
         let mut transport: BoxedTransport =
@@ -254,6 +260,9 @@ impl RouteExecutor {
                 let config = self.tls_config(&descriptor.adapter_id).await?;
                 let wrapped = tls::wrap_tls(transport, sni, config, &descriptor.adapter_id).await?;
                 Ok(Box::new(wrapped))
+            }
+            AdapterKind::OpenVpn => {
+                Err(NetcoreError::OpenVpnNotReady(descriptor.adapter_id.clone()))
             }
             AdapterKind::DnsOverride => Err(NetcoreError::Unsupported(AdapterKind::DnsOverride)),
         }

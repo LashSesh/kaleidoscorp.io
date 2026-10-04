@@ -15,10 +15,40 @@ ssk-netadmin = { path = "../ssk-netadmin", version = "0.1.0" }
 ssk-netcore = { path = "../ssk-netcore", version = "0.1.0" }
 ssk-tensor = { path = "../ssk-tensor", version = "0.1.0" }
 ssk-ipc = { path = "../ssk-ipc", version = "0.1.0" }
+# The kill-switch seam (`src/killswitch.rs`), CLIENT SIDE ONLY.
+#
+# `ssk-boundary` is needed for `KillSwitchState`, so `view_of` can match the
+# broker's journal state EXHAUSTIVELY. The alternative — comparing
+# `logical_state.as_str()` against `"engaged"` — would let a rename in
+# `ssk-boundary` silently flip this daemon to reporting "not engaged", which is
+# the exact fail-open this seam exists to remove.
+#
+# `ssk-netd-helper` is needed for `KillSwitchStatus`/`Recovery` and for
+# `PrivilegedClient`, which is how the daemon ASKS the privileged broker instead
+# of observing the OS itself. The enforcement design preferred that this edge not
+# exist at all (the production provider was to live in `ssk-winhost`, which
+# already has it), and that remains the better shape; it was not reachable from
+# this change's file scope because `ssk-winhost` re-exports the pipe transport
+# but not `PrivilegedClient`. Constraints that hold regardless, and that
+# `src/killswitch.rs` documents:
+#   * nothing here constructs a `Broker`, a `ReceiptStore`, a `BoundaryEnforcer`
+#     or an `EgressObserver` — the privileged core stays out of the unprivileged
+#     daemon;
+#   * both crates are pure and `#![forbid(unsafe_code)]`;
+#   * acyclic — neither reaches back to `ssk-daemon` (verified with `cargo tree`).
+ssk-boundary = { path = "../ssk-boundary", version = "0.1.0" }
+ssk-netd-helper = { path = "../ssk-netd-helper", version = "0.1.0" }
+# Process diagnostics: the subscriber, the durable rotated sink, the panic hook
+# and the OS-CSPRNG probe. This crate used to carry `src/diag.rs` and
+# `src/entropy.rs`, with `ssk-cli` carrying an inline copy of both; that
+# duplication is what produced the `/dev/urandom` defect twice, and `ssk-svc`
+# would have been the third copy. `tracing-subscriber`, `tracing-appender` and
+# `getrandom` moved with them and are no longer direct dependencies here.
+ssk-diag = { path = "../ssk-diag", version = "0.1.0" }
 serde.workspace = true
+serde_json.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
-tracing-subscriber.workspace = true
 tokio = { version = "1", features = [
     "rt-multi-thread",
     "sync",
@@ -29,9 +59,44 @@ tokio = { version = "1", features = [
     "io-util",
 ] }
 
+[target.'cfg(unix)'.dependencies]
+# `flock` for the daemon lock. Same crate and version `ssk-ipc` already carries
+# for its peer-credential check; only the `fs` feature is new. A kernel-held
+# lock is released on `SIGKILL`, which a `create_new` lock file is not.
+rustix = { version = "0.38", default-features = false, features = ["fs"] }
+
+[target.'cfg(windows)'.dependencies]
+# The composition root's Windows half. `ssk_ipc::server::serve_named_pipe`
+# *requires* a `PipeFactory` (which must call
+# `create_with_security_attributes_raw` with a real DACL) and a
+# `PeerAuthenticator` (which must impersonate the pipe client and read
+# `TokenUser`); `ssk_ipc::paths::named_pipe_name` requires this process's SID.
+# All three are Win32 FFI and live in `ssk-winhost`, the one crate exempt from
+# `unsafe_code = "forbid"`. This crate stays `#![forbid(unsafe_code)]` and only
+# *injects* them — which is the point of the seam: a security control with no
+# production caller is the defect this edge exists to close.
+#
+# Acyclic: `ssk-winhost` depends on ssk-ipc/ssk-types/ssk-boundary/ssk-capture/
+# ssk-service-host/ssk-netd-helper, none of which reach back to `ssk-daemon`.
+ssk-winhost = { path = "../ssk-winhost", version = "0.1.0" }
+# The privileged pipe's CLIENT transport (`NamedPipeClientTransport`), which is
+# what `killswitch::PrivilegedPipeStatus` dials — and, critically, the thing that
+# verifies the endpoint is owned by `S-1-5-18` before the first frame. Without
+# that check a squatter on the fixed pipe name could answer a forged "engaged".
+# `getrandom` supplies the per-command anti-replay nonces the broker's protocol
+# requires; a predictable nonce is one an attacker can burn ahead of a legitimate
+# client. Same crate and major `ssk-winhost` already carries — no fourth
+# `getrandom` major, no new FFI here (this crate stays `forbid(unsafe_code)`).
+getrandom = "0.3"
+
 [dev-dependencies]
+ssk-desktop-client = { path = "../ssk-desktop-client", version = "0.1.0" }
 tempfile.workspace = true
 serde_yaml.workspace = true
+# `tests/kill_switch_status.rs` drives a REAL `ssk_netd_helper::Broker` behind a
+# real `PrivilegedServer` over an in-memory `FrameTransport` pair. Building that
+# broker needs its actuation manifest and its `(principal, verb)` table.
+ssk-signature = { path = "../ssk-signature", version = "0.1.0" }
 
 [lints]
 workspace = true

@@ -1,0 +1,21 @@
+[package]
+name = "ssk-desktop-client"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+ssk-ui-contract = { path = "../ssk-ui-contract", version = "0.1.0" }
+ssk-ipc = { path = "../ssk-ipc", version = "0.1.0" }
+tokio = { version = "1", features = ["time", "sync"] }
+serde.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+ssk-winhost = { path = "../ssk-winhost", version = "0.1.0" }
+
+[dev-dependencies]
+serde_json.workspace = true
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "test-util"] }
+
+[lints]
+workspace = true

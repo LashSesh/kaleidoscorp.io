@@ -13,8 +13,10 @@ use proptest::prelude::*;
 use ssk_boundary::KillSwitchState;
 use ssk_capture::{CaptureMode, CaptureScope, SystemTrafficField, TrafficSource, TrafficWindow};
 use ssk_crown::EmissionDecision;
+use ssk_field_tensor::FieldTensorSkin;
 use ssk_mpk::Graph;
 use ssk_service_host::ServiceHealth;
+use ssk_signature::TargetProfile;
 use ssk_system::{SystemInputs, SystemPipeline};
 
 /// Yields a clean GET window, plus (when `sensitive`) a second POST carrying
@@ -66,6 +68,21 @@ fn windows() -> Vec<Graph> {
     vec![Graph::from_edges(3, &[(0, 1), (1, 2)]).unwrap()]
 }
 
+/// A baseline "established" from a prior, independent capture of `traffic` —
+/// built outside any `SystemPipeline::evaluate` call, the shape a real
+/// persisted per-host baseline takes once loaded by a caller (rather than the
+/// fabricated self-referential target the defect this fix replaces used to
+/// build *inside* `evaluate`).
+fn baseline_for(traffic: &SystemTrafficField, ws: &[Graph]) -> TargetProfile {
+    let skin = FieldTensorSkin::from_field(traffic, ws);
+    let sig = skin
+        .surface_tensor
+        .last()
+        .expect("fixture traffic yields a surface")
+        .clone();
+    TargetProfile::new("system", sig)
+}
+
 fn decision_rank(d: EmissionDecision) -> u8 {
     match d {
         EmissionDecision::Emit => 0,
@@ -100,6 +117,7 @@ proptest! {
     ) {
         let traffic = field(sensitive);
         let ws = windows();
+        let baseline = baseline_for(&traffic, &ws);
         let inputs = SystemInputs {
             traffic: &traffic,
             windows: &ws,
@@ -112,6 +130,7 @@ proptest! {
             open_obligations,
             parallax_consistent,
             replay_equal,
+            signature_baseline: Some(&baseline),
         };
         let mut pipeline = SystemPipeline::new();
         let verdict = pipeline.evaluate(&inputs);
@@ -141,6 +160,7 @@ proptest! {
     ) {
         let traffic = field(sensitive);
         let ws = windows();
+        let baseline = baseline_for(&traffic, &ws);
         let base = SystemInputs {
             traffic: &traffic,
             windows: &ws,
@@ -153,6 +173,7 @@ proptest! {
             open_obligations,
             parallax_consistent,
             replay_equal,
+            signature_baseline: Some(&baseline),
         };
         let base_rank = decision_rank(SystemPipeline::new().evaluate(&base).decision);
 
@@ -228,6 +249,7 @@ proptest! {
     ) {
         let traffic = field(sensitive);
         let ws = windows();
+        let baseline = baseline_for(&traffic, &ws);
         let inputs = SystemInputs {
             traffic: &traffic,
             windows: &ws,
@@ -240,6 +262,7 @@ proptest! {
             open_obligations,
             parallax_consistent,
             replay_equal,
+            signature_baseline: Some(&baseline),
         };
 
         let mut a = SystemPipeline::new();

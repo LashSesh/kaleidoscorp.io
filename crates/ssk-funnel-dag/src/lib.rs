@@ -22,6 +22,18 @@
 //! This is **not** the Ω locator funnel-DAG (`ssk-locator`'s `LocatorGraph`) —
 //! a different object over a different plane. FunnelDAG nodes carry host cells
 //! (a work/role relation), never locators (a routing relation).
+//!
+//! ## Status — deferred with a plan; zero consumers is the design
+//!
+//! Nothing depends on this crate, and nothing is meant to yet. Band B, scheduled
+//! as phase **P4** and explicitly gated on a source
+//! (`FCHL_MPK_INTEGRATION_STRATEGY.md:216`) — the capture/ingress source Band B
+//! depends on and that does not exist yet (`:42`, `:114`) — with the acceptance
+//! test "Temporal-window replay" (`:216`; object row `:108`, "DEFER (Band B)").
+//! It is Block F of the integration sequence
+//! (`SYSTEM_ARCHITECTURE_CORRESPONDENCE.md:270`, described at `:24`). The
+//! hash-chained trace here is what discharges that replay gate once a real source
+//! lands. Do not retire this crate as unreferenced.
 
 use std::collections::BTreeMap;
 

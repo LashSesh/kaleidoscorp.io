@@ -16,23 +16,19 @@ use crate::dto::{
     RecoveryDto, ResonanceActionDto, SeverityDto, SystemVerdictViewDto,
 };
 
-impl From<KillSwitchState> for LogicalStateDto {
-    fn from(s: KillSwitchState) -> Self {
-        match s {
-            KillSwitchState::Armed => LogicalStateDto::Armed,
-            KillSwitchState::Engaged => LogicalStateDto::Engaged,
-            KillSwitchState::Released => LogicalStateDto::Released,
-        }
+fn logical_state(s: KillSwitchState) -> LogicalStateDto {
+    match s {
+        KillSwitchState::Armed => LogicalStateDto::Armed,
+        KillSwitchState::Engaged => LogicalStateDto::Engaged,
+        KillSwitchState::Released => LogicalStateDto::Released,
     }
 }
 
-impl From<Recovery> for RecoveryDto {
-    fn from(r: Recovery) -> Self {
-        match r {
-            Recovery::Consistent => RecoveryDto::Consistent,
-            Recovery::Reconciled => RecoveryDto::Reconciled,
-            Recovery::Inconsistent => RecoveryDto::Inconsistent,
-        }
+fn recovery(r: Recovery) -> RecoveryDto {
+    match r {
+        Recovery::Consistent => RecoveryDto::Consistent,
+        Recovery::Reconciled => RecoveryDto::Reconciled,
+        Recovery::Inconsistent => RecoveryDto::Inconsistent,
     }
 }
 
@@ -44,13 +40,11 @@ fn os_rule(present: Option<bool>) -> OsRuleDto {
     }
 }
 
-impl From<&EnforcementReceipt> for ReceiptDto {
-    fn from(r: &EnforcementReceipt) -> Self {
-        ReceiptDto {
-            receipt_id_hex: r.receipt_id.to_hex(),
-            scope_label: r.scope_label.clone(),
-            prior_state: r.prior_state.clone(),
-        }
+fn receipt(r: &EnforcementReceipt) -> ReceiptDto {
+    ReceiptDto {
+        receipt_id_hex: r.receipt_id.to_hex(),
+        scope_label: r.scope_label.clone(),
+        prior_state: r.prior_state.clone(),
     }
 }
 
@@ -63,9 +57,9 @@ impl From<&EnforcementReceipt> for ReceiptDto {
 /// field that may drive a green affordance.
 #[must_use]
 pub fn kill_switch_view(status: &KillSwitchStatus) -> KillSwitchViewDto {
-    let logical_state = LogicalStateDto::from(status.logical_state);
+    let logical_state = logical_state(status.logical_state);
     let os = os_rule(status.os_rule_present);
-    let recovery = RecoveryDto::from(status.recovery);
+    let recovery = recovery(status.recovery);
 
     let journal_claims_engaged = matches!(status.logical_state, KillSwitchState::Engaged);
     let protection_confirmed = journal_claims_engaged
@@ -94,7 +88,7 @@ pub fn kill_switch_view(status: &KillSwitchStatus) -> KillSwitchViewDto {
         state_version: status.state_version,
         audit_len: status.audit_len,
         audit_head_hex: status.audit_head.to_hex(),
-        receipt: status.receipt.as_ref().map(ReceiptDto::from),
+        receipt: status.receipt.as_ref().map(receipt),
     }
 }
 
@@ -129,35 +123,29 @@ pub fn audit_view(entries: &[BoundaryAuditEntry], verified: bool) -> AuditViewDt
     }
 }
 
-impl From<EmissionDecision> for DecisionDto {
-    fn from(d: EmissionDecision) -> Self {
-        match d {
-            EmissionDecision::Emit => DecisionDto::Emit,
-            EmissionDecision::Hold => DecisionDto::Hold,
-            EmissionDecision::Deny => DecisionDto::Deny,
-        }
+fn decision(d: EmissionDecision) -> DecisionDto {
+    match d {
+        EmissionDecision::Emit => DecisionDto::Emit,
+        EmissionDecision::Hold => DecisionDto::Hold,
+        EmissionDecision::Deny => DecisionDto::Deny,
     }
 }
 
-impl From<GateOutcomeKind> for GateOutcomeDto {
-    fn from(g: GateOutcomeKind) -> Self {
-        match g {
-            GateOutcomeKind::Pass => GateOutcomeDto::Pass,
-            GateOutcomeKind::Hold => GateOutcomeDto::Hold,
-            GateOutcomeKind::Refine => GateOutcomeDto::Refine,
-            GateOutcomeKind::Reject => GateOutcomeDto::Reject,
-            GateOutcomeKind::Quarantine => GateOutcomeDto::Quarantine,
-        }
+fn gate_outcome(g: GateOutcomeKind) -> GateOutcomeDto {
+    match g {
+        GateOutcomeKind::Pass => GateOutcomeDto::Pass,
+        GateOutcomeKind::Hold => GateOutcomeDto::Hold,
+        GateOutcomeKind::Refine => GateOutcomeDto::Refine,
+        GateOutcomeKind::Reject => GateOutcomeDto::Reject,
+        GateOutcomeKind::Quarantine => GateOutcomeDto::Quarantine,
     }
 }
 
-impl From<ResonanceAction> for ResonanceActionDto {
-    fn from(a: ResonanceAction) -> Self {
-        match a {
-            ResonanceAction::Stabilize => ResonanceActionDto::Stabilize,
-            ResonanceAction::Delay => ResonanceActionDto::Delay,
-            ResonanceAction::Hold => ResonanceActionDto::Hold,
-        }
+fn resonance_action(a: ResonanceAction) -> ResonanceActionDto {
+    match a {
+        ResonanceAction::Stabilize => ResonanceActionDto::Stabilize,
+        ResonanceAction::Delay => ResonanceActionDto::Delay,
+        ResonanceAction::Hold => ResonanceActionDto::Hold,
     }
 }
 
@@ -167,11 +155,11 @@ impl From<ResonanceAction> for ResonanceActionDto {
 #[must_use]
 pub fn system_verdict_view(v: &SystemVerdict) -> SystemVerdictViewDto {
     SystemVerdictViewDto {
-        decision: v.decision.into(),
+        decision: decision(v.decision),
         host_downgraded: v.host_downgraded,
-        signature_gate: v.signature_gate.into(),
-        qlogic_gate: v.qlogic_gate.into(),
-        resonance_action: v.resonance_action.into(),
+        signature_gate: gate_outcome(v.signature_gate),
+        qlogic_gate: gate_outcome(v.qlogic_gate),
+        resonance_action: resonance_action(v.resonance_action),
         field_digest_hex: v.field_digest.to_hex(),
         reasons: v.reasons.clone(),
     }

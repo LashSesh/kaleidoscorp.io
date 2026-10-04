@@ -44,6 +44,11 @@ impl HopSpec {
 pub enum RouteKind {
     /// Connect directly to the destination without any proxy or relay.
     Direct,
+    /// Broker-managed OpenVPN profile, unavailable until service integration.
+    OpenVpn {
+        adapter_id: String,
+        profile_id: String,
+    },
     /// Route through a single proxy/relay hop.
     SingleHop(HopSpec),
     /// Route through an ordered chain of hops (multi-hop).
@@ -91,17 +96,25 @@ pub struct AdapterRegistryEntry {
 #[derive(Debug, Default)]
 pub struct RouteOrchestrator {
     registry: Vec<AdapterRegistryEntry>,
+    vpn_profiles: std::collections::BTreeMap<String, String>,
 }
 
 impl RouteOrchestrator {
     #[must_use]
     pub fn new(registry: Vec<AdapterRegistryEntry>) -> Self {
-        Self { registry }
+        Self {
+            registry,
+            vpn_profiles: Default::default(),
+        }
     }
 
     /// Register an adapter with its default hop specification.
     pub fn register(&mut self, entry: AdapterRegistryEntry) {
         self.registry.push(entry);
+    }
+
+    pub fn register_openvpn(&mut self, adapter_id: String, profile_id: String) {
+        self.vpn_profiles.insert(adapter_id, profile_id);
     }
 
     fn resolve_adapter(&self, adapter_id: &str) -> Option<&AdapterRegistryEntry> {
@@ -144,6 +157,15 @@ impl RouteOrchestrator {
                 false,
             )),
             PolicyAction::Redirect { adapter_id } => {
+                if let Some(profile_id) = self.vpn_profiles.get(adapter_id) {
+                    return Ok((
+                        RouteKind::OpenVpn {
+                            adapter_id: adapter_id.clone(),
+                            profile_id: profile_id.clone(),
+                        },
+                        false,
+                    ));
+                }
                 let entry = self
                     .resolve_adapter(adapter_id)
                     .ok_or_else(|| NetAdminError::UnknownAdapter(adapter_id.clone()))?;
@@ -291,6 +313,8 @@ mod tests {
             description: "proxy critical risk via socks5".into(),
             priority: 1,
             criteria: MatchCriteria {
+                dest_host: None,
+                dest_port: None,
                 app_prefix: None,
                 dest_suffix: None,
                 protocol: None,

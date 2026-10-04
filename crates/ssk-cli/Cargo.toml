@@ -1,5 +1,6 @@
 [package]
 name = "ssk-cli"
+default-run = "ssk"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -8,7 +9,12 @@ license.workspace = true
 name = "ssk"
 path = "src/main.rs"
 
+[[bin]]
+name = "ssk-vpn-acceptance"
+path = "src/bin/ssk-vpn-acceptance.rs"
+
 [dependencies]
+sha2.workspace = true
 anyhow.workspace = true
 clap.workspace = true
 serde_json.workspace = true
@@ -36,10 +42,53 @@ ssk-service-host = { path = "../ssk-service-host", version = "0.1.0" }
 ssk-boundary = { path = "../ssk-boundary", version = "0.1.0" }
 ssk-crown = { path = "../ssk-crown", version = "0.1.0" }
 ssk-winhost = { path = "../ssk-winhost", version = "0.1.0" }
-# Only "rt" + "net" + "macros": one-shot current-thread runtime for the new
+# --- The privileged broker's protocol, CLIENT half only (roadmap P3) --------
+# This edge did not exist before P3, and a comment in `main.rs` used to justify
+# its absence: "the broker is the privileged layer P3 will host as SYSTEM, and
+# the unprivileged CLI depending on it directly would invert that." That
+# reasoning was about *hosting*. It does not survive P3's actual requirement,
+# which is that `ssk winhost killswitch` stop actuating the firewall and start
+# **speaking to** the broker — and a client must be able to name the protocol it
+# speaks. What is used here is exactly the client surface: `PrivilegedClient`,
+# `ClientHello`, `KillSwitchStatus`, `RejectReason`, `LeaseId`. `Broker` itself
+# is never constructed in this crate, and a test asserts that (see
+# `the_cli_never_constructs_a_broker`).
+#
+# The alternative — re-exporting a narrow facade from `ssk-winhost` — was
+# rejected: it would put a portable protocol behind the one crate that is exempt
+# from `forbid(unsafe_code)` and `#[cfg(windows)]`-only, so the rendering and
+# error-mapping logic (all of which is pure) would become untestable off-Windows.
+ssk-netd-helper = { path = "../ssk-netd-helper", version = "0.1.0" }
+# Per-command anti-replay nonces and idempotency keys for the privileged
+# transport. `ssk_netd_helper::NonceSource` is deliberately injected rather than
+# generated inside that crate, and its doc says production must supply a CSPRNG:
+# a predictable nonce is one an attacker can burn ahead of a legitimate client,
+# turning anti-replay into denial-of-service. 0.3 is the major already in this
+# graph via `ssk-diag` and `ssk-winhost`, so this adds no crate and no fourth
+# `getrandom` major. On Windows it calls `ProcessPrng`; it never reads
+# `/dev/urandom` on the platforms this binary ships to.
+getrandom = "0.3"
+# Only "rt" + "net" + "time" + "macros": one-shot current-thread runtime for the
 # daemon-backed commands (status/activate/deactivate/list-profiles). `run` /
 # `replay-verify` / `doctor` / etc. remain fully synchronous and local.
-tokio = { version = "1", features = ["rt", "net", "macros"] }
+# "time" is not incidental: `DaemonClient::connect` sleeps between
+# `ERROR_PIPE_BUSY` retries on Windows, so `enable_all` must start a time
+# driver. `ssk-ipc` happens to enable it too, but a crate must declare the
+# features its own call path requires rather than inherit them by unification.
+tokio = { version = "1", features = ["rt", "net", "time", "macros"] }
+# --- Process diagnostics (roadmap P2, task 5) -------------------------------
+# `ssk` had NO tracing dependency at all, so the 14 emit sites in the libraries
+# it links (ssk-winhost x11, ssk-boundary, ssk-crown, ssk-system,
+# ssk-service-host, ssk-netcore) were unconditionally dropped and
+# `docs/OBSERVABILITY.md`'s target catalog was unreachable from the shipped CLI.
+tracing.workspace = true
+# The subscriber, the durable rotated sink, the panic hook and `doctor`'s
+# OS-CSPRNG probe. This file used to carry `tracing-subscriber`,
+# `tracing-appender` and `getrandom` directly, for an inline `mod diag` and
+# `mod entropy` that duplicated `ssk-daemon`'s — the duplication that produced
+# the `/dev/urandom` defect in both crates at once. All three moved into
+# `ssk-diag` with the code.
+ssk-diag = { path = "../ssk-diag", version = "0.1.0" }
 
 [lints]
 workspace = true

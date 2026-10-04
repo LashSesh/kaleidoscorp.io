@@ -37,6 +37,7 @@
 //! `sha256(json.dumps(...))` byte-for-byte).
 
 pub mod audit_ledger;
+pub mod baseline;
 pub mod calibration;
 pub mod canonical;
 pub mod controlled_adapter;
@@ -61,6 +62,7 @@ pub mod url;
 pub mod value;
 
 pub use audit_ledger::{AuditLedger, LedgerError};
+pub use baseline::{PersistedBaseline, BASELINE_SCHEMA};
 pub use calibration::{
     calibration_preset_names, calibration_spectrum, get_calibration_preset, CalibrationPreset,
     DEFAULT_CALIBRATION_PRESET,

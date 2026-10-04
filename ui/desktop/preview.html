@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="de">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self'; connect-src 'self'; object-src 'none'; base-uri 'none'; form-action 'none'">
+  <title>ScorpioSync · UI-Vorschau</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <aside class="preview-banner"><strong>UI-Vorschau · ausschließlich Beispieldaten</strong><br>Diese Ansicht steuert und prüft keine Schutzfunktionen auf diesem Rechner.</aside>
+  <header><h1>ScorpioSync · Diagnose</h1><span id="panel-state" class="badge" role="status" aria-live="polite">Nicht verbunden</span></header>
+  <p class="intro">Kill-Switch, Verbindungen und Auditdaten im Überblick. Eine Anzeige hier ist keine Bestätigung vollständigen Systemschutzes.</p>
+  <p id="source">Keine Backend-Verbindung</p>
+  <div class="toolbar">
+    <label for="scenario">Beispielszenario</label><select id="scenario"><option value="disconnected">Nicht verbunden</option><option value="connecting">Verbindungsaufbau</option><option value="ready">Bereit</option><option value="engaged">Kill-Switch bestätigt</option><option value="released">Freigegeben</option><option value="inconsistent">Widersprüchlicher Zustand</option><option value="degraded">Eingeschränkt</option><option value="daemon-v2">Dienststatus (v2)</option></select>
+    <button id="refresh" type="button">Aktualisieren</button>
+  </div>
+  <p>Gemeldeter Zustand: <span id="reported-state">unbekannt</span></p>
+  <main>
+    <section aria-labelledby="daemon-h"><h2 id="daemon-h">Hintergrunddienst <span id="daemon-state" class="badge">Keine Daten</span></h2>
+      <p class="intro">Laufzeitstatus des Dienstes. Bestätigter Systemschutz sowie vollständige Audit- und Verbindungsdaten sind hier noch nicht angebunden.</p><dl id="daemon-fields"></dl>
+    </section>
+    <section aria-labelledby="ks-h"><h2 id="ks-h">Kill-Switch</h2>
+      <div id="ks-light" class="light neutral" role="status" aria-live="polite"><span id="ks-headline">Schutzstatus unbekannt</span></div><dl id="ks-fields"></dl>
+    </section>
+    <section aria-labelledby="au-h"><h2 id="au-h">Auditprotokoll <span id="au-integrity" class="badge">Keine Daten</span></h2>
+      <div class="table-scroll"><table id="au-table"><thead><tr><th>Nr.</th><th>Ereignis</th><th>Übergang</th><th>Akteur</th><th>Hash</th></tr></thead><tbody></tbody></table></div>
+    </section>
+    <section aria-labelledby="co-h"><h2 id="co-h">Verbindungen <span id="co-note" class="badge">Keine Daten</span></h2>
+      <div class="table-scroll"><table id="co-table"><thead><tr><th>Protokoll</th><th>Lokal</th><th>Gegenstelle</th><th>Prozess</th><th>Zustand</th></tr></thead><tbody></tbody></table></div>
+    </section>
+  </main>
+  <script type="module" src="src/preview-main.js"></script>
+</body>
+</html>

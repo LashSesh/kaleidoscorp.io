@@ -7,6 +7,8 @@
 
 use std::collections::BTreeMap;
 
+use serde::{Deserialize, Serialize};
+
 use crate::signature::SpectralSignature;
 
 fn default_dimension_tolerances() -> BTreeMap<String, f64> {
@@ -28,7 +30,13 @@ fn default_externalization_surfaces() -> Vec<String> {
 }
 
 /// The signature + tolerances a transform is gated against.
-#[derive(Clone, Debug, PartialEq)]
+///
+/// `Serialize`/`Deserialize` (added alongside a persisted-baseline use, see
+/// [`crate::baseline::PersistedBaseline`]): every field is already
+/// serde-capable — `SpectralSignature` derives both, and the rest are plain
+/// `String`/`BTreeMap<String, f64>`/`Vec<String>` — so this is a derive, not a
+/// new format.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct TargetProfile {
     pub name: String,
     pub signature: SpectralSignature,

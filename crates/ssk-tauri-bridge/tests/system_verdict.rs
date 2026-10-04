@@ -5,8 +5,10 @@
 
 use ssk_boundary::KillSwitchState;
 use ssk_capture::{CaptureMode, CaptureScope, SystemTrafficField, TrafficSource, TrafficWindow};
+use ssk_field_tensor::FieldTensorSkin;
 use ssk_mpk::Graph;
 use ssk_service_host::ServiceHealth;
+use ssk_signature::TargetProfile;
 use ssk_system::{SystemInputs, SystemPipeline};
 
 use ssk_tauri_bridge::dto::{DecisionDto, GateOutcomeDto, ResonanceActionDto};
@@ -44,10 +46,24 @@ fn windows() -> Vec<Graph> {
     ]
 }
 
+/// A baseline "established" from a prior, independent capture of `traffic` —
+/// built outside any `SystemPipeline::evaluate` call, exactly the shape a
+/// real persisted per-host baseline takes once loaded by a caller.
+fn baseline_for(traffic: &SystemTrafficField, ws: &[Graph]) -> TargetProfile {
+    let skin = FieldTensorSkin::from_field(traffic, ws);
+    let sig = skin
+        .surface_tensor
+        .last()
+        .expect("fixture traffic yields a surface")
+        .clone();
+    TargetProfile::new("system", sig)
+}
+
 fn inputs<'a>(
     traffic: &'a SystemTrafficField,
     ws: &'a [Graph],
     kill_switch: KillSwitchState,
+    baseline: Option<&'a TargetProfile>,
 ) -> SystemInputs<'a> {
     SystemInputs {
         traffic,
@@ -57,6 +73,7 @@ fn inputs<'a>(
         open_obligations: 0,
         parallax_consistent: true,
         replay_equal: true,
+        signature_baseline: baseline,
     }
 }
 
@@ -66,7 +83,13 @@ fn inputs<'a>(
 fn clean_run_projects_to_a_coherent_verdict_dto() {
     let traffic = field();
     let ws = windows();
-    let verdict = SystemPipeline::new().evaluate(&inputs(&traffic, &ws, KillSwitchState::Armed));
+    let baseline = baseline_for(&traffic, &ws);
+    let verdict = SystemPipeline::new().evaluate(&inputs(
+        &traffic,
+        &ws,
+        KillSwitchState::Armed,
+        Some(&baseline),
+    ));
     let dto = system_verdict_view(&verdict);
 
     assert_eq!(dto.decision, DecisionDto::Emit, "the clean path emits");
@@ -90,7 +113,13 @@ fn clean_run_projects_to_a_coherent_verdict_dto() {
 fn an_engaged_kill_switch_forces_deny() {
     let traffic = field();
     let ws = windows();
-    let verdict = SystemPipeline::new().evaluate(&inputs(&traffic, &ws, KillSwitchState::Engaged));
+    let baseline = baseline_for(&traffic, &ws);
+    let verdict = SystemPipeline::new().evaluate(&inputs(
+        &traffic,
+        &ws,
+        KillSwitchState::Engaged,
+        Some(&baseline),
+    ));
     let dto = system_verdict_view(&verdict);
     assert_eq!(
         dto.decision,

@@ -195,7 +195,7 @@ mod tests {
                 id: FacetId::of(&"f1", HashAlg::Blake3).expect("hash"),
                 core: CoreId::new("c1"),
                 phase: PhaseVector::zero(),
-                orientation: Orientation::Forward,
+                orientation: FacetOrientation::Forward,
                 sector: Sector::Identity,
                 key_ctx: KeyContextRef::new("kc"),
                 session: SessionId::new("sess"),

@@ -1,0 +1,49 @@
+{
+  "schema_version": 1,
+  "panel_state": "ready",
+  "kill_switch": {
+    "audit_head_hex": "0000000000000000000000000000000000000000000000000000000000000000",
+    "audit_len": 1,
+    "is_alarm": false,
+    "journal_claims_engaged": false,
+    "logical_state": "armed",
+    "os_rule": "absent",
+    "protection_confirmed": false,
+    "receipt": null,
+    "recovery": "consistent",
+    "severity": "ok",
+    "state_version": 1
+  },
+  "audit": {
+    "entries": [
+      {
+        "actor": "operator",
+        "entry_hash_hex": "0000000000000000000000000000000000000000000000000000000000000000",
+        "from_state": "armed",
+        "kind": "engage",
+        "reason": null,
+        "seq": 0,
+        "to_state": "engaged"
+      }
+    ],
+    "entry_count": 1,
+    "head_hex": "0000000000000000000000000000000000000000000000000000000000000000",
+    "integrity": {
+      "status": "unverified"
+    }
+  },
+  "connections": {
+    "live_supported": true,
+    "parse_anomaly": false,
+    "rows": [
+      {
+        "local": "10.0.0.1:55000",
+        "pid": 4321,
+        "protocol": "tcp",
+        "remote": "93.184.216.34:443",
+        "status": "established"
+      }
+    ],
+    "source_id": "mock-source"
+  }
+}

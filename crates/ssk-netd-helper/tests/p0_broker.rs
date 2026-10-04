@@ -83,7 +83,7 @@ fn actuation_auth() -> AuthorizationManifest {
 }
 
 fn mk(dir: &Path, state: Arc<MockState>) -> Broker {
-    let store = Box::new(FileReceiptStore::open(dir).unwrap());
+    let store = Box::new(FileReceiptStore::open_existing(dir).unwrap());
     let cfg = BrokerConfig {
         session_token: TOKEN,
         actuation_auth: actuation_auth(),
@@ -159,7 +159,7 @@ fn engage_severs_persists_and_is_authoritative() {
     assert_eq!(state.engage_calls.load(Ordering::SeqCst), 1);
 
     // The durable store now holds an Engaged snapshot with the receipt.
-    let reloaded = FileReceiptStore::open(dir.path())
+    let reloaded = FileReceiptStore::open_existing(dir.path())
         .unwrap()
         .load()
         .unwrap()
@@ -251,7 +251,7 @@ fn release_restores_egress_and_audit_reverifies() {
     assert!(status.audit_len >= 2, "engage + release are both audited");
 
     // The persisted journal still rehydrates (chain intact) after release.
-    let snap = FileReceiptStore::open(dir.path())
+    let snap = FileReceiptStore::open_existing(dir.path())
         .unwrap()
         .load()
         .unwrap()
@@ -273,7 +273,7 @@ fn engage_failure_rolls_back_with_no_persisted_state() {
     let status = broker.status();
     assert_eq!(status.logical_state, KillSwitchState::Armed);
     assert_eq!(status.state_version, 0);
-    assert!(FileReceiptStore::open(dir.path())
+    assert!(FileReceiptStore::open_existing(dir.path())
         .unwrap()
         .load()
         .unwrap()

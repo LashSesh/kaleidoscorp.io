@@ -99,6 +99,15 @@ pub struct PipelineExecution {
     pub gate_report: GateReport,
     pub traces: Vec<TraceRecord>,
     pub scheduler_state: SchedulerState,
+    /// The seam-scoped `FourPiClosure` accumulator `gate_vector.evaluate`
+    /// already advanced via `BcikGate`'s real crossing pre-check (S1 item 1
+    /// close-out) — scoped 1:1 to this one candidate (`execute_pipeline`
+    /// builds exactly one per call), never object-owned or daemon-lifetime.
+    /// `run_to_outcome` reuses this SAME accumulator for its own, separate
+    /// materialization crossing so a genuine second, agreeing pass over the
+    /// identical seam can honestly close (Satz 12.4) instead of fabricating
+    /// repetition.
+    pub closure: ssk_imdf::closure::FourPiClosure,
 }
 
 /// Runs the pure decision core once: deterministic given identical `intent`,
@@ -131,7 +140,13 @@ pub fn execute_pipeline(
         .ok_or(RuntimeError::LocatorNotFound)?;
 
     let candidate = from_intent(intent.clone(), facet, locator);
-    let gate_report = gate_vector.evaluate(&candidate);
+    // One closure per one candidate, by construction: execute_pipeline builds
+    // exactly one candidate per call (single derive_identity_facet +
+    // from_intent, no loop), so this accumulator's scope is structurally tied
+    // to that one seam -- nothing outside this function can hand it to an
+    // unrelated candidate.
+    let mut closure = ssk_imdf::closure::FourPiClosure::new(candidate.facet.trace.clone());
+    let gate_report = gate_vector.evaluate(&candidate, &mut closure);
 
     let mut traces = Vec::new();
     let mut prev_hash = ssk_types::Digest::GENESIS;
@@ -163,6 +178,7 @@ pub fn execute_pipeline(
         gate_report,
         traces,
         scheduler_state: scheduler.state(),
+        closure,
     })
 }
 
@@ -241,6 +257,7 @@ pub fn run_to_outcome(
         candidate,
         gate_report,
         scheduler_state,
+        mut closure,
         ..
     } = execution;
 
@@ -263,8 +280,14 @@ pub fn run_to_outcome(
         GateOutcomeKind::Pass => {}
     }
 
-    // Gate passed: cross the seam for real. An open crossing is a boundary
-    // residue, which dissolves (still not a silent loss).
+    // Gate passed: cross the seam for real -- reusing the SAME FourPiClosure
+    // BcikGate's own pre-check inside execute_pipeline's gate_vector.evaluate
+    // already advanced above. This is a genuine second, agreeing pass over
+    // the identical seam (same facet/locator/fiber/candidate, so both the
+    // seam digest and the canonical self-class digest agree), not a
+    // fabricated repetition -- so it can honestly close (Satz 12.4). An open
+    // crossing is a boundary residue, which dissolves (still not a silent
+    // loss).
     let provider = ssk_crypto::Blake3HashProvider;
     let mut bcik = ssk_bcik::Bcik::new(&provider);
     let mut stitch = match bcik.cross(
@@ -272,6 +295,7 @@ pub fn run_to_outcome(
         &candidate.locator,
         ssk_types::FiberType::Data,
         &candidate,
+        &mut closure,
     ) {
         ssk_types::CrossOutcome::Closed(stitch) => stitch,
         ssk_types::CrossOutcome::Residue(residue) => {
@@ -400,7 +424,23 @@ impl ssk_core::connection::MaterializationSink for TensorMaterializationSink<'_>
     fn materialize(&mut self, sc: &StitchCandidate) -> Result<Vec<StitchId>, ssk_types::FaultKind> {
         let provider = ssk_crypto::Blake3HashProvider;
         let mut bcik = ssk_bcik::Bcik::new(&provider);
-        let mut stitch = match bcik.cross(&sc.facet, &sc.locator, ssk_types::FiberType::Data, sc) {
+        // Standalone crossing (design item 2's verdict): `ssk-core`'s
+        // `MaterializationSink` trait is a dependency-inversion boundary
+        // `ssk-core` must not gain an `ssk-imdf` edge across, and grepping
+        // ssk-daemon/ssk-cli for `Connection::<`/`TensorMaterializationSink`
+        // finds zero production callers of this typestate path -- there is
+        // no prior real gate-check crossing to share an accumulator with.
+        // One fresh pass, therefore always Residue, never Closed. The real
+        // production materialization path that achieves honest closure is
+        // `run_to_outcome`, which shares BcikGate's own pre-check pass.
+        let mut closure = ssk_imdf::closure::FourPiClosure::new(sc.facet.trace.clone());
+        let mut stitch = match bcik.cross(
+            &sc.facet,
+            &sc.locator,
+            ssk_types::FiberType::Data,
+            sc,
+            &mut closure,
+        ) {
             ssk_types::CrossOutcome::Closed(stitch) => stitch,
             ssk_types::CrossOutcome::Residue(_) => {
                 return Err(ssk_types::FaultKind::BcikSeamMissing);
@@ -483,6 +523,7 @@ impl<'a, L: LedgerBackend> Runtime<'a, L> {
             gate_report,
             traces,
             scheduler_state,
+            ..
         } = execution;
 
         let stitch = if gate_report.outcome == GateOutcomeKind::Pass && refocuses(&candidate) {
@@ -874,8 +915,19 @@ mod tests {
         ));
     }
 
+    // Under S1's closure-sharing design, `TensorMaterializationSink` has no
+    // shared `FourPiClosure` accumulator available (`ssk-core`'s
+    // `MaterializationSink` trait is a dependency-inversion boundary that
+    // must not gain an `ssk-imdf` edge, and this typestate path has zero
+    // production callers -- see the design's item-2 verdict). So a standalone
+    // single crossing here can only ever be a lone, honest first pass: it
+    // must degrade to Residue, never fabricate a second pass to close. This
+    // replaces the old test's assumption (which only ever passed because of
+    // the pre-S1 two-boolean shortcut) with the true, disclosed resting
+    // state -- proving the honest-degrade path is real and reachable, not
+    // silently dropping the coverage.
     #[test]
-    fn connection_typestate_drives_to_materialized_with_real_collaborators() {
+    fn connection_typestate_gate_passes_but_standalone_materialize_sink_honestly_residues() {
         use ssk_core::connection::{Connection, ConnectionInner, GateOutcome, Intent};
 
         // Build a real candidate exactly as the pipeline does.
@@ -890,14 +942,20 @@ mod tests {
         let c = c.birefract().expect("birefract");
         let c = c.place(&HypercubePathCheck).expect("place");
         let c = match c.gate(&gate_vector) {
-            GateOutcome::Pass(c) => c,
+            GateOutcome::Pass(c) => c, // BcikGate's verdict is boundary-existence, unaffected
             _ => panic!("expected GateOutcome::Pass"),
         };
         let mut sink = TensorMaterializationSink::new(&mut tensor, EpochId(0), ssk_types::Tick(1));
-        let c = c.materialize(&mut sink).expect("materialize");
-
-        assert_eq!(c.inner().stitches().len(), 1);
-        assert_eq!(tensor.graph().len(), 1);
+        let result = c.materialize(&mut sink);
+        assert!(
+            matches!(result, Err(ssk_types::FaultKind::BcikSeamMissing)),
+            "a standalone single-pass crossing cannot honestly close"
+        );
+        assert_eq!(
+            tensor.graph().len(),
+            0,
+            "no materialization on an honest residue"
+        );
     }
 
     #[test]

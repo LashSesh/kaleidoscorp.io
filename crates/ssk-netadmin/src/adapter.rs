@@ -18,6 +18,8 @@ pub enum AdapterKind {
     HttpConnect,
     TlsTunnel,
     DnsOverride,
+    /// Reserved for the privileged OpenVPN lifecycle; not a TCP proxy.
+    OpenVpn,
 }
 
 /// A fully-resolved adapter descriptor ready for use by a transport layer.

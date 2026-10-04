@@ -1,0 +1,11 @@
+{
+  "schema_version": 2,
+  "panel_state": "degraded",
+  "daemon": {
+    "reported_state": "inactive",
+    "version": "0.1.0",
+    "active_profile": null,
+    "adapter_count": 0,
+    "last_error_code": null
+  }
+}

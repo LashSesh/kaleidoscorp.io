@@ -19,6 +19,10 @@ use ssk_tensor::{GenericFileLedgerBackend, GenericLedgerBackend, GenericMemoryBa
 /// Outcome of a dispatched (or denied) flow.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AuditOutcome {
+    /// A dispatch attempt was durably admitted, but has no recorded result
+    /// yet. Never interpret this as a successful connection. A crash may
+    /// leave it without a terminal entry.
+    DispatchPending,
     /// The flow was allowed and dispatched.
     Dispatched,
     /// The flow was denied by policy.
@@ -66,6 +70,10 @@ pub struct ForensicEntry {
 
 fn summarise_route(route: &RouteKind) -> String {
     match route {
+        RouteKind::OpenVpn {
+            adapter_id,
+            profile_id,
+        } => format!("openvpn:{adapter_id}:{profile_id}"),
         RouteKind::Direct => "Direct".into(),
         RouteKind::SingleHop(h) => format!("SingleHop({})", h.adapter_id),
         RouteKind::MultiHop(hops) => {

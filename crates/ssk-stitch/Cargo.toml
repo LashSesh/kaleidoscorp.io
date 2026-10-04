@@ -10,5 +10,17 @@ ssk-core = { path = "../ssk-core", version = "0.1.0" }
 ssk-locator = { path = "../ssk-locator", version = "0.1.0" }
 ssk-bcik = { path = "../ssk-bcik", version = "0.1.0" }
 
+[dev-dependencies]
+# Only used by tests below, to prove the four StitchCandidate flags
+# from_intent computes actually drive their real downstream consumers
+# (BcikGate/BoundaryGate/ReplayGate/FocusGate/HypercubeGate), not just that
+# the bools are right in isolation. Production code in src/ never depends on
+# ssk-gates, so this stays a dev-only edge — ssk-gates already depends on
+# ssk-bcik, not on ssk-stitch, so no cycle is introduced.
+ssk-gates = { path = "../ssk-gates", version = "0.1.0" }
+# Same test module: every BcikGate/BoundaryGate/ReplayGate/FocusGate::evaluate
+# call now needs a real `&mut FourPiClosure` accumulator argument.
+ssk-imdf = { path = "../ssk-imdf", version = "0.1.0" }
+
 [lints]
 workspace = true

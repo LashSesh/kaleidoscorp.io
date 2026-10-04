@@ -74,6 +74,14 @@ pub struct SystemInputs<'a> {
     /// evidence is available so R conservatively fails rather than silently
     /// passing.
     pub replay_equal: bool,
+    /// The persisted per-host signature baseline (`ssk-signature::TargetProfile`),
+    /// loaded by the caller from the ProgramData state store
+    /// (`ssk_winhost::state_dir` / `ssk system baseline-init`). Real, previously
+    /// established comparison ground truth — this pipeline does not fabricate one
+    /// from the observation it is about to gate. Pass `None` when no baseline has
+    /// been established yet, so the signature gate conservatively holds rather
+    /// than silently comparing the observation against itself.
+    pub signature_baseline: Option<&'a TargetProfile>,
 }
 
 /// The result of one end-to-end evaluation.
@@ -140,15 +148,16 @@ impl SystemPipeline {
         for r in &skin.residue_tensor {
             residue_report = residue_report.add(&r.surface, r.severity, &r.message);
         }
-        let signature_gate = match skin.surface_tensor.last() {
-            Some(sig) => {
-                let target = TargetProfile::new("system", sig.clone());
-                GateBundle
-                    .evaluate(sig, sig, &target, &residue_report, None)
-                    .to_ssk_decision()
-            }
+        let signature_gate = match (skin.surface_tensor.last(), inputs.signature_baseline) {
+            (Some(sig), Some(target)) => GateBundle
+                .evaluate(sig, sig, target, &residue_report, None)
+                .to_ssk_decision(),
             // Nothing captured — fail closed to a hold, never a silent pass.
-            None => GateOutcomeKind::Hold,
+            (None, _) => GateOutcomeKind::Hold,
+            // Captured, but no baseline established yet — fail closed to a
+            // hold; the gate cannot genuinely compute a distance against
+            // nothing. See `ssk system baseline-init`.
+            (Some(_), None) => GateOutcomeKind::Hold,
         };
 
         // 5. The IMDF QLOGIC verdict g=(κ,H,Π,R,B,Δ). Every axis is computed from
@@ -196,6 +205,15 @@ impl SystemPipeline {
         let mut reasons = crown_report.reasons.clone();
         let mut decision = crown_report.decision;
         let mut host_downgraded = false;
+
+        // Name the missing-baseline case explicitly, rather than folding it
+        // into the generic `signature_gate_hold` `ssk-crown` already emits.
+        // Purely additive: it does not change `decision`, since
+        // `signature_gate = Hold` has already made the Crown/Crown-downstream
+        // decision conservative.
+        if inputs.signature_baseline.is_none() && skin.surface_tensor.last().is_some() {
+            reasons.push("signature_baseline_missing".to_owned());
+        }
 
         // 7a. Host-health: an un-emittable host holds a would-be emit.
         if !inputs.host_health.is_emittable() {
@@ -417,6 +435,37 @@ mod tests {
         }
     }
 
+    // A capture that is spectrally different from `CleanSource` (deeper URL,
+    // a different header set, a larger structured payload — shifting the
+    // shape/ordering/entropy dimensions) but carries no Authorization header,
+    // cookie, or other linkability trigger, so it produces zero residues.
+    //
+    // Track C's regression test needs exactly this: a fixture where the
+    // *only* possible reason `signature_gate` can be non-`Pass` is the
+    // spectral distance against the loaded baseline. `DriftingSource` (above)
+    // is deliberately residue-triggering for a *different* test and would
+    // confound this one — its own Authorization-header Hold fires
+    // independently of whether the baseline comparison is real or
+    // self-referential, which is exactly the confound this fixture avoids.
+    struct SpectrallyDifferentCleanSource;
+    impl TrafficSource for SpectrallyDifferentCleanSource {
+        fn source_id(&self) -> String {
+            "clean-but-different".to_owned()
+        }
+        fn windows(&self, _scope: &CaptureScope) -> Vec<TrafficWindow> {
+            let mut w = TrafficWindow::http("http");
+            w.method = Some("GET".to_owned());
+            w.url = Some("https://example.local/api/v2/widgets/42/details".to_owned());
+            w.status = Some(200);
+            w.response_headers = vec![
+                ("Content-Type".to_owned(), "application/json".to_owned()),
+                ("Cache-Control".to_owned(), "no-store".to_owned()),
+            ];
+            w.payload = br#"{"id":42,"name":"widget","tags":["a","b","c"]}"#.to_vec();
+            vec![w]
+        }
+    }
+
     fn field(source: &dyn TrafficSource) -> SystemTrafficField {
         SystemTrafficField::capture(
             source,
@@ -432,7 +481,32 @@ mod tests {
         ]
     }
 
-    fn clean_inputs<'a>(traffic: &'a SystemTrafficField, windows: &'a [Graph]) -> SystemInputs<'a> {
+    /// A baseline "established" from a prior, independent capture of
+    /// `traffic` — built by calling `FieldTensorSkin::from_field` directly,
+    /// *outside* any `SystemPipeline::evaluate` call. This is the shape a real
+    /// persisted baseline takes once loaded by a caller: unlike the defect
+    /// this fix replaces (`TargetProfile::new("system", sig.clone())`
+    /// fabricated *inside* `evaluate` from the very signature it is compared
+    /// against), this profile is a genuinely separate construction. Tests that
+    /// want "this traffic matches its own previously established baseline"
+    /// use it; tests proving the distance path itself build a baseline from
+    /// *different* traffic instead (see
+    /// `a_genuinely_different_signature_yields_nonzero_spectral_distance_against_a_loaded_baseline`).
+    fn baseline_for(traffic: &SystemTrafficField, windows: &[Graph]) -> TargetProfile {
+        let skin = FieldTensorSkin::from_field(traffic, windows);
+        let sig = skin
+            .surface_tensor
+            .last()
+            .expect("fixture traffic yields at least one surface")
+            .clone();
+        TargetProfile::new("system", sig)
+    }
+
+    fn clean_inputs<'a>(
+        traffic: &'a SystemTrafficField,
+        windows: &'a [Graph],
+        baseline: Option<&'a TargetProfile>,
+    ) -> SystemInputs<'a> {
         SystemInputs {
             traffic,
             windows,
@@ -441,6 +515,7 @@ mod tests {
             open_obligations: 0,
             parallax_consistent: true,
             replay_equal: true,
+            signature_baseline: baseline,
         }
     }
 
@@ -448,9 +523,12 @@ mod tests {
     fn clean_stack_emits_and_is_replay_stable() {
         let traffic = field(&CleanSource);
         let ws = windows();
+        // A genuine, independently-established baseline (built outside
+        // `evaluate`, never fabricated from the observation it gates).
+        let baseline = baseline_for(&traffic, &ws);
 
         let mut a = SystemPipeline::new();
-        let va = a.evaluate(&clean_inputs(&traffic, &ws));
+        let va = a.evaluate(&clean_inputs(&traffic, &ws, Some(&baseline)));
         assert_eq!(
             va.decision,
             EmissionDecision::Emit,
@@ -465,7 +543,7 @@ mod tests {
         // A second, independent pipeline on the same inputs yields an identical
         // field digest and Crown head — the whole composition replays by content.
         let mut b = SystemPipeline::new();
-        let vb = b.evaluate(&clean_inputs(&traffic, &ws));
+        let vb = b.evaluate(&clean_inputs(&traffic, &ws, Some(&baseline)));
         assert_eq!(va.field_digest, vb.field_digest);
         assert_eq!(va.transduction.id, vb.transduction.id);
         assert_eq!(a.crown_head(), b.crown_head());
@@ -475,8 +553,9 @@ mod tests {
     fn kill_switch_denies_end_to_end() {
         let traffic = field(&CleanSource);
         let ws = windows();
+        let baseline = baseline_for(&traffic, &ws);
         let mut pipeline = SystemPipeline::new();
-        let mut inputs = clean_inputs(&traffic, &ws);
+        let mut inputs = clean_inputs(&traffic, &ws, Some(&baseline));
         inputs.kill_switch = KillSwitchState::Engaged;
         let verdict = pipeline.evaluate(&inputs);
         assert_eq!(
@@ -491,9 +570,10 @@ mod tests {
     fn unhealthy_host_holds_a_would_be_emit() {
         let traffic = field(&CleanSource);
         let ws = windows();
+        let baseline = baseline_for(&traffic, &ws);
         for health in [ServiceHealth::Degraded, ServiceHealth::Down] {
             let mut pipeline = SystemPipeline::new();
-            let mut inputs = clean_inputs(&traffic, &ws);
+            let mut inputs = clean_inputs(&traffic, &ws, Some(&baseline));
             inputs.host_health = health;
             let verdict = pipeline.evaluate(&inputs);
             // The gates are all clean (would emit), but an un-emittable host holds.
@@ -511,8 +591,9 @@ mod tests {
     fn sensitive_field_holds_and_keeps_privileged_effects_behind_the_supervisor() {
         let traffic = field(&DriftingSource);
         let ws = windows();
+        let baseline = baseline_for(&traffic, &ws);
         let mut pipeline = SystemPipeline::new();
-        let verdict = pipeline.evaluate(&clean_inputs(&traffic, &ws));
+        let verdict = pipeline.evaluate(&clean_inputs(&traffic, &ws, Some(&baseline)));
 
         // A captured Authorization surface is a linkability residue: the signature
         // gate holds, so the whole stack holds (never emits) — no silent pass.
@@ -591,8 +672,9 @@ mod tests {
     fn cookie_leak_holds_end_to_end_without_an_authorization_header() {
         let traffic = field(&CookieLeakSource);
         let ws = windows();
+        let baseline = baseline_for(&traffic, &ws);
         let mut pipeline = SystemPipeline::new();
-        let verdict = pipeline.evaluate(&clean_inputs(&traffic, &ws));
+        let verdict = pipeline.evaluate(&clean_inputs(&traffic, &ws, Some(&baseline)));
 
         assert_eq!(
             verdict.signature_gate,
@@ -617,9 +699,10 @@ mod tests {
     fn fail_closed_priority_holds_across_crates() {
         let traffic = field(&CleanSource);
         let ws = windows();
+        let baseline = baseline_for(&traffic, &ws);
         // An open obligation holds a would-be emit.
         let mut pipeline = SystemPipeline::new();
-        let mut inputs = clean_inputs(&traffic, &ws);
+        let mut inputs = clean_inputs(&traffic, &ws, Some(&baseline));
         inputs.open_obligations = 1;
         let verdict = pipeline.evaluate(&inputs);
         assert_eq!(verdict.decision, EmissionDecision::Hold);
@@ -641,8 +724,9 @@ mod tests {
     fn parallax_and_replay_evidence_genuinely_gate_the_pipeline() {
         let traffic = field(&CleanSource);
         let ws = windows();
+        let baseline = baseline_for(&traffic, &ws);
 
-        let mut inconsistent_parallax = clean_inputs(&traffic, &ws);
+        let mut inconsistent_parallax = clean_inputs(&traffic, &ws, Some(&baseline));
         inconsistent_parallax.parallax_consistent = false;
         let mut p1 = SystemPipeline::new();
         let v1 = p1.evaluate(&inconsistent_parallax);
@@ -652,7 +736,7 @@ mod tests {
         assert_ne!(v1.decision, EmissionDecision::Emit);
         assert!(v1.reasons.iter().any(|r| r == "a3_parallax_inconsistent"));
 
-        let mut broken_replay = clean_inputs(&traffic, &ws);
+        let mut broken_replay = clean_inputs(&traffic, &ws, Some(&baseline));
         broken_replay.replay_equal = false;
         let mut p2 = SystemPipeline::new();
         let v2 = p2.evaluate(&broken_replay);
@@ -688,7 +772,8 @@ mod tests {
         }
         let traffic = field(&HighEntropySource);
         let ws = windows();
-        let inputs = clean_inputs(&traffic, &ws);
+        let baseline = baseline_for(&traffic, &ws);
+        let inputs = clean_inputs(&traffic, &ws, Some(&baseline));
         let sig = traffic.surfaces[0].signature();
         let observed = sig
             .dimensions
@@ -706,5 +791,121 @@ mod tests {
             GateOutcomeKind::Reject,
             "a merely elevated (not extreme) entropy should hold, not hard-reject"
         );
+    }
+
+    // Regression (Track C): the signature gate used to build its own
+    // comparison `TargetProfile` from the very signature it was about to
+    // gate (`TargetProfile::new("system", sig.clone())` inside `evaluate`
+    // itself), so `distance_by_dimension` was `0.0` on every dimension by
+    // construction — the gate was trivially satisfiable, not merely hard to
+    // trip, and the distance path had never been exercised with two
+    // genuinely different inputs (roadmap open question: "whether the
+    // spectral metric has discriminative power is currently unknowable").
+    //
+    // This proves the property that fabrication made impossible to test: a
+    // baseline established from one capture, compared against a genuinely
+    // different later capture, shows a real, nonzero per-dimension distance.
+    //
+    // Deliberately uses `SpectrallyDifferentCleanSource`, not `DriftingSource`:
+    // `DriftingSource` carries an Authorization header that trips an
+    // independent, residue-based Hold, which would make the pipeline-path
+    // assertion below pass under this test's *own* pre-fix defect (the
+    // residue Hold fires regardless of whether the baseline comparison is
+    // real) — confirmed by mutation testing, which is exactly the kind of
+    // false-positive regression test this project's ethos exists to catch.
+    #[test]
+    fn a_genuinely_different_signature_yields_nonzero_spectral_distance_against_a_loaded_baseline()
+    {
+        // The baseline: established from a prior, independent capture — never
+        // built from the observation it is about to gate.
+        let baseline_traffic = field(&CleanSource);
+        let baseline_windows = windows();
+        let baseline = baseline_for(&baseline_traffic, &baseline_windows);
+
+        // A later, genuinely different, still-residue-free capture.
+        let traffic = field(&SpectrallyDifferentCleanSource);
+        let ws = windows();
+        let live_skin = FieldTensorSkin::from_field(&traffic, &ws);
+        let live_sig = live_skin
+            .surface_tensor
+            .last()
+            .expect("this capture yields a surface");
+
+        let distances = live_sig.distance_by_dimension(&baseline.signature);
+        assert!(
+            distances.values().any(|&d| d > 0.0),
+            "a genuinely different capture must show nonzero spectral distance against an \
+             independently established baseline (distances={distances:?}); under the fabricated \
+             self-referential target this fix replaces, every one of these was 0.0 by \
+             construction"
+        );
+
+        // And through the whole pipeline: with a real, independently
+        // established baseline passed in, the signature gate can now
+        // genuinely observe that the capture diverges from it, rather than
+        // trivially comparing equal to itself.
+        let mut pipeline = SystemPipeline::new();
+        let verdict = pipeline.evaluate(&clean_inputs(&traffic, &ws, Some(&baseline)));
+        assert_ne!(
+            verdict.signature_gate,
+            GateOutcomeKind::Pass,
+            "a genuinely different capture must not pass against an independent baseline"
+        );
+    }
+
+    // Regression (Track C, first-run problem): on first run there is no
+    // persisted baseline yet. The gate must not fabricate one from the
+    // observation it is about to gate (that is the exact defect this fix
+    // replaces) and must not silently pass either — it holds, with a reason
+    // an operator can act on, distinct from the generic `signature_gate_hold`
+    // `ssk-crown` already emits.
+    #[test]
+    fn missing_baseline_holds_and_names_the_reason_instead_of_silently_passing() {
+        let traffic = field(&CleanSource);
+        let ws = windows();
+        let mut pipeline = SystemPipeline::new();
+        let verdict = pipeline.evaluate(&clean_inputs(&traffic, &ws, None));
+
+        assert_eq!(
+            verdict.signature_gate,
+            GateOutcomeKind::Hold,
+            "no persisted baseline yet: the gate cannot genuinely compute a distance against \
+             nothing, so it fails closed to Hold rather than silently passing"
+        );
+        assert_ne!(verdict.decision, EmissionDecision::Emit);
+        assert!(
+            verdict
+                .reasons
+                .iter()
+                .any(|r| r == "signature_baseline_missing"),
+            "reasons={:?}",
+            verdict.reasons
+        );
+    }
+
+    // Regression: an observation with nothing captured at all must still
+    // hold, and must NOT claim the missing-baseline reason (there is nothing
+    // to compare, baseline or not) — the two fail-closed cases stay distinct.
+    #[test]
+    fn no_capture_holds_without_the_missing_baseline_reason() {
+        struct EmptySource;
+        impl TrafficSource for EmptySource {
+            fn source_id(&self) -> String {
+                "empty".to_owned()
+            }
+            fn windows(&self, _scope: &CaptureScope) -> Vec<TrafficWindow> {
+                Vec::new()
+            }
+        }
+        let traffic = field(&EmptySource);
+        let ws = windows();
+        let mut pipeline = SystemPipeline::new();
+        let verdict = pipeline.evaluate(&clean_inputs(&traffic, &ws, None));
+
+        assert_eq!(verdict.signature_gate, GateOutcomeKind::Hold);
+        assert!(!verdict
+            .reasons
+            .iter()
+            .any(|r| r == "signature_baseline_missing"));
     }
 }

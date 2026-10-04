@@ -16,6 +16,21 @@
 //!   hash-chained ledger (tamper-evident), and the whole history replays.
 //! * **Reversible.** Rolling back to a prior version is itself a gated,
 //!   audited transition.
+//!
+//! ## Status — deferred with a plan; zero consumers is the design
+//!
+//! Nothing depends on this crate, and nothing is meant to yet. It is the SSCL-3
+//! ProfileManifold, scheduled as phase **P6** (Band C) with the gates
+//! "Kill-Switch, Rollback, Emission Gate, config/profile", marked
+//! `[SSCL-UNVERIFIED]` and requiring explicit authorization
+//! (`FCHL_MPK_INTEGRATION_STRATEGY.md:218`; object row `:112`). It is **Block P**
+//! of the integration sequence — "thread validated config into a real
+//! multi-profile model driving the daemon (retire the hardcoded reference
+//! policy)" (`SYSTEM_ARCHITECTURE_CORRESPONDENCE.md:268`, described at `:29`).
+//! Its consumer is that daemon wiring, which does not exist yet. Do not retire
+//! this crate as unreferenced. (`FCHL_MPK_INTEGRATION_STRATEGY.md:112` and
+//! `SYSTEM_ARCHITECTURE_CORRESPONDENCE.md:252` still call ProfileManifold
+//! "absent"; those rows predate this crate and are stale.)
 
 use std::collections::BTreeMap;
 

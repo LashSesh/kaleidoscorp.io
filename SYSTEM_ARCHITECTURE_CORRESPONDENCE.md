@@ -113,15 +113,61 @@ L6  System Surface Crown      SSCL: SystemTrafficField · ServiceHost ·        
 L5  Mirror Dome               IMDF: SelfObservationField · ObserverModels ·      [IMDF-0..9 · ABSENT]
                                Aperture/Lens/Split/Parallax · Wavefront ·
                                QLOGIC · 4π-Closure · SelfPerceptionAtlas · Reanalysis
-L4  Runtime (Ω)               ssk-runtime · run_to_outcome · scheduler ·          [SSKΩ-1,6 · GOOD]
-                               focus · replay · netcore (real egress) · daemon
+L4a Runtime (Ω) — decision-   ssk-runtime · run_to_outcome · scheduler ·         [SSKΩ-1,6 · GOOD]
+     core path                 focus · replay
+                               entry point: ssk-cli `run`/`replay-verify`/
+                               `connect` over a sample_intent fixture — NOT sskd
+L4b Flow path — the live      ssk-daemon (sskd) → ssk-netadmin (FlowDescriptor   [SSKΩ-7 · the live
+     per-connection decision   → PolicyEngine → RouteOrchestrator) →              per-connection path]
+                               ssk-netcore (RouteExecutor, real egress)
+                               entry point: ssk-cli `activate` over IPC
 L3  Decision core (Ω)         ssk-core/locator/bcik/gates/stitch/tensor/         [SSKΩ-0..5 · GOOD/partial]
                                identity/privacy/config · 12-gate vector
+                               the 12-gate vector feeds L4a ONLY and is not
+                               reachable from L4b; ssk-config and ssk-tensor
+                               are shared by both (ssk-daemon depends on them
+                               directly, ssk-daemon/Cargo.toml:13,:16)
 L2  Meta-resonance substrate  5D_Cube: Solve/Gate/Coagula · Mandorla · BI ·      [5D · PARTIAL as determinism]
                                replay-commit · Meta-Resonanz(FTCSA⊗Hosts) PID
 L1  Foundation                ssk-types · ssk-crypto (Digest/content_id/gate/    [SSKΩ-0 · GOOD]
                                residue/replay primitives — the shared kernel §1)
 ```
+
+> **Corrected 2026-08-11 — L4 was wrong, and the error was load-bearing.** This stack originally
+> carried a single, undivided `L4` row:
+>
+> ```
+> L4  Runtime (Ω)               ssk-runtime · run_to_outcome · scheduler ·
+>                                focus · replay · netcore (real egress) · daemon
+> ```
+>
+> That is **superseded**, for two reasons, both verified against the tree rather than inferred:
+>
+> 1. **`ssk-netadmin` was missing from the stack entirely**, even though it owns the live
+>    per-connection decision. `sskd` constructs a `FlowDescriptor` itself
+>    (`crates/ssk-daemon/src/supervisor.rs:543-553`), evaluates it through
+>    `PolicyEngine::evaluate` → `RouteOrchestrator::plan` (`:554-558`), and only then dispatches
+>    through `DataPlane::connect_route` (`:582`) over the real `NetcoreDataPlane`/`RouteExecutor`
+>    built at `crates/ssk-daemon/src/main.rs:272-273`. Placing "netcore (real egress) · daemon"
+>    inside the `ssk-runtime` layer skipped the decision step and mis-attributed it to `ssk-runtime`.
+> 2. **`run_to_outcome` and the daemon are not on the same path at all.** `ssk-daemon` does not
+>    depend on `ssk-runtime` (`crates/ssk-daemon/Cargo.toml:11-47`), and `ssk-runtime` and
+>    `ssk-netadmin` have no dependency relationship in either direction
+>    (`crates/ssk-runtime/Cargo.toml:7-24`, `crates/ssk-netadmin/Cargo.toml:15-23`). The workspace's
+>    only production caller of `ssk_runtime::run_to_outcome` is `ssk-cli`'s `connect_command`
+>    (`crates/ssk-cli/src/main.rs:4030-4031`), which passes a hardcoded `sample_intent`.
+>
+> The structural reason, recorded so this is not re-litigated: `ssk_types::ConnectionIntent`
+> (`crates/ssk-types/src/lib.rs:622-628`) has no field that can hold a destination host or port, so
+> it cannot be the per-flow decision type; `FlowDescriptor`
+> (`crates/ssk-netadmin/src/flow.rs:31-42`) has `destination_host`/`destination_port` and is. The
+> full decision is `docs/adr/0008-flow-path-owns-the-per-connection-decision.md`.
+>
+> **What is *not* corrected here:** the SSCL/IMDF canonical layer ordering this section reconciles
+> is unchanged, and the L3/L4a grading is unchanged. Only the L4 contents and the L3→L4 reachability
+> claim are superseded. Note also that the §5 gap matrix row "Ω core L3–L4" and the §3 ladder's
+> `SSKΩ-7` cell still describe L4 as one layer; they are dated 2026-07 and should be read through
+> this correction.
 
 Two source docs are **inputs**, not layers: **FTCSA** supplies the constraint tensor `T` that becomes `FieldTensorSkin` (`F = T_surface + T_res + C_coupling + δF`, Addendum §3.1; the "tensorielle Strukturspannung/Constraint" of 5D_Cube §4.1); **Heavenly Hosts** supplies the exploration impulses `R` that become `HostCellPlane` (`HostCell=(role,epoch,capability,localView,coherence,ttl,trace)`, Addendum §3.2; the "nichtlokale Resonanz-Impulse/Exploration" of 5D_Cube §4.1). Their coupling **is** the 5D_Cube Meta-Resonance layer (`∆T=α_TΠ_sym+(R−R^eq)`, `∆R=−α_R(R−G(T))`).
 

@@ -7,27 +7,19 @@
 
 use ssk_types::{BoundaryRef, LocatorFacet, ResidueRef, StitchCandidate, TraceId, TrustClass};
 
+/// The nine axes of the hypercube (ch. 8.1, verbatim). Defined in `ssk-types`
+/// — `ssk-config`'s `projective_connection_hypercube.axes` list reuses it,
+/// and homing it there keeps that reuse from dragging this crate into the
+/// daemon's dependency closure (see
+/// `docs/adr/0008-flow-path-owns-the-per-connection-decision.md`). Re-exported
+/// here because `HypercubeGate` and the projectors below are its logic
+/// consumers, so `ssk_gates::pch::Axis` stays the natural path.
+pub use ssk_types::Axis;
+
 /// Risk-score ceiling for the `Risk` axis projection (ch. 8.1). Shared by
 /// `RiskProjector` and the facet-level `locator_axes_consistent` pre-check
 /// so the two never drift apart.
 pub const LOCATOR_RISK_CEILING: u8 = 70;
-
-/// The nine axes of the hypercube (ch. 8.1, verbatim). Serde derives added
-/// in Phase 8 so `ssk-config`'s `projective_connection_hypercube.axes` list
-/// (Section S) can reuse this type directly instead of duplicating it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Axis {
-    Identity,
-    Locator,
-    Protocol,
-    Timing,
-    Trust,
-    Risk,
-    Capability,
-    Replay,
-    Boundary,
-}
 
 /// A confidence weight for a passing projection (ch. 8.1). Phase 3
 /// placeholder scale (0-100).
@@ -283,7 +275,7 @@ mod tests {
                 id: FacetId::of(&"f1", HashAlg::Blake3).expect("hash"),
                 core: CoreId::new("c1"),
                 phase: PhaseVector::zero(),
-                orientation: Orientation::Forward,
+                orientation: FacetOrientation::Forward,
                 sector: Sector::Identity,
                 key_ctx: KeyContextRef::new("kc"),
                 session: SessionId::new("sess"),

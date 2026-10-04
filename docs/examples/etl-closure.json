@@ -1,0 +1,42 @@
+{
+  "schema_version": 1,
+  "source": "synthetic_fixture",
+  "profile": "process_network_v1",
+  "file": {
+    "bytes": 3,
+    "sha256": "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+  },
+  "intent": {
+    "session_guid": "a72f10ca-79ef-4ff6-95d9-8b3e7b190422",
+    "clock_type": 1,
+    "log_file_mode": 33554433,
+    "enable_flags": 268500993
+  },
+  "owns_session_from_start": true,
+  "configuration_unchanged": true,
+  "start_status": 0,
+  "query_after_start": {
+    "api_status": 0,
+    "properties": {
+      "session_guid": "a72f10ca-79ef-4ff6-95d9-8b3e7b190422",
+      "log_file_mode": 33554433,
+      "enable_flags": 268500993,
+      "events_lost": 0,
+      "log_buffers_lost": 0,
+      "realtime_buffers_lost": 0,
+      "buffers_written": 0
+    }
+  },
+  "stop": {
+    "api_status": 0,
+    "properties": {
+      "session_guid": "a72f10ca-79ef-4ff6-95d9-8b3e7b190422",
+      "log_file_mode": 33554433,
+      "enable_flags": 268500993,
+      "events_lost": 0,
+      "log_buffers_lost": 0,
+      "realtime_buffers_lost": 0,
+      "buffers_written": 1
+    }
+  }
+}

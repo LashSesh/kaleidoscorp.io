@@ -11,6 +11,7 @@ ssk-scheduler = { path = "../ssk-scheduler", version = "0.1.0" }
 ssk-identity = { path = "../ssk-identity", version = "0.1.0" }
 ssk-locator = { path = "../ssk-locator", version = "0.1.0" }
 ssk-bcik = { path = "../ssk-bcik", version = "0.1.0" }
+ssk-imdf = { path = "../ssk-imdf", version = "0.1.0" }
 ssk-crypto = { path = "../ssk-crypto", version = "0.1.0" }
 ssk-gates = { path = "../ssk-gates", version = "0.1.0" }
 ssk-stitch = { path = "../ssk-stitch", version = "0.1.0" }

@@ -4,4 +4,5 @@ error[E0599]: no method named `materialize` found for struct `Connection<Intent>
 8 |     let _ = c.materialize(&mut ());
   |               ^^^^^^^^^^^ method not found in `Connection<Intent>`
   |
-  = note: the method was found for `Connection<GatePassed>`
+  = note: the method was found for
+          - `Connection<GatePassed>`

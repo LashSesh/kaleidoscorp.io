@@ -25,6 +25,21 @@
 //! Applying a plan is a deliberate, caller-side step ([`Deployment::apply_plan`]),
 //! and an uninstall yields a content-addressed [`UninstallReceipt`] so the removal
 //! is auditable and reconstructible.
+//!
+//! ## Status — deferred, gated on packaging; zero consumers is the design
+//!
+//! Nothing depends on this crate, and nothing is meant to yet. It is the SSCL
+//! Crown DeliveryEnvelope (`SYSTEM_ARCHITECTURE_CORRESPONDENCE.md:42`), part of
+//! **Block S/D** (ServiceHost + DeliveryEnvelope, SSCL-5/8) in the integration
+//! sequence (`:272`). It is gated on something this repository does not do yet:
+//! SSCL-8 is graded **✗ "ships source not binaries"** (`:206`), and the named
+//! remaining work is "a real system service / installer" (`:57`). Until the
+//! release pipeline ships binaries, an envelope planner has nothing real to
+//! plan over. **Honest caveat:** unlike its Band B siblings this crate has no
+//! numbered phase and no named acceptance test in any document, and the Block
+//! S/D rows at `:234`/`:254`/`:272` name a crate `ssk-package` rather than this
+//! one — they predate it. Retire it only on a recorded decision, not as an
+//! unreferenced-crate sweep.
 
 use serde::{Deserialize, Serialize};
 use ssk_types::{digest_of, Digest, GateOutcomeKind, HashAlg};

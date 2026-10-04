@@ -1,0 +1,19 @@
+{
+  "schema_version": 1,
+  "panel_state": "released",
+  "kill_switch": {
+    "audit_head_hex": "0000000000000000000000000000000000000000000000000000000000000000",
+    "audit_len": 1,
+    "is_alarm": false,
+    "journal_claims_engaged": false,
+    "logical_state": "released",
+    "os_rule": "absent",
+    "protection_confirmed": false,
+    "receipt": null,
+    "recovery": "consistent",
+    "severity": "ok",
+    "state_version": 1
+  },
+  "audit": null,
+  "connections": null
+}

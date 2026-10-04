@@ -5,30 +5,9 @@
 //! The `transition` match over [`PanelState`] is **exhaustive with no wildcard**,
 //! so adding a state fails to compile until every case is handled.
 
-use serde::{Deserialize, Serialize};
 use ssk_boundary::KillSwitchState;
 use ssk_netd_helper::{KillSwitchStatus, Recovery};
-
-/// The panel's presentation state.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum PanelState {
-    /// No connection to the broker yet.
-    Disconnected,
-    /// Connecting / first observation in flight.
-    Connecting,
-    /// Coherent, kill-switch armed (not engaged).
-    Ready,
-    /// Coherent, kill-switch engaged with a confirmed OS rule.
-    Engaged,
-    /// Coherent, kill-switch released.
-    Released,
-    /// Journal/OS disagreement — a fail-closed red alarm (sticky).
-    Inconsistent,
-    /// The source is unreachable, the ledger is unverified, or a verdict is
-    /// unknown — never rendered as a safe/green state.
-    Degraded,
-}
+pub use ssk_ui_contract::PanelState;
 
 /// A control event driving the panel machine. `Observed` carries the freshly
 /// read authoritative status (boxed to keep the enum small).

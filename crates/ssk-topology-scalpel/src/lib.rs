@@ -14,6 +14,19 @@
 //! * **Reversible.** Every well-formed plan carries a rollback that exactly
 //!   restores the prior topology; a plan whose rollback would not restore, or
 //!   which is malformed, is gated `Reject` and never marked applicable.
+//!
+//! ## Status — deferred with a plan; zero consumers is the design
+//!
+//! Nothing depends on this crate, and nothing is meant to yet. It is the planner
+//! half of FCHL-MPK-8, scheduled as phase **P3** with the acceptance test
+//! "Scalpel Gate Test, negative: no rewrite-emission without RewriteGate"
+//! (`FCHL_MPK_INTEGRATION_STRATEGY.md:215`; object row `:105`, invariant I9 at
+//! `:131`). Its only intended consumer is the *application* path — Band C
+//! actuation, which must not be built before a `BoundaryActuator` exists
+//! (`FCHL_MPK_INTEGRATION_STRATEGY.md:43`;
+//! `SYSTEM_ARCHITECTURE_CORRESPONDENCE.md:273`, Block X: "candidate-only until B
+//! lands"). Having no caller and no `apply()` **is** the enforced safety
+//! property. Do not retire this crate as unreferenced.
 
 use std::collections::BTreeSet;
 

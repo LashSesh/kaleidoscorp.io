@@ -4,10 +4,16 @@ use serde::{Deserialize, Serialize};
 use ssk_types::GateId;
 use std::collections::BTreeMap;
 
-pub const CURRENT_CONFIG_VERSION: u32 = 3;
+pub mod routing;
+
+pub const CURRENT_CONFIG_VERSION: u32 = 4;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
+    #[error("invalid configuration: {0}")]
+    Structure(String),
+    #[error("invalid routing configuration: {0}")]
+    Routing(String),
     #[error("yaml parse error: {0}")]
     Yaml(#[from] serde_yaml::Error),
     #[error("toml parse error: {0}")]
@@ -197,17 +203,20 @@ impl LocatorPlaneConfig {
 }
 
 /// `projective_connection_hypercube:` section (ch. 21). Reuses
-/// `ssk_gates::pch::Axis` directly rather than duplicating the 9-variant
-/// enum.
+/// `ssk_types::Axis` directly rather than duplicating the 9-variant enum.
+/// The axis logic lives in `ssk_gates::pch`, which re-exports the same type;
+/// depending on `ssk-types` for it instead keeps the decision core out of the
+/// daemon's dependency closure (see
+/// `docs/adr/0008-flow-path-owns-the-per-connection-decision.md`).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct HypercubeConfig {
-    pub axes: Vec<ssk_gates::pch::Axis>,
+    pub axes: Vec<ssk_types::Axis>,
     pub require_all_axis_projection: bool,
 }
 
 impl Default for HypercubeConfig {
     fn default() -> Self {
-        use ssk_gates::pch::Axis::{
+        use ssk_types::Axis::{
             Boundary, Capability, Identity, Locator, Protocol, Replay, Risk, Timing, Trust,
         };
         Self {
@@ -613,7 +622,9 @@ impl Default for InteropConfig {
 /// sections (`gates:` maps onto the now-enriched `policy.gate_profile`
 /// rather than a duplicate top-level field, per Section K.3's design).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct AppConfig {
+    pub routing: routing::RoutingConfig,
     pub version: u32,
     pub policy: Policy,
     pub runtime: RuntimeConfig,
@@ -635,6 +646,7 @@ impl Default for AppConfig {
     fn default() -> Self {
         Self {
             version: CURRENT_CONFIG_VERSION,
+            routing: routing::RoutingConfig::default(),
             policy: Policy {
                 name: "default-fail-closed".into(),
                 fail_closed: true,
@@ -661,6 +673,7 @@ impl Default for AppConfig {
 /// so `version: 1`/`version: 2` config files migrate cleanly instead of
 /// erroring on the newer required fields.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct GateProfileV1 {
     pub order: Vec<GateId>,
     pub fail_closed: bool,
@@ -679,6 +692,7 @@ impl From<GateProfileV1> for GateProfile {
 /// The implicit "v1" shape: no `version` field at all, just the policy
 /// fields flattened at the top level.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct LegacyPolicyV1 {
     pub name: String,
     pub fail_closed: bool,
@@ -688,6 +702,7 @@ pub struct LegacyPolicyV1 {
 /// The `version: 2` shape (pre-Phase-8): `policy`/`runtime`/`interop`
 /// only, none of Section S's eleven new PDF sections.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct AppConfigV2 {
     pub version: u32,
     pub policy: PolicyV1,
@@ -696,6 +711,7 @@ pub struct AppConfigV2 {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct PolicyV1 {
     pub name: String,
     pub fail_closed: bool,
@@ -730,6 +746,7 @@ impl AppConfig {
         }
 
         self.policy.validate()?;
+        self.routing.validate()?;
 
         if !self.runtime.strict_mode {
             return Err(ConfigError::RuntimeStrictModeRequired);
@@ -792,69 +809,77 @@ impl AppConfig {
     }
 
     pub fn parse_with_migration_yaml(content: &str) -> Result<LoadedConfig, ConfigError> {
-        if let Ok(config) = Self::from_yaml(content) {
-            return Ok(LoadedConfig {
-                config,
-                migrated_from: None,
-            });
-        }
-
-        if let Ok(v2) = serde_yaml::from_str::<AppConfigV2>(content) {
-            let config = Self::upgrade_from_v2(v2);
-            config.validate()?;
-            return Ok(LoadedConfig {
-                config,
-                migrated_from: Some(2),
-            });
-        }
-
-        let legacy: LegacyPolicyV1 = serde_yaml::from_str(content)?;
-        let config = Self::upgrade_from_v1(legacy);
-        config.validate()?;
-        Ok(LoadedConfig {
-            config,
-            migrated_from: Some(1),
-        })
+        let value: serde_yaml::Value = serde_yaml::from_str(content)?;
+        Self::migrate_value(serde_json::to_value(value)?)
     }
 
     pub fn parse_with_migration_toml(content: &str) -> Result<LoadedConfig, ConfigError> {
-        if let Ok(config) = Self::from_toml(content) {
-            return Ok(LoadedConfig {
-                config,
-                migrated_from: None,
-            });
-        }
+        Self::migrate_value(toml::from_str(content)?)
+    }
 
-        if let Ok(v2) = toml::from_str::<AppConfigV2>(content) {
-            let config = Self::upgrade_from_v2(v2);
-            config.validate()?;
-            return Ok(LoadedConfig {
-                config,
-                migrated_from: Some(2),
-            });
-        }
-
-        let legacy: LegacyPolicyV1 = toml::from_str(content)?;
-        let config = Self::upgrade_from_v1(legacy);
+    // Dispatch ONLY by declared version. Invalid modern documents must never
+    // fall through to an older schema and silently discard security settings.
+    fn migrate_value(mut value: serde_json::Value) -> Result<LoadedConfig, ConfigError> {
+        let object = value
+            .as_object_mut()
+            .ok_or_else(|| ConfigError::Structure("expected a config object".into()))?;
+        let version = match object.get("version") {
+            None => 1,
+            Some(value) => value
+                .as_u64()
+                .and_then(|v| u32::try_from(v).ok())
+                .ok_or_else(|| {
+                    ConfigError::Structure("version must be an unsigned integer".into())
+                })?,
+        };
+        let config = match version {
+            1 => {
+                object.remove("version");
+                Self::upgrade_from_v1(serde_json::from_value(value)?)
+            }
+            2 => Self::upgrade_from_v2(serde_json::from_value(value)?),
+            3 => {
+                if object.contains_key("routing") {
+                    return Err(ConfigError::Structure(
+                        "routing requires config version 4".into(),
+                    ));
+                }
+                object.insert("version".into(), CURRENT_CONFIG_VERSION.into());
+                object.insert(
+                    "routing".into(),
+                    serde_json::to_value(routing::RoutingConfig::default())?,
+                );
+                serde_json::from_value(value)?
+            }
+            CURRENT_CONFIG_VERSION => serde_json::from_value(value)?,
+            found => {
+                return Err(ConfigError::UnsupportedVersion {
+                    found,
+                    expected: CURRENT_CONFIG_VERSION,
+                })
+            }
+        };
         config.validate()?;
         Ok(LoadedConfig {
             config,
-            migrated_from: Some(1),
+            migrated_from: (version != CURRENT_CONFIG_VERSION).then_some(version),
         })
     }
 
     pub fn schema_json() -> serde_json::Value {
         serde_json::json!({
             "$schema": "https://json-schema.org/draft/2020-12/schema",
-            "$id": "https://kaleidoscorp.io/schema/ssk-config-v3.json",
+            "$id": "https://kaleidoscorp.io/schema/ssk-config-v4.json",
             "title": "ScorpioSync Kaleidoscorp Config",
             "type": "object",
             "required": [
                 "version", "policy", "runtime", "interop", "system", "core",
                 "locator_plane", "projective_connection_hypercube", "hypertorus",
-                "bcik", "capabilities", "privacy", "replay", "ledger", "dissolution"
+                "bcik", "capabilities", "privacy", "replay", "ledger", "dissolution", "routing"
             ],
+            "additionalProperties": false,
             "properties": {
+                "routing": routing::schema_json(),
                 "version": {"type": "integer", "const": CURRENT_CONFIG_VERSION},
                 "policy": {
                     "type": "object",
@@ -1036,7 +1061,7 @@ mod tests {
     fn schema_snapshot_stable() {
         let schema = AppConfig::schema_json();
         let snapshot = serde_json::to_string_pretty(&schema).expect("schema serializes");
-        assert!(snapshot.contains("ssk-config-v3.json"));
+        assert!(snapshot.contains("ssk-config-v4.json"));
         assert!(snapshot.contains("strict_mode"));
         assert!(snapshot.contains("projective_connection_hypercube"));
         assert!(snapshot.contains("dissolution"));
@@ -1150,6 +1175,49 @@ gate_profile:
             config.validate(),
             Err(ConfigError::LedgerMustNotStorePayload)
         ));
+    }
+
+    /// Pins the on-the-wire form of `projective_connection_hypercube.axes`:
+    /// nine `snake_case` strings in the hypercube's own axis order. `Axis`
+    /// is serde-serialized as part of persisted config, so this test is what
+    /// makes a variant rename or reorder a loud failure rather than a silent
+    /// config-compatibility break. It is deliberately written against the
+    /// literal YAML text, not against `Axis` values, so it stays meaningful
+    /// no matter which crate owns the enum.
+    #[test]
+    fn hypercube_axes_round_trip_as_snake_case_names() {
+        const DOC: &str = "\
+axes:
+- identity
+- locator
+- protocol
+- timing
+- trust
+- risk
+- capability
+- replay
+- boundary
+require_all_axis_projection: true
+";
+        let parsed: HypercubeConfig = serde_yaml::from_str(DOC).expect("axes deserialize");
+        assert_eq!(parsed, HypercubeConfig::default());
+        assert!(parsed.validate().is_ok());
+        assert_eq!(
+            serde_yaml::to_string(&HypercubeConfig::default()).expect("axes serialize"),
+            DOC
+        );
+
+        // And the same section survives a whole-document round trip.
+        let doc = serde_yaml::to_string(&AppConfig::default()).expect("yaml");
+        assert!(
+            doc.contains("- capability"),
+            "axes render snake_case: {doc}"
+        );
+        let back: AppConfig = serde_yaml::from_str(&doc).expect("whole config round-trips");
+        assert_eq!(
+            back.projective_connection_hypercube,
+            AppConfig::default().projective_connection_hypercube
+        );
     }
 
     #[test]

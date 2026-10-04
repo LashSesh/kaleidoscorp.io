@@ -4,4 +4,5 @@ error[E0599]: no method named `gate` found for struct `Connection<Canonical>` in
 9 |     let _ = c.gate(&());
   |               ^^^^ method not found in `Connection<Canonical>`
   |
-  = note: the method was found for `Connection<Placed>`
+  = note: the method was found for
+          - `Connection<Placed>`

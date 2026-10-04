@@ -15,6 +15,23 @@
 //! Time is logical (a tick counter) so the plane is pure and deterministic — no
 //! clock. A cell dissolves either explicitly or when its TTL elapses; a
 //! dissolved cell can do nothing.
+//!
+//! ## Status — deferred with a plan; conformance-graded
+//!
+//! Band B, scheduled as phase **P4** and explicitly gated on a source
+//! (`FCHL_MPK_INTEGRATION_STRATEGY.md:216`) — the capture/ingress source Band B
+//! depends on and that does not exist yet (`:42`, `:114`) — with acceptance
+//! tests "Host Authority, Dissolution" (`:216`; object row `:107`,
+//! "DEFER (Band B)"). It is Block F of the integration sequence
+//! (`SYSTEM_ARCHITECTURE_CORRESPONDENCE.md:270`, described at `:22`). Its one
+//! in-workspace consumer is its Band B sibling `ssk-funnel-dag`; no shipped
+//! binary reaches it, by design. Graded **Realized** against IMRT axiom A1
+//! (`docs/IMRT_IMPLEMENTATION_SPEC.md:248`), and gap **G7** (HostAuthority
+//! residue, axiom A4) is Realized, discharged by the test
+//! `under_capability_denial_conserves_a_host_authority_residue` (`:334`). That
+//! resolution log is authoritative over the older per-tier row at `:250`, which
+//! still reads "Absent" and is kept there as the original problem statement
+//! (`:321-324`). Do not retire this crate as unreferenced.
 
 use std::collections::BTreeSet;
 

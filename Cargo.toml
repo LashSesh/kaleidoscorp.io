@@ -19,9 +19,10 @@ members = [
   "crates/ssk-config",
   "crates/ssk-interop",
   "crates/ssk-runtime",
-  "crates/ssk-sim",
   "crates/ssk-netadmin",
+  "crates/ssk-netanalysis",
   "crates/ssk-netcore",
+  "crates/ssk-vpnctl",
   "crates/ssk-signature",
   "crates/ssk-imdf",
   "crates/ssk-capture",
@@ -39,12 +40,15 @@ members = [
   "crates/ssk-delivery",
   "crates/ssk-system",
   "crates/ssk-audit-store",
+  "crates/ssk-diag",
   "crates/ssk-winhost",
   "crates/ssk-cli",
   "crates/ssk-ipc",
   "crates/ssk-daemon",
   "crates/ssk-netd-helper",
   "crates/ssk-tauri-bridge",
+  "crates/ssk-ui-contract",
+  "crates/ssk-desktop-client",
 ]
 
 [workspace.package]
@@ -53,6 +57,24 @@ version = "0.1.0"
 license = "Apache-2.0"
 authors = ["Kaleidoscorp Contributors"]
 repository = "https://github.com/LashSesh/kaleidoscorp.io"
+# MSRV. Derived from the floor of the resolved dependency graph, not copied
+# from the pinned toolchain -- an MSRV equal to latest-stable is not an MSRV.
+# The binding constraints at Cargo.lock as committed are clap 4.6, proptest
+# 1.11, toml 1.1, getrandom 0.4, hashbrown 0.17, constant_time_eq 0.4, zeroize
+# 1.9, trybuild 1.0.118 and indexmap 2.14, all of which declare 1.85. (wasip2
+# declares 1.87 but is reachable only under
+# cfg(all(target_arch = "wasm32", target_os = "wasi", target_env = "p2")),
+# which this workspace does not target.) Edition 2021 itself needs only 1.56.
+#
+# NOT YET ENFORCED, and deliberately recorded as such: a `[workspace.package]`
+# key only supplies a value for inheritance. No member manifest currently
+# declares `rust-version.workspace = true`, so nothing checks this today. Two
+# follow-ups are required before this line means anything:
+#   1. add `rust-version.workspace = true` to the 45 member manifests, and
+#   2. add a CI leg that actually builds on 1.85.
+# Until (2) runs green, 1.85 is a claim about the dependency graph only -- the
+# workspace's own sources have never been compiled by a 1.85 toolchain.
+rust-version = "1.85"
 
 [workspace.dependencies]
 anyhow = "1"
@@ -73,6 +95,53 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
 serde_yaml = "0.9"
 toml = "0.8"
+
+# Explicit release profile. Every value below is a deliberate choice for a
+# security product that will be shipped, signed and crash-reported; none of it
+# is left to the implicit cargo default.
+[profile.release]
+# In the traffic path once P4 lands. Optimise for speed, not size -- the
+# binaries are a few MB and distribution size is not a constraint.
+opt-level = 3
+# Cross-crate inlining across a 45-crate workspace, where the hot paths
+# (framing, hashing, the executor) are split across crate boundaries. "thin"
+# rather than "fat": fat LTO on this many crates costs a large amount of
+# single-threaded link time and memory for a marginal gain over thin +
+# codegen-units = 1, and it is the configuration most likely to make a release
+# build fail only in CI.
+lto = "thin"
+# One codegen unit. Beyond the optimisation gain, codegen unit partitioning is
+# a source of build-to-build nondeterminism; P6 publishes SHA-256 checksums and
+# an SBOM and signs the binaries with Authenticode, so byte-identical rebuilds
+# from the same lockfile and toolchain are a requirement, not a nicety.
+codegen-units = 1
+# Unwind, NOT abort -- this is the choice that keeps a crash record possible.
+# A `panic::set_hook` handler (planned in P2) runs under either setting, so the
+# hook is not the deciding factor; what unwinding buys is everything after it:
+#   - destructors run, so the rolling-file tracing sink and the audit-store
+#     writer flush. Under `abort` the process dies with the crash record still
+#     sitting in a userspace buffer -- the report is written and then lost.
+#   - a panic inside one connection handler is observed by the tokio runtime as
+#     JoinError::panic instead of killing sskd/ssk-svc outright, so the daemon
+#     can record the fault and release the op-lock rather than stranding a
+#     machine with an engaged kill-switch and no live broker.
+# `abort` would also cost slightly smaller binaries and no landing pads; that
+# is not worth a security product that cannot report why it died.
+panic = "unwind"
+# Keep symbols. `std::backtrace::Backtrace` in the P2 panic hook is only useful
+# with line tables, and on windows-msvc that data goes into a side-by-side .pdb
+# rather than the .exe, so the shipped binary pays nothing for it. `strip` is
+# left at "none" so ELF builds keep the symbol table for the same reason. The
+# .pdb must be archived alongside each release for later symbolication.
+debug = "line-tables-only"
+strip = "none"
+# Integer overflow panics in release as it already does in dev. This is the
+# fail-closed choice and it also closes a verification gap: every test in this
+# workspace runs under the dev profile, where overflow-checks is on by default,
+# so without this line the shipped binaries execute wrapping arithmetic that no
+# test has ever exercised -- in a codebase whose length arithmetic decides how
+# much a pre-auth peer may make it allocate (ssk-ipc framing).
+overflow-checks = true
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

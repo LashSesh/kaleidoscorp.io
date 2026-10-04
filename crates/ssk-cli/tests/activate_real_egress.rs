@@ -8,10 +8,32 @@
 //!
 //! Same binary-colocation requirement as `ipc_status_snapshot.rs`: run via
 //! `cargo test --workspace`, not `cargo test -p ssk-cli` in isolation.
+//!
+//! # Why this file is no longer `#![cfg(unix)]`
+//!
+//! Roadmap P0 gated it and recorded the debt: `spawn_daemon` polled for
+//! `<state-dir>/sskd.sock`, which `sskd` never created on Windows, and the
+//! `ssk` subprocess it drives had no Windows control plane at all
+//! (`#[cfg(not(unix))] call_daemon` was a `DAEMON_UNIX_ONLY` stub). P2 closed
+//! both halves — a real named-pipe client in `ssk-cli`, and a composition root
+//! in `sskd` that injects a pipe factory and a peer authenticator — so the gate
+//! is removed rather than relaxed. No assertion below changed.
+//!
+//! Readiness is now a real connection to the daemon's endpoint instead of a
+//! `Path::exists`, because a named pipe has no file to look for.
+
+include!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../tests/support/routing_config.rs"
+));
 
 use std::net::TcpListener;
-use std::process::{Child, Command};
-use std::time::Duration;
+use std::process::{Child, Command, Stdio};
+use std::time::{Duration, Instant};
+
+use ssk_ipc::Endpoint;
+
+const READY_TIMEOUT: Duration = Duration::from_secs(30);
 
 struct DaemonProcess {
     child: Child,
@@ -25,22 +47,72 @@ impl Drop for DaemonProcess {
     }
 }
 
+/// Where `sskd` listens for this state directory — the same derivation `ssk`
+/// itself performs.
+#[cfg(unix)]
+fn endpoint_for(state_dir: &std::path::Path) -> Endpoint {
+    Endpoint::UnixSocket(state_dir.join("sskd.sock"))
+}
+
+#[cfg(windows)]
+fn endpoint_for(state_dir: &std::path::Path) -> Endpoint {
+    let sid = ssk_winhost::current_user_sid().expect("read this test process's own SID");
+    Endpoint::NamedPipe(ssk_ipc::paths::named_pipe_name(&sid, state_dir))
+}
+
 fn spawn_daemon() -> DaemonProcess {
     let state_dir = tempfile::tempdir().expect("tempdir");
     let sskd_path = sskd_binary_path();
+    let stderr = std::fs::File::create(state_dir.path().join("sskd.err")).expect("stderr capture");
     let child = Command::new(sskd_path)
         .env("SSK_STATE_DIR", state_dir.path())
+        .env("SSK_CONFIG_PATH", write_loopback_config(state_dir.path()))
+        .stderr(Stdio::from(stderr))
         .spawn()
         .expect("spawn sskd");
-    let proc = DaemonProcess { child, state_dir };
+    let mut proc = DaemonProcess { child, state_dir };
+    wait_until_serving(&mut proc);
+    proc
+}
 
-    for _ in 0..100 {
-        if proc.state_dir.path().join("sskd.sock").exists() {
-            return proc;
+/// Block until the daemon actually accepts a connection on its endpoint.
+/// Deliberately not "until `ssk status` succeeds": the binary under test must
+/// not be its own readiness gate.
+fn wait_until_serving(proc: &mut DaemonProcess) {
+    let endpoint = endpoint_for(proc.state_dir.path());
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("readiness runtime");
+    let deadline = Instant::now() + READY_TIMEOUT;
+    loop {
+        if runtime
+            .block_on(ssk_ipc::DaemonClient::connect(&endpoint))
+            .is_ok()
+        {
+            return;
         }
+        if let Some(status) = proc.child.try_wait().expect("try_wait on sskd") {
+            panic!(
+                "sskd exited with {status} instead of serving {endpoint}:\n{}",
+                daemon_stderr(proc)
+            );
+        }
+        assert!(
+            Instant::now() < deadline,
+            "sskd never accepted a connection on {endpoint} within {READY_TIMEOUT:?}:\n{}",
+            daemon_stderr(proc)
+        );
         std::thread::sleep(Duration::from_millis(20));
     }
-    panic!("sskd did not create its socket in time");
+}
+
+fn daemon_stderr(proc: &DaemonProcess) -> String {
+    let path = proc.state_dir.path().join("sskd.err");
+    match std::fs::read_to_string(&path) {
+        Ok(text) if !text.trim().is_empty() => text,
+        _ => format!("(no stderr captured at {})", path.display()),
+    }
 }
 
 fn sskd_binary_path() -> std::path::PathBuf {

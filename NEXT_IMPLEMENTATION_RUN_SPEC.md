@@ -1,5 +1,14 @@
 # NEXT_IMPLEMENTATION_RUN_SPEC.md
 
+> ## SUPERSEDED — 2026-08-02
+>
+> **This spec is no longer the plan of record.** Its remaining work packages (WP5's TTL-sweep driver,
+> WP6 config/profile model, WP7 test-tier split, WP8 packaging) are folded into
+> [`docs/WINDOWS_PRODUCT_ROADMAP.md`](docs/WINDOWS_PRODUCT_ROADMAP.md) — WP6 into P4, WP7 into P0/P4,
+> WP8 into P6, WP5 into P5 — which additionally covers a Windows layer this spec never saw: three
+> security findings (two Critical), a dead control plane on Windows, and four failing repo gates.
+> The document below is retained as a dated record of what the previous run was scoped to do.
+
 > **IMPLEMENTATION UPDATE (this run executed against this spec, same day).** **WP1 (no_std fix), WP2 (`ssk-netcore` real adapter model), WP3 (daemon/system integration replacing `MockDataPlane`), WP4 (CLI user-reachable flow — `ssk activate --dest`), and the audit-non-vacuous half of WP5 are DONE** — see `crates/ssk-netcore/` (new crate: real Direct/SOCKS5/HTTP-CONNECT/TLS/DNS execution + health probing), `crates/ssk-daemon/src/supervisor.rs` + `main.rs` (mock removed from production, real destination required, real audit recording), `crates/ssk-cli/src/main.rs` (`Activate { profile, dest }`), and the real-binary system tests `ssk-daemon/tests/round_trip.rs` + `ssk-cli/tests/activate_real_egress.rs`. The bonus `cargo deny`/`bans` wildcard-dependency fix (all 23 crates) was also applied. **Still open, exactly as this spec originally scoped**: WP5's TTL-sweep-driver half (`DissolutionManager::sweep` still has no production caller), WP6 (config/profile/policy — the daemon still uses one hardcoded reference policy, not a config-driven multi-profile model), WP7 (a dedicated unit/integration/system test-tier split beyond what the new real-binary tests already establish), and WP8's packaging half (release still ships source, not binaries; no service units). The Definition of Done items below should be re-checked against this update, not assumed satisfied — items 1, 2 (partially: WP1 fully; SSKΩ-7 now real for adapters, not merely corrected in prose), 3, and 4 are now substantively true; items 6-9 need re-verification per WP6/WP7/WP8's remaining scope.
 
 > Implementable master spec for the next implementation run of the SSK-Ω (`kaleidoscorp.io`) workspace.

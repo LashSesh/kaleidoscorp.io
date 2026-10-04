@@ -1,0 +1,60 @@
+# Line-ending policy for this repository.
+#
+# Why this file exists: `rustfmt.toml` sets `newline_style = "Unix"`, so rustfmt
+# rejects any source file that reaches it with CRLF ("Incorrect newline style").
+# With `core.autocrlf=true` — the Git for Windows default — and no attributes
+# file, every checkout on Windows produced CRLF working-tree files and
+# `cargo fmt --all -- --check` failed on all 152 Rust files without a single
+# real formatting diff. Pinning the working tree to LF on every platform makes
+# the `fmt --check` gate mean "the code is formatted", not "the clone was made
+# on Linux".
+#
+# Baseline: normalize to LF in the index, check out LF everywhere.
+* text=auto eol=lf
+
+# --- Text formats, stated explicitly so the policy does not depend on Git's
+#     content heuristic ---
+*.rs      text eol=lf
+*.toml    text eol=lf
+*.md      text eol=lf
+*.yml     text eol=lf
+*.yaml    text eol=lf
+*.json    text eol=lf
+*.py      text eol=lf
+*.sh      text eol=lf
+*.js      text eol=lf
+*.css     text eol=lf
+*.html    text eol=lf
+
+# trybuild UI snapshots are compared byte-wise against compiler stderr; they
+# must be LF on Windows runners too (crates/ssk-core/tests/ui/*.stderr).
+*.stderr  text eol=lf
+
+# Cargo.lock is committed (see docs/WINDOWS_PRODUCT_ROADMAP.md P0) and is a
+# text file; keep it LF so it does not churn across platforms.
+Cargo.lock text eol=lf
+
+# --- Windows shell scripts ---
+# No .bat/.cmd/.ps1 files are tracked today (verified with `git ls-files`).
+# These rules are pre-declared so that when Windows packaging lands (P6) the
+# batch interpreter gets the CRLF it expects instead of inheriting the LF
+# baseline above.
+*.bat     text eol=crlf
+*.cmd     text eol=crlf
+*.ps1     text eol=crlf
+*.psm1    text eol=crlf
+
+# --- Binaries: never touched, never diffed as text ---
+# Tracked today: two *.pdf specifications and chameleon_signature_kernel_v0_5.zip.
+*.pdf     binary
+*.zip     binary
+*.png     binary
+*.jpg     binary
+*.jpeg    binary
+*.gif     binary
+*.ico     binary
+*.woff    binary
+*.woff2   binary
+*.ttf     binary
+*.exe     binary
+*.dll     binary

@@ -1,0 +1,53 @@
+{
+  "schema_version": 1,
+  "baseline": {
+    "window_ms": 1000,
+    "valid_for_ms": 1000,
+    "max_events": 32,
+    "min_events": 1,
+    "max_attempts_per_second": 3,
+    "min_attempts_for_failure_rate": 4,
+    "max_failed_basis_points": 5000,
+    "max_sent_bytes_per_second": 1024,
+    "min_sent_bytes_for_imbalance": 1024,
+    "max_sent_to_received_ratio": 16
+  },
+  "scope": {
+    "source_epoch": "fixture-epoch-1",
+    "subject": "application:process-incarnation-1",
+    "endpoint": "192.0.2.1:443",
+    "transport": "tcp"
+  },
+  "provenance": "synthetic_replay",
+  "start_ms": 0,
+  "first_sequence": 1,
+  "assess_at_ms": 1000,
+  "lost_events": 0,
+  "observations": [
+    {
+      "scope": { "source_epoch": "fixture-epoch-1", "subject": "application:process-incarnation-1", "endpoint": "192.0.2.1:443", "transport": "tcp" },
+      "sequence": 1, "at_ms": 100,
+      "signal": { "kind": "connection_attempt", "failed": true }
+    },
+    {
+      "scope": { "source_epoch": "fixture-epoch-1", "subject": "application:process-incarnation-1", "endpoint": "192.0.2.1:443", "transport": "tcp" },
+      "sequence": 2, "at_ms": 200,
+      "signal": { "kind": "connection_attempt", "failed": true }
+    },
+    {
+      "scope": { "source_epoch": "fixture-epoch-1", "subject": "application:process-incarnation-1", "endpoint": "192.0.2.1:443", "transport": "tcp" },
+      "sequence": 3, "at_ms": 300,
+      "signal": { "kind": "connection_attempt", "failed": true }
+    },
+    {
+      "scope": { "source_epoch": "fixture-epoch-1", "subject": "application:process-incarnation-1", "endpoint": "192.0.2.1:443", "transport": "tcp" },
+      "sequence": 4, "at_ms": 400,
+      "signal": { "kind": "connection_attempt", "failed": false }
+    },
+    {
+      "scope": { "source_epoch": "fixture-epoch-1", "subject": "application:process-incarnation-1", "endpoint": "192.0.2.1:443", "transport": "tcp" },
+      "sequence": 5, "at_ms": 500,
+      "signal": { "kind": "transfer", "sent_bytes": 2048, "received_bytes": 0 }
+    }
+  ]
+}

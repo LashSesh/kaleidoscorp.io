@@ -1,0 +1,30 @@
+# Toolchain pin. This file is what makes "the build" a statement rather than a
+# description of whatever rustup happened to hold that morning.
+#
+# Two of this workspace's gates are toolchain-dependent by construction, so an
+# unpinned `stable` makes CI non-reproducible in both directions -- it can turn
+# red with no commit in this repo, and it can turn green again the same way:
+#
+#   * `ssk-core/tests/ui/*.stderr` are trybuild snapshots of *rustc's own
+#     diagnostics*. Any rustc release that rewords, renumbers or re-spans an
+#     error breaks them. They were observed stale against 1.95 on 2026-08-02
+#     (docs/WINDOWS_PRODUCT_ROADMAP.md 1.2), which is exactly this failure mode.
+#   * `cargo clippy -- -D warnings` is gated on the lint set of the clippy that
+#     ships with the toolchain. New lints arrive every six weeks and are errors
+#     here by definition of the gate.
+#
+# Bump this deliberately, in its own commit, together with re-blessing the
+# trybuild snapshots and clearing whatever new clippy lints appear.
+#
+# 1.95.0 is the version the workspace was first validated on real Windows 11
+# hardware with (rustc 1.95.0, 2026-04-14). It is NOT the MSRV -- the MSRV is
+# declared separately as `rust-version` in Cargo.toml's [workspace.package] and
+# is lower on purpose.
+[toolchain]
+channel = "1.95.0"
+# Both gates listed above need their tool present in the pinned toolchain, not
+# in whatever else rustup has installed.
+components = ["rustfmt", "clippy"]
+# Install exactly what the gates need and nothing else, so a fresh checkout (or
+# a CI runner) fetches a smaller, fully determined toolchain.
+profile = "minimal"

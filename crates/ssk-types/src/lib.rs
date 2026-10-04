@@ -195,8 +195,18 @@ pub enum ClosureState {
 /// placeholder — the PDF names the field but does not give its variants in
 /// the excerpted text; `Forward`/`Reverse` is this document's own minimal,
 /// disclosed design choice pending a richer definition.
+///
+/// Named `FacetOrientation` (S1 item 4, "the two Orientation types reconcile
+/// to one") to disambiguate from `ssk_imdf::closure::Orientation`, the ℤ/2
+/// spinor grade `FourPiClosure` derives from an accumulating pass count.
+/// These are not the same kind of thing and must not be merged: this one is a
+/// fixed, single-object provenance bit set once at facet derivation (fresh
+/// forward stitch vs. recovered/mirrored-back), consumed as a plain equality
+/// check in `ssk-stitch`'s `focus_ready`; the other is a live quotient of a
+/// growing crossing history. Reconciling "to one" means one clear name per
+/// concept, not asserting an unproven relationship between the two.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum Orientation {
+pub enum FacetOrientation {
     Forward,
     Reverse,
 }
@@ -217,7 +227,7 @@ pub struct MirrorFacet {
     pub id: FacetId,
     pub core: CoreId,
     pub phase: PhaseVector,
-    pub orientation: Orientation,
+    pub orientation: FacetOrientation,
     pub sector: Sector,
     pub key_ctx: KeyContextRef,
     pub session: SessionId,
@@ -631,6 +641,34 @@ pub struct StitchCandidate {
     pub replay_ready: bool,
     pub focus_ready: bool,
     pub ttl_epoch: u64,
+}
+
+/// The nine axes of the Projective Connection Hypercube (Master Spec Ω+1
+/// ch. 8.1, verbatim). Serde derives added in Phase 8 so `ssk-config`'s
+/// `projective_connection_hypercube.axes` list (Section S) can reuse this
+/// type directly instead of duplicating it.
+///
+/// The enum lives here rather than beside its sole logic consumer
+/// (`ssk_gates::pch::Hypercube`) so that reuse does not pull the decision
+/// core into the daemon's dependency closure — see
+/// `docs/adr/0008-flow-path-owns-the-per-connection-decision.md`.
+/// `ssk_gates::pch::Axis` remains a valid path via re-export, and the
+/// nine-axis projection logic is unmoved.
+///
+/// Serialized by variant *name* (`snake_case`), never by index: renaming or
+/// reordering a variant is a silent config-compatibility break.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Axis {
+    Identity,
+    Locator,
+    Protocol,
+    Timing,
+    Trust,
+    Risk,
+    Capability,
+    Replay,
+    Boundary,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]

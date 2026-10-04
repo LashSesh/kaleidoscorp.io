@@ -1,0 +1,7 @@
+{
+  "identifier": "read-panel",
+  "description": "The bundled main window may read one bounded daemon status observation.",
+  "local": true,
+  "windows": ["main"],
+  "permissions": ["allow-get-panel-snapshot-v2"]
+}

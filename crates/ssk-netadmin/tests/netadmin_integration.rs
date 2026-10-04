@@ -21,6 +21,8 @@ fn build_engine() -> PolicyEngine {
             description: "allow internal low-risk traffic directly".into(),
             priority: 10,
             criteria: MatchCriteria {
+                dest_host: None,
+                dest_port: None,
                 app_prefix: None,
                 dest_suffix: Some(".internal".into()),
                 protocol: None,
@@ -34,6 +36,8 @@ fn build_engine() -> PolicyEngine {
             description: "route high-risk via socks5".into(),
             priority: 20,
             criteria: MatchCriteria {
+                dest_host: None,
+                dest_port: None,
                 app_prefix: None,
                 dest_suffix: None,
                 protocol: None,
@@ -49,6 +53,8 @@ fn build_engine() -> PolicyEngine {
             description: "deny critical DNS flows".into(),
             priority: 5,
             criteria: MatchCriteria {
+                dest_host: None,
+                dest_port: None,
                 app_prefix: None,
                 dest_suffix: None,
                 protocol: Some(ProtocolKind::Dns),
@@ -62,6 +68,8 @@ fn build_engine() -> PolicyEngine {
             description: "require attestation for TLS flows".into(),
             priority: 15,
             criteria: MatchCriteria {
+                dest_host: None,
+                dest_port: None,
                 app_prefix: None,
                 dest_suffix: None,
                 protocol: Some(ProtocolKind::Tls),
