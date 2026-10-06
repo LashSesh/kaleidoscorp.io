@@ -2,6 +2,7 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use ssk_ipc::server::{BoxFuture, CommandHandler, Request, Response};
 use ssk_ipc::{
@@ -23,6 +24,17 @@ use crate::state::StateMachine;
 type PersistedAuditLedger =
     ssk_netadmin::audit::AuditLedger<GenericFileLedgerBackend<ForensicEntry>>;
 
+/// Upper bound on one activation dial. The supervisor mutex is held across the
+/// dial, so this is also the longest a silent upstream can keep every other
+/// request waiting. It is deliberately shorter than the executor's own dial
+/// deadline: the executor's bound still protects callers that do not pass
+/// through here (probes), but the daemon must not depend on it for its own
+/// availability.
+const ACTIVATE_DIAL_DEADLINE: Duration = Duration::from_secs(20);
+
+/// Machine code for a dial that outlived [`ACTIVATE_DIAL_DEADLINE`].
+const ACTIVATION_CONNECT_TIMEOUT: &str = "ACTIVATION_CONNECT_TIMEOUT";
+
 /// The daemon's product runtime: owns the live state machine, the persisted
 /// audit ledger, and a real `ssk-netcore`-backed data plane (Phase 3 is no
 /// longer a mock — see `ssk_netcore::NetcoreDataPlane`). Implements
@@ -33,6 +45,9 @@ pub struct Supervisor {
     /// supervisor's async mutex, and it holds no daemon state of its own — it
     /// is a window onto a different process's authoritative answer.
     kill_switch: Box<dyn KillSwitchProvider>,
+    /// Outside `Inner` for the same reason as `kill_switch`: it is read while
+    /// the mutex is already held by the dial it bounds.
+    activation_deadline: Duration,
 }
 
 struct Inner {
@@ -219,6 +234,7 @@ impl Supervisor {
         }
         Self {
             kill_switch,
+            activation_deadline: ACTIVATE_DIAL_DEADLINE,
             inner: Mutex::new(Inner {
                 state,
                 active_profile: None,
@@ -231,6 +247,15 @@ impl Supervisor {
                 dns_protected: false,
             }),
         }
+    }
+
+    /// Replace the activation dial deadline (default 20 s). Exists so tests can
+    /// end a silent upstream in milliseconds; expiry is an ordinary failed
+    /// connect, never a way to proceed without the route.
+    #[must_use]
+    pub fn with_activation_deadline(mut self, deadline: Duration) -> Self {
+        self.activation_deadline = deadline;
+        self
     }
 
     /// The current kill-switch view. Non-blocking — see
@@ -634,7 +659,28 @@ impl CommandHandler for Supervisor {
                     ) {
                         return inner.refuse_activation(error);
                     }
-                    let connected = inner.data_plane.connect_route(admission).await;
+                    // Dropping the timed-out dial closes its half-built
+                    // transport; the expiry then takes the same durable
+                    // `FailClosed` path as any other failed connect.
+                    let deadline = self.activation_deadline;
+                    let connected = match tokio::time::timeout(
+                        deadline,
+                        inner.data_plane.connect_route(admission),
+                    )
+                    .await
+                    {
+                        Ok(result) => result
+                            .map_err(|err| IpcError::new("Runtime", err.code(), err.to_string())),
+                        Err(_elapsed) => Err(IpcError::new(
+                            "Runtime",
+                            ACTIVATION_CONNECT_TIMEOUT,
+                            format!("activation connect did not complete within {deadline:?}"),
+                        )
+                        .with_next_step(
+                            "Check that the configured proxy or upstream is reachable and \
+                             completes its handshake; no direct connection is made instead.",
+                        )),
+                    };
                     let outcome = if connected.is_ok() {
                         AuditOutcome::Dispatched
                     } else {
@@ -656,8 +702,7 @@ impl CommandHandler for Supervisor {
                             inner.state.transition(DaemonState::Protected, reason);
                         }
                         Err(err) => {
-                            inner.activation_error =
-                                Some(IpcError::new("Runtime", err.code(), err.to_string()));
+                            inner.activation_error = Some(err.clone());
                             inner.active_profile = None;
                             inner.dns_protected = false;
                             inner.state.transition(
@@ -895,6 +940,14 @@ fn explain_code(code: &str) -> ExplainResponse {
             "The daemon refuses activation instead of reusing an audit identifier.",
             vec!["Preserve and archive the ledger using an approved retention procedure before recovery."],
         ),
+        ACTIVATION_CONNECT_TIMEOUT => (
+            "The activation connection did not complete in time.",
+            "The route's upstream accepted or stalled the connection but did not finish its handshake before the daemon's activation deadline. The attempt was closed, the daemon is fail-closed, and no direct connection was made instead.",
+            vec![
+                "Check that the configured proxy or upstream is reachable and answering.",
+                "Retry the activation once the upstream responds.",
+            ],
+        ),
         "NO_POLICY_MATCH" => (
             "No policy rule matched this flow.",
             "The policy engine evaluates rules by priority; when none match, the flow is denied fail-closed.",
@@ -1045,6 +1098,16 @@ mod tests {
     #[tokio::test]
     async fn the_unknown_code_is_explainable() {
         let explained = explain_code(crate::killswitch::KILL_SWITCH_STATUS_UNKNOWN);
+        assert!(
+            !explained.summary.starts_with("Unknown error code"),
+            "a code the daemon emits must have an explanation registered: {explained:?}"
+        );
+        assert!(!explained.next_steps.is_empty());
+    }
+
+    #[tokio::test]
+    async fn the_activation_timeout_code_is_explainable() {
+        let explained = explain_code(ACTIVATION_CONNECT_TIMEOUT);
         assert!(
             !explained.summary.starts_with("Unknown error code"),
             "a code the daemon emits must have an explanation registered: {explained:?}"

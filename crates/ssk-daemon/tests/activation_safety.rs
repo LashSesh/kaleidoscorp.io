@@ -536,3 +536,147 @@ async fn audit_failure_after_connect_closes_the_socket_without_a_protected_event
     }
     assert_eq!(supervisor.current_state().await, DaemonState::FailClosed);
 }
+
+/// A proxy that accepts the TCP connection and then never speaks can only be
+/// ended by a deadline. The daemon must own one of its own: the mutex is held
+/// across the dial, so an unbounded dial is an unbounded status/deactivate
+/// outage, and a deadline that lives only in the executor is not the daemon's
+/// to promise.
+#[tokio::test]
+async fn silent_proxy_ends_fail_closed_at_the_activation_deadline_and_status_answers() {
+    use ssk_config::routing::{AdapterTransport, RoutingAction, RoutingAdapter};
+    use ssk_ipc::CommandHandler;
+    use ssk_netadmin::audit::AuditOutcome;
+    use tokio::io::AsyncReadExt;
+
+    let dir = tempfile::tempdir().expect("state directory");
+    let path = dir.path().join("audit.json");
+    let proxy = TcpListener::bind("127.0.0.1:0").await.expect("proxy");
+    let port = proxy.local_addr().expect("address").port();
+    // Accepted sockets are handed to the test and kept open: the peer must see
+    // silence, not a reset, or the dial would end on its own.
+    let (accepted_tx, mut accepted) = tokio::sync::mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        while let Ok((socket, _)) = proxy.accept().await {
+            if accepted_tx.send(socket).is_err() {
+                break;
+            }
+        }
+    });
+
+    let mut loaded = loopback_config();
+    let rule = &mut loaded.config.routing.profiles[0].rules[0];
+    rule.destination = Some("service.corp.invalid".into());
+    rule.port = Some(8443);
+    rule.action = RoutingAction::Adapter {
+        adapter_id: "silent-proxy".into(),
+    };
+    loaded.config.routing.adapters.push(RoutingAdapter {
+        id: "silent-proxy".into(),
+        transport: AdapterTransport::Socks5 {
+            host: "127.0.0.1".into(),
+            port,
+        },
+    });
+    let registry = ssk_daemon::routing::ConfiguredRouting::new(&loaded.config.routing).adapters;
+    // The executor keeps its own, longer, dial deadline: only the daemon's
+    // bound can fire inside this test.
+    let data_plane = ssk_netcore::NetcoreDataPlane::new(std::sync::Arc::new(
+        ssk_netcore::RouteExecutor::new(registry),
+    ));
+    let supervisor = ssk_daemon::supervisor::Supervisor::new(
+        path.clone(),
+        Box::new(data_plane),
+        Box::new(ssk_daemon::killswitch::NoProvider),
+        Ok(loaded),
+    )
+    .with_activation_deadline(Duration::from_millis(300));
+    #[cfg(windows)]
+    let peer = ssk_ipc::PeerIdentity::Sid("test".into());
+    #[cfg(unix)]
+    let peer = ssk_ipc::PeerIdentity::Uid(0);
+    let mut events = supervisor.subscribe_events().await;
+
+    let request = Request::ActivateProfile(ActivateProfileRequest {
+        profile_id: "default".into(),
+        dest_host: Some("service.corp.invalid".into()),
+        dest_port: Some(8443),
+    });
+    let response = tokio::time::timeout(Duration::from_secs(5), supervisor.handle(request, &peer))
+        .await
+        .expect("a silent upstream must not hold the activation past the daemon's own deadline");
+    match response {
+        Response::Status(status) => {
+            assert_eq!(status.state, DaemonState::FailClosed);
+            let error = status.last_error.expect("the failure must be reported");
+            assert_eq!(error.code, "ACTIVATION_CONNECT_TIMEOUT");
+            assert!(!error.retriable, "the daemon never retries a dial itself");
+            assert!(status.active_profile.is_none());
+            assert!(status.adapters.is_empty());
+            assert!(!status.dns_protected);
+        }
+        other => panic!("a stalled dial was not reported as a fail-closed status: {other:?}"),
+    }
+    assert_eq!(supervisor.current_state().await, DaemonState::FailClosed);
+
+    // The dial really reached the silent proxy exactly once, and expiry closed
+    // that socket instead of leaving a half-built tunnel behind.
+    let mut connection = accepted.try_recv().expect("the proxy was dialed");
+    assert!(
+        accepted.try_recv().is_err(),
+        "an expired dial must not be retried"
+    );
+    // The client's SOCKS5 greeting is already in flight; it is the only thing
+    // the proxy may ever see before EOF.
+    let mut buffer = [0; 16];
+    let closed = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            match connection.read(&mut buffer).await {
+                Ok(0) => return true,
+                Ok(_) => {}
+                Err(error) => return error.kind() == std::io::ErrorKind::ConnectionReset,
+            }
+        }
+    })
+    .await
+    .expect("an expired dial must be closed");
+    assert!(closed);
+
+    // The durable result is the same one every other failed dial writes.
+    let ledger = ssk_netadmin::audit::AuditLedger::persisted(&path);
+    ledger.verify().expect("durable valid chain");
+    let entries = ledger.entries().expect("entries");
+    assert_eq!(entries.len(), 2);
+    assert_eq!(entries[0].outcome, AuditOutcome::DispatchPending);
+    assert_eq!(entries[1].outcome, AuditOutcome::FailClosed);
+
+    // Neither Protected nor a stuck Activating was ever the last word.
+    let mut states = Vec::new();
+    while let Ok(event) = events.try_recv() {
+        if let ssk_ipc::Event::StateChanged { to, .. } = event {
+            states.push(to);
+        }
+    }
+    assert_eq!(states, [DaemonState::Activating, DaemonState::FailClosed]);
+
+    match tokio::time::timeout(
+        Duration::from_secs(1),
+        supervisor.handle(Request::GetStatus, &peer),
+    )
+    .await
+    .expect("status must answer after the dial expired")
+    {
+        Response::Status(status) => {
+            assert_eq!(status.state, DaemonState::FailClosed);
+            assert_eq!(
+                status.last_error.expect("failure stays visible").code,
+                "ACTIVATION_CONNECT_TIMEOUT"
+            );
+            assert_eq!(
+                status.audit_head.as_deref(),
+                Some(entries[1].entry_hash.as_str())
+            );
+        }
+        other => panic!("status unavailable: {other:?}"),
+    }
+}
