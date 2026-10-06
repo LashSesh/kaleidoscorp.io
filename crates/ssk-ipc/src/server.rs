@@ -141,9 +141,83 @@ fn next_timeout(subscribed: bool, limits: &ServeLimits) -> Option<Duration> {
     }
 }
 
+/// Backoff and give-up policy for an accept loop that keeps failing.
+///
+/// A single failed `accept()` is not a reason to stop serving: `EMFILE` and
+/// `ENFILE` are transient fd pressure (the daemon's own sockets can cause it),
+/// and `ECONNABORTED` is a peer that vanished while queued. The loop therefore
+/// sleeps and tries again, doubling the pause from [`Self::INITIAL_DELAY`] up
+/// to [`Self::MAX_DELAY`] so a persistent fault cannot spin a core, and resets
+/// on the next success so isolated errors never add up.
+///
+/// It is not unconditional: the [`Self::GIVE_UP_AFTER`]th *consecutive* error
+/// returns `None`, at which point the caller returns that last error and the
+/// daemon stops. That is a known limit, not a fix for exhaustion — a fault that
+/// outlasts the roughly 55 s of sleeping this allows still ends the process.
+///
+/// Pure (no clock, no I/O, no tokio) so the whole table is unit-testable. No
+/// error classification on purpose: which errno is "transient" differs by OS,
+/// and an unrecognised one would again kill the daemon on its first occurrence.
+#[derive(Debug, Clone, Default)]
+pub struct AcceptRetry {
+    consecutive: u32,
+}
+
+impl AcceptRetry {
+    /// Pause after the first error in a run.
+    pub const INITIAL_DELAY: Duration = Duration::from_millis(50);
+    /// Ceiling the doubling pause is clamped to.
+    pub const MAX_DELAY: Duration = Duration::from_secs(1);
+    /// The consecutive error that gives up: errors 1 to 59 are retried, the
+    /// 60th is final.
+    pub const GIVE_UP_AFTER: u32 = 60;
+
+    #[must_use]
+    pub const fn new() -> Self {
+        Self { consecutive: 0 }
+    }
+
+    /// Record a failed accept. `Some(delay)`: sleep that long, then accept
+    /// again. `None`: give up and return the error.
+    #[must_use = "`None` means give up; dropping it retries forever"]
+    pub fn on_error(&mut self) -> Option<Duration> {
+        // Saturating, so a caller that keeps asking after `None` cannot
+        // overflow (overflow-checks is on in every profile).
+        self.consecutive = self.consecutive.saturating_add(1);
+        if self.consecutive >= Self::GIVE_UP_AFTER {
+            None
+        } else {
+            Some(Self::delay_for(self.consecutive))
+        }
+    }
+
+    /// Record a successful accept: the next error starts again at the floor.
+    pub fn on_success(&mut self) {
+        self.consecutive = 0;
+    }
+
+    /// Length of the current run of errors, for logging.
+    #[must_use]
+    pub const fn consecutive_errors(&self) -> u32 {
+        self.consecutive
+    }
+
+    /// Pause after the `n`th consecutive error (`n` of 1 is the floor).
+    fn delay_for(n: u32) -> Duration {
+        // `checked_shl` is `None` from 32 up; both that and the multiply
+        // saturate, then the clamp applies, so no `n` can overflow.
+        let factor = 1u32.checked_shl(n.saturating_sub(1)).unwrap_or(u32::MAX);
+        Self::INITIAL_DELAY
+            .saturating_mul(factor)
+            .min(Self::MAX_DELAY)
+    }
+}
+
 #[cfg(unix)]
 mod unix_transport {
-    use super::{clamp_request_limits, next_timeout, CommandHandler, Request, ServeLimits};
+    use super::{
+        clamp_request_limits, next_timeout, AcceptRetry, CommandHandler, Request, ServeLimits,
+    };
     use crate::auth::unix::check_peer_same_user;
     use crate::error::IpcError;
     use std::sync::Arc;
@@ -177,12 +251,32 @@ mod unix_transport {
         let listener = tokio::net::UnixListener::bind(path)
             .map_err(|e| IpcError::new("Runtime", "IPC_BIND_FAILED", e.to_string()))?;
         let permits = Arc::new(Semaphore::new(limits.max_connections as usize));
+        let mut retry = AcceptRetry::new();
 
         loop {
-            let (stream, _addr) = listener
-                .accept()
-                .await
-                .map_err(|e| IpcError::new("Runtime", "IPC_ACCEPT_FAILED", e.to_string()))?;
+            let (stream, _addr) = match listener.accept().await {
+                Ok(accepted) => {
+                    retry.on_success();
+                    accepted
+                }
+                Err(e) => {
+                    // The daemon exits when this function returns, so one
+                    // transient error (EMFILE under fd pressure, ECONNABORTED)
+                    // must not return: back off and accept again, and give up
+                    // only when the error will not clear.
+                    let Some(delay) = retry.on_error() else {
+                        return Err(IpcError::new("Runtime", "IPC_ACCEPT_FAILED", e.to_string()));
+                    };
+                    tracing::warn!(
+                        error = %e,
+                        consecutive = retry.consecutive_errors(),
+                        retry_in = ?delay,
+                        "ipc accept failed; backing off"
+                    );
+                    tokio::time::sleep(delay).await;
+                    continue;
+                }
+            };
             let permit = Arc::clone(&permits)
                 .acquire_owned()
                 .await
@@ -535,6 +629,103 @@ mod tests {
             .await
             .expect_err("a silent peer must time out");
         assert_eq!(err.code, "IPC_READ_TIMEOUT");
+    }
+
+    fn ms(n: u64) -> Duration {
+        Duration::from_millis(n)
+    }
+
+    #[test]
+    fn accept_retry_backoff_table() {
+        let mut retry = AcceptRetry::new();
+        // 50 ms doubling, clamped at 1 s: 50, 100, 200, 400, 800, then 1000.
+        let table = [50, 100, 200, 400, 800, 1000, 1000, 1000, 1000];
+        for (i, want) in table.into_iter().enumerate() {
+            assert_eq!(retry.on_error(), Some(ms(want)), "error #{}", i + 1);
+            assert_eq!(
+                retry.consecutive_errors(),
+                u32::try_from(i + 1).unwrap_or(u32::MAX)
+            );
+        }
+    }
+
+    #[test]
+    fn accept_retry_gives_up_on_the_60th_consecutive_error() {
+        assert_eq!(AcceptRetry::GIVE_UP_AFTER, 60);
+        let mut retry = AcceptRetry::new();
+        let mut total = Duration::ZERO;
+        for n in 1..AcceptRetry::GIVE_UP_AFTER {
+            let delay = retry
+                .on_error()
+                .unwrap_or_else(|| panic!("error #{n} must still be retried"));
+            total += delay;
+        }
+        assert_eq!(
+            retry.on_error(),
+            None,
+            "the 60th consecutive error gives up"
+        );
+        // 59 sleeps: 50+100+200+400+800 ms, then 54 x 1 s. Bounds how long a
+        // sustained failure keeps the daemon alive before it stops.
+        assert_eq!(total, ms(1550 + 54 * 1000));
+        // Giving up is sticky: asking again never revives the loop.
+        assert_eq!(retry.on_error(), None);
+        assert_eq!(retry.on_error(), None);
+    }
+
+    #[test]
+    fn accept_retry_success_resets_the_sequence() {
+        let mut retry = AcceptRetry::new();
+        assert_eq!(retry.on_error(), Some(ms(50)));
+        assert_eq!(retry.on_error(), Some(ms(100)));
+        assert_eq!(retry.on_error(), Some(ms(200)));
+        retry.on_success();
+        assert_eq!(retry.consecutive_errors(), 0);
+        assert_eq!(
+            retry.on_error(),
+            Some(ms(50)),
+            "backoff restarts at the floor"
+        );
+    }
+
+    #[test]
+    fn accept_retry_success_resets_the_give_up_count() {
+        // Errors that are *not* consecutive never add up to a give-up, however
+        // many there are in total.
+        let mut retry = AcceptRetry::new();
+        for round in 0..5 {
+            for n in 1..AcceptRetry::GIVE_UP_AFTER {
+                assert!(retry.on_error().is_some(), "round {round}, error #{n}");
+            }
+            retry.on_success();
+        }
+        // A success with no preceding error changes nothing.
+        retry.on_success();
+        assert_eq!(retry.on_error(), Some(ms(50)));
+    }
+
+    #[test]
+    fn accept_retry_never_overflows() {
+        // Far past the threshold: the counter saturates and the delay never
+        // exceeds the cap (overflow-checks is on in every profile).
+        let mut retry = AcceptRetry::new();
+        for _ in 0..100_000 {
+            if let Some(delay) = retry.on_error() {
+                assert!(delay <= AcceptRetry::MAX_DELAY);
+            }
+        }
+        assert_eq!(retry.on_error(), None);
+
+        // The numeric edge itself, reached directly rather than by looping.
+        let mut edge = AcceptRetry {
+            consecutive: u32::MAX,
+        };
+        assert_eq!(edge.on_error(), None);
+        assert_eq!(edge.consecutive_errors(), u32::MAX);
+        assert_eq!(AcceptRetry::delay_for(u32::MAX), AcceptRetry::MAX_DELAY);
+        assert_eq!(AcceptRetry::delay_for(33), AcceptRetry::MAX_DELAY);
+        assert_eq!(AcceptRetry::delay_for(32), AcceptRetry::MAX_DELAY);
+        assert_eq!(AcceptRetry::delay_for(31), AcceptRetry::MAX_DELAY);
     }
 
     #[tokio::test]
