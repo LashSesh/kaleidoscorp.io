@@ -110,6 +110,79 @@ mod tests {
         assert!(matches!(err, NetcoreError::UnknownAdapter(_)));
     }
 
+    /// Counts connections the sentinel has queued, waiting `grace` for each
+    /// one. A dial that completed before this runs is already in the accept
+    /// queue, so the grace only ever delays a passing (zero) result.
+    async fn sentinel_connections(sentinel: &TcpListener) -> usize {
+        let grace = std::time::Duration::from_millis(200);
+        let mut seen = 0;
+        while let Ok(Ok(_)) = tokio::time::timeout(grace, sentinel.accept()).await {
+            seen += 1;
+        }
+        seen
+    }
+
+    #[tokio::test]
+    async fn fallback_route_never_dials_direct() {
+        // A bound, never-listening socket reserves its port for the whole
+        // test (no free-then-reuse race) and refuses every connect.
+        let dead_proxy = tokio::net::TcpSocket::new_v4().expect("socket");
+        dead_proxy
+            .bind("127.0.0.1:0".parse().expect("addr"))
+            .expect("bind");
+        let dead_port = dead_proxy.local_addr().expect("addr").port();
+
+        let sentinel = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let sentinel_port = sentinel.local_addr().expect("addr").port();
+
+        let mut registry = AdapterRegistry::new();
+        registry.register(AdapterDescriptor {
+            adapter_id: "dead-socks".into(),
+            kind: AdapterKind::Socks5,
+            address: "127.0.0.1".into(),
+            port: dead_port,
+            metadata: vec![],
+        });
+        let primary = RouteKind::SingleHop(ssk_netadmin::route::HopSpec::new(
+            "dead-socks",
+            "127.0.0.1",
+            dead_port,
+        ));
+        let executor = RouteExecutor::new(registry);
+        let target = ("127.0.0.1", sentinel_port);
+
+        // Premise: the primary really fails on its own, so reaching the
+        // sentinel can only mean the executor retried on the fallback.
+        let primary_err = executor
+            .connect(&primary, target)
+            .await
+            .expect_err("the dead SOCKS5 primary must fail");
+        assert!(matches!(primary_err, NetcoreError::ConnectionRefused(..)));
+        assert_eq!(sentinel_connections(&sentinel).await, 0);
+
+        let route = RouteKind::Fallback {
+            primary: Box::new(primary),
+            fallback: Box::new(RouteKind::Direct),
+        };
+        let result = executor.connect(&route, target).await;
+        assert_eq!(
+            sentinel_connections(&sentinel).await,
+            0,
+            "a failed primary must never become a direct dial of the target"
+        );
+        assert!(
+            matches!(&result, Err(NetcoreError::NoRoute(reason)) if reason.contains("fallback")),
+            "a Fallback route must be refused as NoRoute, got {:?}",
+            result.map(|session| session.chain().to_vec())
+        );
+
+        // `probe` goes through `connect`, so it must be just as inert.
+        let report = executor.probe(&route, target).await;
+        assert_eq!(report.status, ProbeStatus::Down);
+        assert_eq!(sentinel_connections(&sentinel).await, 0);
+        drop(dead_proxy);
+    }
+
     #[tokio::test]
     async fn probe_reports_down_with_a_real_reason_when_nothing_listens() {
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");

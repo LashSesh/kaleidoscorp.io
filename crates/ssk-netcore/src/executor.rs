@@ -110,7 +110,9 @@ impl RouteExecutor {
 
     /// Dispatches `route` for real, connecting all the way to
     /// `target = (host, port)`. Fails closed with a typed [`NetcoreError`]
-    /// on any real failure — never falls back to an unplanned adapter.
+    /// on any real failure — never falls back to an unplanned adapter, and
+    /// never retries one route on another: a `RouteKind::Fallback` is refused
+    /// with `NoRoute` before any socket is opened.
     pub async fn connect(
         &self,
         route: &RouteKind,
@@ -126,18 +128,13 @@ impl RouteExecutor {
                 self.connect_chain(std::slice::from_ref(hop), target).await
             }
             RouteKind::MultiHop(hops) => self.connect_chain(hops, target).await,
-            RouteKind::Fallback { primary, fallback } => {
-                match Box::pin(self.connect(primary, target)).await {
-                    Ok(session) => Ok(session),
-                    Err(primary_err) => {
-                        tracing::warn!(
-                            error = %primary_err,
-                            "primary route failed for real, trying fallback route"
-                        );
-                        Box::pin(self.connect(fallback, target)).await
-                    }
-                }
-            }
+            // Retrying a failed primary on `fallback` (which may be `Direct`)
+            // is an unintended direct egress, so refusing it must not depend
+            // on the planner happening never to emit this variant. The variant
+            // stays only because `RouteKind` is public and serialisable.
+            RouteKind::Fallback { .. } => Err(NetcoreError::NoRoute(
+                "fallback routes are not executable".into(),
+            )),
         }
     }
 
