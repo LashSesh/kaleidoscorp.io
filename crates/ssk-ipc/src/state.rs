@@ -17,7 +17,16 @@ pub enum DaemonState {
     Activating,
     /// Protection on, routing engaged.
     Active,
-    /// Active and verified (route + DNS covered).
+    /// The daemon holds ONE open egress session that an activation
+    /// established through the profile's route to the requested destination,
+    /// and whose audit result is durable. It says nothing wider: it is not
+    /// system-wide coverage (other traffic on the machine is neither captured
+    /// nor routed by it, and the kill switch is a separate mechanism reported
+    /// in `StatusDto::kill_switch`), and it is not verified DNS
+    /// (`StatusDto::dns_protected` can be `false` here, e.g. for a hostname
+    /// destination reached without a DNS-override adapter). The session is
+    /// not monitored after activation, so this is the state at the moment it
+    /// was established, not a liveness guarantee.
     Protected,
     /// Active but a non-fatal issue reduced protection.
     Degraded,

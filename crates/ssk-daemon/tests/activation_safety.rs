@@ -680,3 +680,281 @@ async fn silent_proxy_ends_fail_closed_at_the_activation_deadline_and_status_ans
         other => panic!("status unavailable: {other:?}"),
     }
 }
+
+/// A kill-switch answer the test can change while an activation is in flight,
+/// to prove the status overlay reads the provider when it answers rather than
+/// when the activation started.
+struct SwitchableKillSwitch(
+    std::sync::Arc<std::sync::Mutex<ssk_daemon::killswitch::KillSwitchView>>,
+);
+
+impl ssk_daemon::killswitch::KillSwitchProvider for SwitchableKillSwitch {
+    fn view(&self) -> ssk_daemon::killswitch::KillSwitchView {
+        *self.0.lock().expect("kill-switch view")
+    }
+}
+
+/// A supervisor whose `silent-proxy` adapter accepts the TCP connection and
+/// never answers, with a deliberately long activation deadline: only the
+/// test, not the daemon's own bound, ends a dial here. The loopback `Direct`
+/// rule stays available so a test can establish a real session first.
+struct SilentDial {
+    supervisor: std::sync::Arc<ssk_daemon::supervisor::Supervisor>,
+    view: std::sync::Arc<std::sync::Mutex<ssk_daemon::killswitch::KillSwitchView>>,
+    accepted: tokio::sync::mpsc::UnboundedReceiver<tokio::net::TcpStream>,
+    _state: tempfile::TempDir,
+}
+
+async fn silent_dial() -> SilentDial {
+    use ssk_config::routing::{AdapterTransport, RoutingAction, RoutingAdapter, RoutingRule};
+    let state = tempfile::tempdir().expect("state directory");
+    let proxy = TcpListener::bind("127.0.0.1:0").await.expect("proxy");
+    let port = proxy.local_addr().expect("address").port();
+    // Accepted sockets are handed to the test and kept open: the peer must
+    // see silence, not a reset, or the dial would end on its own.
+    let (accepted_tx, accepted) = tokio::sync::mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        while let Ok((socket, _)) = proxy.accept().await {
+            if accepted_tx.send(socket).is_err() {
+                break;
+            }
+        }
+    });
+
+    let mut loaded = loopback_config();
+    let profile = &mut loaded.config.routing.profiles[0];
+    profile.rules.push(RoutingRule {
+        id: "silent".into(),
+        priority: 20,
+        destination: Some("service.corp.invalid".into()),
+        domain_suffix: None,
+        port: Some(8443),
+        action: RoutingAction::Adapter {
+            adapter_id: "silent-proxy".into(),
+        },
+        require_attestation: false,
+    });
+    loaded.config.routing.adapters.push(RoutingAdapter {
+        id: "silent-proxy".into(),
+        transport: AdapterTransport::Socks5 {
+            host: "127.0.0.1".into(),
+            port,
+        },
+    });
+    let registry = ssk_daemon::routing::ConfiguredRouting::new(&loaded.config.routing).adapters;
+    let data_plane = ssk_netcore::NetcoreDataPlane::new(std::sync::Arc::new(
+        ssk_netcore::RouteExecutor::new(registry),
+    ));
+    let view = std::sync::Arc::new(std::sync::Mutex::new(
+        ssk_daemon::killswitch::KillSwitchView::NotEngaged,
+    ));
+    let supervisor = ssk_daemon::supervisor::Supervisor::new(
+        state.path().join("audit.json"),
+        Box::new(data_plane),
+        Box::new(SwitchableKillSwitch(std::sync::Arc::clone(&view))),
+        Ok(loaded),
+    )
+    .with_activation_deadline(Duration::from_secs(60));
+    SilentDial {
+        supervisor: std::sync::Arc::new(supervisor),
+        view,
+        accepted,
+        _state: state,
+    }
+}
+
+fn test_peer() -> ssk_ipc::PeerIdentity {
+    #[cfg(windows)]
+    {
+        ssk_ipc::PeerIdentity::Sid("test".into())
+    }
+    #[cfg(unix)]
+    {
+        ssk_ipc::PeerIdentity::Uid(0)
+    }
+}
+
+fn silent_activation() -> Request {
+    Request::ActivateProfile(ActivateProfileRequest {
+        profile_id: "default".into(),
+        dest_host: Some("service.corp.invalid".into()),
+        dest_port: Some(8443),
+    })
+}
+
+/// Ask for status the way the desktop client does: it gives up after 2 s, so
+/// an answer that needs more than 1 s here is an answer the client never sees.
+async fn status_within_a_second(
+    supervisor: &ssk_daemon::supervisor::Supervisor,
+) -> ssk_ipc::StatusDto {
+    use ssk_ipc::CommandHandler;
+    match tokio::time::timeout(
+        Duration::from_secs(1),
+        supervisor.handle(Request::GetStatus, &test_peer()),
+    )
+    .await
+    .expect("GetStatus must answer while an activation dial is silent")
+    {
+        Response::Status(status) => status,
+        other => panic!("GetStatus did not answer with a status: {other:?}"),
+    }
+}
+
+/// Start the silent activation and wait until it really holds the supervisor
+/// mutex across its dial: the proxy has accepted the TCP connection, which the
+/// executor only does from inside `connect_route`.
+async fn start_silent_activation(
+    dial: &mut SilentDial,
+) -> (tokio::task::JoinHandle<Response>, tokio::net::TcpStream) {
+    use ssk_ipc::CommandHandler;
+    let supervisor = std::sync::Arc::clone(&dial.supervisor);
+    let activation =
+        tokio::spawn(async move { supervisor.handle(silent_activation(), &test_peer()).await });
+    let held = tokio::time::timeout(Duration::from_secs(5), dial.accepted.recv())
+        .await
+        .expect("the activation must dial the silent proxy")
+        .expect("proxy accept loop");
+    (activation, held)
+}
+
+/// Closing the silent proxy's socket ends the dial at once (EOF or reset in
+/// the SOCKS5 handshake), so a test does not wait out the long deadline.
+async fn end_the_dial(activation: tokio::task::JoinHandle<Response>, held: tokio::net::TcpStream) {
+    drop(held);
+    match tokio::time::timeout(Duration::from_secs(5), activation)
+        .await
+        .expect("closing the proxy socket must end the dial")
+        .expect("activation task")
+    {
+        Response::Status(status) => assert_eq!(status.state, DaemonState::FailClosed),
+        other => panic!("a failed dial was not reported as a fail-closed status: {other:?}"),
+    }
+}
+
+/// The supervisor mutex is held across the activation dial, so before this a
+/// proxy that accepted and then stayed silent kept `GetStatus` waiting for the
+/// whole dial: the desktop client, which gives up after 2 s, saw no status at
+/// all. The answer given instead must not repeat anything the daemon cannot
+/// stand behind: the session a previous activation held is gone the moment a
+/// new activation clears it, so no `Protected`, profile, adapter or DNS claim
+/// may survive into the answer.
+#[tokio::test]
+async fn status_answers_while_activation_dial_is_silent() {
+    use ssk_ipc::CommandHandler;
+    let mut dial = silent_dial().await;
+
+    // A real held session first, so a status served from a cache of the last
+    // answer would still say Protected with a profile, an adapter and DNS.
+    let target = TcpListener::bind("127.0.0.1:0").await.expect("target");
+    let target_port = target.local_addr().expect("address").port();
+    let accept = tokio::spawn(async move { target.accept().await });
+    match dial
+        .supervisor
+        .handle(
+            Request::ActivateProfile(ActivateProfileRequest {
+                profile_id: "default".into(),
+                dest_host: Some("127.0.0.1".into()),
+                dest_port: Some(target_port),
+            }),
+            &test_peer(),
+        )
+        .await
+    {
+        Response::Status(status) => {
+            assert_eq!(status.state, DaemonState::Protected);
+            assert_eq!(status.active_profile.as_deref(), Some("default"));
+            assert!(status.dns_protected);
+            assert_eq!(status.adapters.len(), 1);
+        }
+        other => panic!("the first activation did not reach Protected: {other:?}"),
+    }
+    let _accepted_target = accept.await.expect("join").expect("accept");
+
+    let (activation, held) = start_silent_activation(&mut dial).await;
+    let started = Instant::now();
+    let status = status_within_a_second(&dial.supervisor).await;
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "GetStatus took {:?} behind a silent dial",
+        started.elapsed()
+    );
+    assert_eq!(status.state, DaemonState::Activating);
+    assert!(
+        status.active_profile.is_none(),
+        "no profile is active while the new session does not exist yet"
+    );
+    assert!(
+        status.adapters.is_empty(),
+        "no adapter has been traversed yet"
+    );
+    assert!(
+        !status.dns_protected,
+        "no DNS protection is established during the dial"
+    );
+    assert!(
+        status.last_error.is_none(),
+        "a confirmed kill-switch answer and no error of this run: {:?}",
+        status.last_error
+    );
+    assert!(!status.kill_switch);
+    assert!(
+        status.audit_head.is_none(),
+        "the ledger is only readable under the lock: no head is claimed"
+    );
+
+    end_the_dial(activation, held).await;
+    // The overlay does not outlive the activation.
+    let after = status_within_a_second(&dial.supervisor).await;
+    assert_eq!(after.state, DaemonState::FailClosed);
+    assert!(after.last_error.is_some(), "the failed dial stays visible");
+    assert!(after.audit_head.is_some());
+}
+
+/// `Activating` was transitioned to and emitted as an event, but a client
+/// polling status could not read it while an activation ran: the state exists
+/// only while the mutex is held, and status needed the mutex. It must be
+/// observable by polling, repeatedly, and the parts of the answer that do not
+/// need the mutex (the kill-switch view) must be read when the answer is given.
+#[tokio::test]
+async fn activating_is_observable() {
+    use ssk_daemon::killswitch::{KillSwitchView, KILL_SWITCH_STATUS_UNKNOWN};
+    let mut dial = silent_dial().await;
+    let (activation, held) = start_silent_activation(&mut dial).await;
+
+    // Polled more than once, and concurrently: each poll answers by itself.
+    let (first, second) = tokio::join!(
+        status_within_a_second(&dial.supervisor),
+        status_within_a_second(&dial.supervisor)
+    );
+    assert_eq!(first.state, DaemonState::Activating);
+    assert_eq!(second.state, DaemonState::Activating);
+    assert!(!first.kill_switch && first.last_error.is_none());
+
+    // The provider is read per answer, not captured when the activation began.
+    *dial.view.lock().expect("kill-switch view") = KillSwitchView::EngagedConfirmed;
+    let engaged = status_within_a_second(&dial.supervisor).await;
+    assert_eq!(engaged.state, DaemonState::Activating);
+    assert!(engaged.kill_switch);
+    assert!(engaged.last_error.is_none());
+
+    // An unknown kill switch stays visible, never rounded to a clean `false`.
+    *dial.view.lock().expect("kill-switch view") = KillSwitchView::Unknown {
+        reason: "the privileged broker could not be reached",
+    };
+    let unknown = status_within_a_second(&dial.supervisor).await;
+    assert_eq!(unknown.state, DaemonState::Activating);
+    assert!(!unknown.kill_switch);
+    assert_eq!(
+        unknown.last_error.expect("unknown must be marked").code,
+        KILL_SWITCH_STATUS_UNKNOWN
+    );
+
+    *dial.view.lock().expect("kill-switch view") = KillSwitchView::NotEngaged;
+    end_the_dial(activation, held).await;
+    let settled = status_within_a_second(&dial.supervisor).await;
+    assert_eq!(
+        settled.state,
+        DaemonState::FailClosed,
+        "Activating must not be the last word once the dial has ended"
+    );
+}

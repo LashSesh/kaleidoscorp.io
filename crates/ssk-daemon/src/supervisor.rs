@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -35,6 +36,17 @@ const ACTIVATE_DIAL_DEADLINE: Duration = Duration::from_secs(20);
 /// Machine code for a dial that outlived [`ACTIVATE_DIAL_DEADLINE`].
 const ACTIVATION_CONNECT_TIMEOUT: &str = "ACTIVATION_CONNECT_TIMEOUT";
 
+/// How long `GetStatus` waits for the supervisor mutex before it asks whether
+/// an activation is the reason. The desktop client gives up on a status read
+/// after 2 s, so the wait has to be a small fraction of that; it is long
+/// enough that an ordinary short handler never trips it.
+const STATUS_LOCK_WAIT: Duration = Duration::from_millis(100);
+
+/// What the daemon can say about an adapter of a held session. The session was
+/// connected when activation finished; nothing probes or reads it afterwards,
+/// so anything stronger ("live") would be a claim no code backs.
+const ADAPTER_HEALTH_AT_ACTIVATION: &str = "connected at activation; liveness not monitored";
+
 /// The daemon's product runtime: owns the live state machine, the persisted
 /// audit ledger, and a real `ssk-netcore`-backed data plane (Phase 3 is no
 /// longer a mock — see `ssk_netcore::NetcoreDataPlane`). Implements
@@ -48,6 +60,48 @@ pub struct Supervisor {
     /// Outside `Inner` for the same reason as `kill_switch`: it is read while
     /// the mutex is already held by the dial it bounds.
     activation_deadline: Duration,
+    /// Outside `Inner` because its whole purpose is to be readable while
+    /// `Inner` is held by an activation dial.
+    activations: ActivationsInFlight,
+}
+
+/// How many `ActivateProfile` requests are between "accepted" and "answered",
+/// including those still queued for `Inner`.
+///
+/// A count and not a flag: a second activation can queue behind the first, and
+/// a flag cleared by whichever finishes first would hide the other. It is
+/// raised before the request awaits `Inner`, because the mutex is exactly what
+/// the reader cannot wait for. A request still queued counts too, which can
+/// only make a status answer say less than is enforced (the previous session
+/// is not cleared yet), never more.
+#[derive(Default)]
+struct ActivationsInFlight(AtomicUsize);
+
+impl ActivationsInFlight {
+    fn enter(&self) -> ActivationInFlight<'_> {
+        self.0.fetch_add(1, Ordering::SeqCst);
+        ActivationInFlight(self)
+    }
+
+    fn any(&self) -> bool {
+        self.0.load(Ordering::SeqCst) > 0
+    }
+
+    fn leave(&self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// Lowers the count on every way out of the request: a normal return, a panic
+/// (unwinding runs `Drop`) and cancellation (a dropped future drops its
+/// locals). A marker that outlived its request would report `Activating`
+/// forever.
+struct ActivationInFlight<'a>(&'a ActivationsInFlight);
+
+impl Drop for ActivationInFlight<'_> {
+    fn drop(&mut self) {
+        self.0.leave();
+    }
 }
 
 struct Inner {
@@ -194,6 +248,30 @@ fn kill_switch_fields(view: KillSwitchView) -> (bool, Option<IpcError>) {
     (view.is_confirmed_engaged(), view.advisory())
 }
 
+/// The answer to a status read that could not get `Inner` because an
+/// activation holds it across its dial.
+///
+/// Built from nothing but what is true at that moment, not from a copy of an
+/// earlier answer. An activation clears the old session before it dials, so a
+/// remembered `Protected`, profile, adapter list or `dns_protected` would
+/// describe protection that no longer exists, and a remembered `last_error`
+/// belongs to a run this activation replaced. The kill-switch fields come from
+/// the provider as of this call; it sits outside the mutex for exactly this.
+/// The ledger is only readable under the mutex, so no audit head is claimed.
+fn activating_status(view: KillSwitchView) -> StatusDto {
+    let (kill_switch, last_error) = kill_switch_fields(view);
+    StatusDto {
+        state: DaemonState::Activating,
+        active_profile: None,
+        adapters: Vec::new(),
+        dns_protected: false,
+        kill_switch,
+        audit_head: None,
+        version: env!("CARGO_PKG_VERSION").to_string(),
+        last_error,
+    }
+}
+
 impl Supervisor {
     /// `kill_switch` is the injected read-only view of the privileged broker
     /// (roadmap P3). It is a seam for the same reason `data_plane` is: the real
@@ -235,6 +313,7 @@ impl Supervisor {
         Self {
             kill_switch,
             activation_deadline: ACTIVATE_DIAL_DEADLINE,
+            activations: ActivationsInFlight::default(),
             inner: Mutex::new(Inner {
                 state,
                 active_profile: None,
@@ -340,15 +419,16 @@ fn parse_protocol(s: &str) -> ProtocolKind {
     }
 }
 
-/// Real per-adapter health derived from the live session's actual traversed
-/// chain — never a hardcoded placeholder string.
+/// Per-adapter entries derived from the held session's actual traversed chain.
+/// The health text states only what activation established; see
+/// [`ADAPTER_HEALTH_AT_ACTIVATION`].
 fn adapter_health_from_session(session: &EgressSession) -> Vec<AdapterHealthSummaryDto> {
     session
         .chain()
         .iter()
         .map(|kind| AdapterHealthSummaryDto {
             id: format!("{kind:?}"),
-            health: "live (real, connected)".into(),
+            health: ADAPTER_HEALTH_AT_ACTIVATION.into(),
         })
         .collect()
 }
@@ -490,10 +570,30 @@ impl CommandHandler for Supervisor {
         Box::pin(async move {
             match req {
                 Request::GetStatus => {
-                    let mut inner = self.inner.lock().await;
+                    // Joined once and kept: dropping the timed-out wait would
+                    // forfeit this request's place in the mutex's queue.
+                    let acquire = self.inner.lock();
+                    tokio::pin!(acquire);
+                    let mut inner = match tokio::time::timeout(STATUS_LOCK_WAIT, &mut acquire).await
+                    {
+                        Ok(inner) => inner,
+                        // Only an activation is allowed to be answered around.
+                        // Any other holder is short and mid-change, and what it
+                        // is changing is what this read must report.
+                        Err(_elapsed) if self.activations.any() => {
+                            return Response::Status(activating_status(self.kill_switch.view()));
+                        }
+                        Err(_elapsed) => acquire.await,
+                    };
                     Response::Status(inner.status(self.kill_switch.view()))
                 }
                 Request::ActivateProfile(req) => {
+                    // Before the first await: from here to the answer, a status
+                    // read that cannot get `Inner` knows why. Declared before
+                    // `inner` so it is released after the mutex is: a reader
+                    // must never find the mutex still held by this activation
+                    // with the marker already gone.
+                    let _in_flight = self.activations.enter();
                     let mut inner = self.inner.lock().await;
                     if let Err(error) = &inner.config {
                         let error = error.clone();
@@ -1196,6 +1296,86 @@ mod tests {
         accept.await.expect("join").expect("accept");
     }
 
+    /// Nothing re-checks a held session after activation: the daemon never
+    /// probes it and never reads from it, so "live" was a claim no code backed.
+    /// The health string may say only what activation established.
+    #[tokio::test]
+    async fn adapter_health_claims_only_what_activation_established() {
+        let (sup, _dir) = supervisor_with(real_data_plane());
+        let (listener, host, port) = reachable_dest().await;
+        let accept = tokio::spawn(async move { listener.accept().await });
+        let resp = call(
+            &sup,
+            Request::ActivateProfile(ssk_ipc::ActivateProfileRequest {
+                profile_id: "default".into(),
+                dest_host: Some(host),
+                dest_port: Some(port),
+            }),
+        )
+        .await;
+        match resp {
+            Response::Status(status) => {
+                assert_eq!(status.state, DaemonState::Protected);
+                let health: Vec<_> = status.adapters.iter().map(|a| a.health.as_str()).collect();
+                assert_eq!(health, ["connected at activation; liveness not monitored"]);
+            }
+            other => panic!("unexpected response: {other:?}"),
+        }
+        accept.await.expect("join").expect("accept");
+    }
+
+    /// A timed-out status read is answered without the mutex only when an
+    /// activation is the reason for the wait. Any other holder keeps the old
+    /// behaviour: wait, then read the live state. A cached `Protected` served
+    /// while some other handler is mid-change would be a claim nobody holds.
+    #[tokio::test]
+    async fn status_keeps_waiting_when_the_lock_is_held_by_something_else() {
+        let (sup, _dir) = supervisor_with(real_data_plane());
+        let sup = Arc::new(sup);
+        let (listener, host, port) = reachable_dest().await;
+        let accept = tokio::spawn(async move { listener.accept().await });
+        call(
+            &sup,
+            Request::ActivateProfile(ssk_ipc::ActivateProfileRequest {
+                profile_id: "default".into(),
+                dest_host: Some(host),
+                dest_port: Some(port),
+            }),
+        )
+        .await;
+        accept.await.expect("join").expect("accept");
+        assert_eq!(sup.current_state().await, DaemonState::Protected);
+
+        // Stands in for any non-activation handler that holds the mutex.
+        let mut other_handler = sup.inner.lock().await;
+        let asker = {
+            let sup = Arc::clone(&sup);
+            tokio::spawn(async move { call(&sup, Request::GetStatus).await })
+        };
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        assert!(
+            !asker.is_finished(),
+            "with no activation in flight GetStatus must wait for the lock, not answer"
+        );
+        other_handler
+            .state
+            .transition(DaemonState::Degraded, "changed while status waited");
+        drop(other_handler);
+
+        match tokio::time::timeout(Duration::from_secs(5), asker)
+            .await
+            .expect("status answers once the lock is free")
+            .expect("join")
+        {
+            Response::Status(status) => assert_eq!(
+                status.state,
+                DaemonState::Degraded,
+                "the answer must be the live state read under the lock"
+            ),
+            other => panic!("unexpected response: {other:?}"),
+        }
+    }
+
     #[tokio::test]
     async fn activate_with_no_route_fails_closed() {
         let (sup, _dir) = supervisor_with(real_data_plane());
@@ -1558,6 +1738,93 @@ mod tests {
             .find(|c| c.name == "paths")
             .expect("a paths check must exist");
         assert!(paths.detail.contains("state directory"), "{}", paths.detail);
+    }
+
+    /// A marker that outlived its request would answer `Activating` for ever,
+    /// so every way out of the request must lower it, and one request leaving
+    /// must not hide another that is still in flight.
+    #[tokio::test]
+    async fn the_in_flight_marker_clears_on_every_exit_path() {
+        let marker = ActivationsInFlight::default();
+        assert!(!marker.any());
+
+        drop(marker.enter());
+        assert!(!marker.any(), "normal exit");
+
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = marker.enter();
+            panic!("a handler panicked mid-activation");
+        }));
+        assert!(panicked.is_err());
+        assert!(!marker.any(), "unwinding");
+
+        let cancelled = tokio::time::timeout(Duration::from_millis(20), async {
+            let _guard = marker.enter();
+            std::future::pending::<()>().await;
+        })
+        .await;
+        assert!(cancelled.is_err(), "the pending future was cancelled");
+        assert!(!marker.any(), "cancellation drops the future's locals");
+
+        let first = marker.enter();
+        let second = marker.enter();
+        drop(first);
+        assert!(marker.any(), "the second request is still in flight");
+        drop(second);
+        assert!(!marker.any());
+    }
+
+    /// The marker is raised before the request awaits `Inner`, because the
+    /// mutex is what a status read cannot wait for. An activation that has
+    /// been accepted but is still queued behind another holder is therefore
+    /// already visible, and cancelling it while queued leaves no trace.
+    #[tokio::test]
+    async fn an_activation_queued_for_the_lock_is_already_in_flight() {
+        let (sup, _dir) = supervisor_with(real_data_plane());
+        let sup = Arc::new(sup);
+        let other_handler = sup.inner.lock().await;
+        let activation = {
+            let sup = Arc::clone(&sup);
+            tokio::spawn(async move {
+                call(
+                    &sup,
+                    Request::ActivateProfile(ssk_ipc::ActivateProfileRequest {
+                        profile_id: "default".into(),
+                        dest_host: Some("127.0.0.1".into()),
+                        dest_port: Some(9),
+                    }),
+                )
+                .await
+            })
+        };
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !sup.activations.any() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the request must be marked before it gets the lock");
+
+        match tokio::time::timeout(Duration::from_secs(1), call(&sup, Request::GetStatus))
+            .await
+            .expect("status must answer around a queued activation")
+        {
+            Response::Status(status) => assert_eq!(status.state, DaemonState::Activating),
+            other => panic!("unexpected response: {other:?}"),
+        }
+
+        activation.abort();
+        assert!(activation.await.expect_err("aborted").is_cancelled());
+        assert!(
+            !sup.activations.any(),
+            "an activation cancelled while queued must not stay in flight"
+        );
+        drop(other_handler);
+        assert_eq!(
+            sup.current_state().await,
+            DaemonState::Inactive,
+            "the cancelled activation never ran, so it changed nothing"
+        );
     }
 
     #[tokio::test]
