@@ -959,6 +959,34 @@ async fn activating_is_observable() {
     );
 }
 
+/// Subscribing only needs the event bus, but it used to be read out of the
+/// state machine behind the supervisor mutex, so a silent dial kept every new
+/// subscriber waiting for the whole dial. The bus is a clone of the sender the
+/// state machine publishes on, held outside the mutex: a subscriber that joins
+/// mid-dial is live at once, and it hears what the dial's end publishes.
+#[tokio::test]
+async fn subscribe_events_does_not_wait_for_a_dial() {
+    let mut dial = silent_dial().await;
+    let (activation, held) = start_silent_activation(&mut dial).await;
+
+    let mut events =
+        tokio::time::timeout(Duration::from_secs(1), dial.supervisor.subscribe_events())
+            .await
+            .expect("subscribe_events must not wait behind a silent dial");
+
+    end_the_dial(activation, held).await;
+
+    // `Activating` was published before this subscriber existed; what the
+    // dial's end publishes, through the state machine's own sender, reaches it.
+    let mut states = Vec::new();
+    while let Ok(event) = events.try_recv() {
+        if let ssk_ipc::Event::StateChanged { to, .. } = event {
+            states.push(to);
+        }
+    }
+    assert_eq!(states, [DaemonState::FailClosed]);
+}
+
 /// The `ActivateProfile` future is dropped while it holds the mutex across its
 /// dial: the task serving a client that went away is aborted, the runtime is
 /// shutting down, or a caller's own timeout fired. Nothing after the dial's

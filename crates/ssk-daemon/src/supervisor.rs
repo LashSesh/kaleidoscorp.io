@@ -69,6 +69,10 @@ pub struct Supervisor {
     /// Outside `Inner` because its whole purpose is to be readable while
     /// `Inner` is held by an activation dial.
     activations: ActivationsInFlight,
+    /// A clone of the sender inside `Inner.state`. Outside `Inner` because its
+    /// whole purpose is to be usable while `Inner` is held by an activation
+    /// dial; it holds no daemon state, only the bus transitions are published on.
+    events: tokio::sync::broadcast::Sender<ssk_ipc::Event>,
 }
 
 /// How many `ActivateProfile` requests are between "accepted" and "answered",
@@ -390,10 +394,13 @@ impl Supervisor {
         if let Some(error) = &activation_error {
             state.transition(DaemonState::ConfigInvalid, &error.message);
         }
+        // Taken before the state machine moves into the mutex.
+        let events = state.event_sender();
         Self {
             kill_switch,
             activation_deadline: ACTIVATE_DIAL_DEADLINE,
             activations: ActivationsInFlight::default(),
+            events,
             inner: Mutex::new(Inner {
                 state,
                 active_profile: None,
@@ -425,10 +432,13 @@ impl Supervisor {
         self.kill_switch.view()
     }
 
-    /// Subscribe to the daemon's event bus (used both by `subscribe_events`
-    /// IPC requests and by tests).
+    /// Subscribe to the daemon's event bus. The IPC `SubscribeEvents` request
+    /// does not come through here (it answers `Ack`); the callers are tests.
+    ///
+    /// Does not take the supervisor mutex, so it answers during an activation
+    /// dial. It stays `async` so existing callers keep compiling unchanged.
     pub async fn subscribe_events(&self) -> tokio::sync::broadcast::Receiver<ssk_ipc::Event> {
-        self.inner.lock().await.state.subscribe()
+        self.events.subscribe()
     }
 
     pub async fn current_state(&self) -> DaemonState {
