@@ -26,8 +26,9 @@ interface or OS route; it fails closed. See [management controller](OPENVPN_MANA
   be represented as a TCP proxy, executable path, arbitrary arguments or `.ovpn`
   path. Activation reports `FailClosed` with `last_error.code = OPENVPN_NOT_READY`.
   `RunDoctor` also reports configured OpenVPN adapters as unavailable.
-- Config has no automatic direct-fallback action. Selecting an unavailable VPN
-  does not grant permission for a direct connection.
+- Config has no automatic direct-fallback action, and `RouteExecutor::connect`
+  refuses `RouteKind::Fallback` before opening a socket. Selecting an unavailable
+  VPN does not grant permission for a direct connection.
 - A required attestation yields `ATTESTATION_REQUIRED` before any connect. The
   verifier is still pending. Deserialized attestation data is not accepted as proof.
 - The data-plane connect API consumes a token owning its route and target. This

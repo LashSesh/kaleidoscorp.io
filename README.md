@@ -504,7 +504,6 @@ Every traffic decision is BLAKE3 hash-chained into an immutable `AuditLedger`, e
 - **Traffic ingress of any kind.** No proxy listener, no WFP/WinDivert/LSP/TUN hook, no PAC, no proxy-settings writer. `ssk-capture` has no OS capture; its only production `TrafficSource` is a hardcoded CLI fixture. (`ssk winhost capture` does enumerate real live flows via IP Helper, but that is observation, not interception, and it does not feed this layer.)
 - **Byte transfer.** `EgressSession::transport_mut` (`crates/ssk-netcore/src/session.rs:63`) has zero callers, so no application data crosses an established session.
 - **Real flow classification.** The supervisor hardcodes `RiskLevel::Low` / `ProtocolKind::Tcp`, so every non-`Direct` executor path is structurally unreachable in production.
-- **Config-driven routing.** The loaded `AppConfig` is not passed into `Supervisor::new`; the adapter registry is hardcoded.
 - True multi-hop proxy chaining beyond two hops is implemented but lightly exercised.
 - A daemon-level "kill switch" only tears down the one session the daemon holds. The separate OS-level kill-switch (`ssk winhost killswitch`, netsh firewall rules) exists but has never been observed completing an engage→release cycle on any machine, in any locale.
 
