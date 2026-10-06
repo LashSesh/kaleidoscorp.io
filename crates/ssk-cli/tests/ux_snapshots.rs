@@ -194,9 +194,12 @@ fn winhost_doctor_reports_unsupported_off_windows() {
     assert!(stdout.contains("\"platform_supported\": false"));
 }
 
+/// Since the broker split the CLI never drives a firewall itself: off Windows
+/// there is no privileged control plane to command, and the refusal must say
+/// that nothing was actuated rather than fall back to a local effect.
 #[cfg(not(windows))]
 #[test]
-fn winhost_killswitch_engage_requires_windows() {
+fn winhost_killswitch_engage_is_unsupported_off_windows() {
     let temp = tempfile::tempdir().expect("tempdir");
     let output = Command::new(binary())
         .current_dir(temp.path())
@@ -205,12 +208,15 @@ fn winhost_killswitch_engage_requires_windows() {
         .expect("winhost killswitch engage must execute");
     assert_eq!(output.status.code(), Some(21));
     let stderr = String::from_utf8(output.stderr).expect("utf8 stderr");
-    assert!(stderr.contains("requires Windows"));
+    assert!(stderr.contains("no Windows privileged control plane"));
+    assert!(stderr.contains("Nothing was actuated"));
 }
 
+/// Off Windows `release` is refused at the broker boundary, before any receipt
+/// is looked up, so the machine-readable code is `KILLSWITCH_BROKER_UNSUPPORTED`.
 #[cfg(not(windows))]
 #[test]
-fn winhost_killswitch_release_without_a_receipt_errors() {
+fn winhost_killswitch_release_is_unsupported_off_windows() {
     let temp = tempfile::tempdir().expect("tempdir");
     let output = Command::new(binary())
         .current_dir(temp.path())
@@ -227,7 +233,7 @@ fn winhost_killswitch_release_without_a_receipt_errors() {
     assert_eq!(output.status.code(), Some(21));
     // The machine-readable error envelope is written to stderr by emit_error.
     let stderr = String::from_utf8(output.stderr).expect("utf8 stderr");
-    assert!(stderr.contains("KILLSWITCH_NO_RECEIPT"));
+    assert!(stderr.contains("KILLSWITCH_BROKER_UNSUPPORTED"));
 }
 
 #[cfg(not(windows))]
