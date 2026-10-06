@@ -155,9 +155,11 @@ fn next_timeout(subscribed: bool, limits: &ServeLimits) -> Option<Duration> {
 /// daemon stops. That is a known limit, not a fix for exhaustion — a fault that
 /// outlasts the roughly 55 s of sleeping this allows still ends the process.
 ///
-/// Pure (no clock, no I/O, no tokio) so the whole table is unit-testable. No
-/// error classification on purpose: which errno is "transient" differs by OS,
-/// and an unrecognised one would again kill the daemon on its first occurrence.
+/// Pure (no clock, no I/O, no tokio) so the whole table is unit-testable; that
+/// the loop obeys it is pinned separately, through a scripted accept source on
+/// paused time (`unix_transport::tests`). No error classification on purpose:
+/// which errno is "transient" differs by OS, and an unrecognised one would
+/// again kill the daemon on its first occurrence.
 #[derive(Debug, Clone, Default)]
 pub struct AcceptRetry {
     consecutive: u32,
@@ -220,8 +222,29 @@ mod unix_transport {
     };
     use crate::auth::unix::check_peer_same_user;
     use crate::error::IpcError;
+    use std::future::Future;
     use std::sync::Arc;
     use tokio::sync::Semaphore;
+
+    /// Where the accept loop gets its connections: the bound listener in
+    /// production, a scripted source in the tests. A real `accept()` fails only
+    /// under descriptor exhaustion, which is process-wide state that a test
+    /// cannot take without breaking its neighbours, so the loop's handling of
+    /// 59 or 60 consecutive failures is exercised through this seam instead.
+    trait AcceptSource {
+        fn accept(
+            &mut self,
+        ) -> impl Future<Output = std::io::Result<tokio::net::UnixStream>> + Send;
+    }
+
+    impl AcceptSource for tokio::net::UnixListener {
+        async fn accept(&mut self) -> std::io::Result<tokio::net::UnixStream> {
+            // Spelled as a path: `self.accept()` would resolve to this method.
+            tokio::net::UnixListener::accept(self)
+                .await
+                .map(|(stream, _addr)| stream)
+        }
+    }
 
     /// Bind a Unix domain socket at `socket_path` and serve `handler` forever
     /// with [`ServeLimits::default`].
@@ -250,14 +273,26 @@ mod unix_transport {
         }
         let listener = tokio::net::UnixListener::bind(path)
             .map_err(|e| IpcError::new("Runtime", "IPC_BIND_FAILED", e.to_string()))?;
+        serve_accept_loop(listener, handler, limits).await
+    }
+
+    /// Accept connections from `source` and serve them, forever, until
+    /// [`AcceptRetry`] gives up and the last accept error is returned. Split
+    /// from the bind so the tests can drive the loop with a source that fails
+    /// on demand.
+    async fn serve_accept_loop<S: AcceptSource>(
+        mut source: S,
+        handler: Arc<dyn CommandHandler>,
+        limits: ServeLimits,
+    ) -> Result<(), IpcError> {
         let permits = Arc::new(Semaphore::new(limits.max_connections as usize));
         let mut retry = AcceptRetry::new();
 
         loop {
-            let (stream, _addr) = match listener.accept().await {
-                Ok(accepted) => {
+            let stream = match source.accept().await {
+                Ok(stream) => {
                     retry.on_success();
-                    accepted
+                    stream
                 }
                 Err(e) => {
                     // The daemon exits when this function returns, so one
@@ -312,6 +347,242 @@ mod unix_transport {
             let resp = handler.handle(clamp_request_limits(req), &peer).await;
             crate::framing::write_frame(&mut stream, &resp).await?;
             timeout = next_timeout(subscribed, &limits);
+        }
+    }
+
+    /// The accept loop's wiring, driven through a scripted [`AcceptSource`] on
+    /// paused time. `AcceptRetry`'s own table is pinned in `server::tests`; a
+    /// loop that goes back to `accept().await?` leaves that table green, so
+    /// what is pinned here is that the loop actually obeys it.
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use crate::auth::PeerIdentity;
+        use crate::framing::{read_frame, write_frame, MAX_RESPONSE_FRAME_LEN};
+        use crate::server::{BoxFuture, Response};
+        use std::collections::VecDeque;
+        use std::io;
+        use std::sync::Mutex;
+        use std::time::Duration;
+        use tokio::net::UnixStream;
+        use tokio::sync::oneshot;
+        use tokio::time::Instant;
+
+        /// Virtual time a test grants the loop. The longest legitimate run
+        /// (the 60th failure) takes 55.55 s; a loop that never stops, or never
+        /// wakes, is cut off here with a message instead of hanging the suite.
+        const VIRTUAL_DEADLINE: Duration = Duration::from_secs(120);
+
+        /// `AcceptRetry::GIVE_UP_AFTER` as a count of `accept()` calls.
+        const GIVE_UP: usize = AcceptRetry::GIVE_UP_AFTER as usize;
+
+        /// One scripted outcome of `accept()`.
+        enum Step {
+            Fail,
+            Connect(UnixStream),
+        }
+
+        fn failures(n: u32) -> impl Iterator<Item = Step> {
+            (0..n).map(|_| Step::Fail)
+        }
+
+        /// Replays its steps as the outcomes of successive `accept()` calls,
+        /// then waits for ever like a listener nobody connects to.
+        struct Scripted {
+            steps: VecDeque<Step>,
+            /// When each `accept()` was called, on the paused clock.
+            calls: Arc<Mutex<Vec<Instant>>>,
+            /// Fired by the first call after the script has run out.
+            drained: Option<oneshot::Sender<()>>,
+        }
+
+        impl Scripted {
+            fn new(
+                steps: impl IntoIterator<Item = Step>,
+            ) -> (Self, Arc<Mutex<Vec<Instant>>>, oneshot::Receiver<()>) {
+                let calls = Arc::new(Mutex::new(Vec::new()));
+                let (drained, drained_rx) = oneshot::channel();
+                let source = Self {
+                    steps: steps.into_iter().collect(),
+                    calls: Arc::clone(&calls),
+                    drained: Some(drained),
+                };
+                (source, calls, drained_rx)
+            }
+        }
+
+        impl AcceptSource for Scripted {
+            async fn accept(&mut self) -> io::Result<UnixStream> {
+                let call = {
+                    let mut calls = self.calls.lock().expect("calls mutex");
+                    calls.push(Instant::now());
+                    calls.len()
+                };
+                match self.steps.pop_front() {
+                    Some(Step::Fail) => {
+                        Err(io::Error::other(format!("scripted accept failure #{call}")))
+                    }
+                    Some(Step::Connect(stream)) => Ok(stream),
+                    None => {
+                        if let Some(drained) = self.drained.take() {
+                            let _ = drained.send(());
+                        }
+                        std::future::pending().await
+                    }
+                }
+            }
+        }
+
+        /// Answers every request with `Ack`.
+        struct AckHandler;
+
+        impl CommandHandler for AckHandler {
+            fn handle<'a>(
+                &'a self,
+                _req: Request,
+                _peer: &'a PeerIdentity,
+            ) -> BoxFuture<'a, Response> {
+                Box::pin(async { Response::Ack })
+            }
+        }
+
+        fn call_count(calls: &Mutex<Vec<Instant>>) -> usize {
+            calls.lock().expect("calls mutex").len()
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn unix_accept_loop_keeps_serving_after_59_failures() {
+            let (server_end, mut client) = UnixStream::pair().expect("socketpair");
+            let steps = failures(AcceptRetry::GIVE_UP_AFTER - 1)
+                .chain(std::iter::once(Step::Connect(server_end)));
+            let (source, calls, _drained) = Scripted::new(steps);
+            let mut server = tokio::spawn(serve_accept_loop(
+                source,
+                Arc::new(AckHandler),
+                ServeLimits::default(),
+            ));
+
+            // The request is written before the loop has accepted anything and
+            // waits in the socket until the 60th call hands the connection over.
+            let exchange = async {
+                write_frame(&mut client, &Request::GetStatus).await?;
+                read_frame::<Response, _>(&mut client, MAX_RESPONSE_FRAME_LEN).await
+            };
+            let answer = tokio::time::timeout(VIRTUAL_DEADLINE, async {
+                // Biased, so that a loop that has already returned is reported
+                // as that and not as the broken connection it leaves behind.
+                tokio::select! {
+                    biased;
+                    ended = &mut server => {
+                        panic!("the accept loop returned instead of backing off: {ended:?}")
+                    }
+                    answer = exchange => answer.expect("the request was not answered"),
+                }
+            })
+            .await
+            .expect("the connection was never served");
+            assert!(matches!(answer, Response::Ack), "unexpected {answer:?}");
+
+            assert!(!server.is_finished(), "the loop must keep serving");
+            assert_eq!(
+                call_count(&calls),
+                GIVE_UP + 1,
+                "59 failures, the connection, then waiting for the next one"
+            );
+            server.abort();
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn unix_accept_loop_returns_ipc_accept_failed_on_the_60th() {
+            let (source, calls, _drained) = Scripted::new(failures(AcceptRetry::GIVE_UP_AFTER));
+            let started = Instant::now();
+            let outcome = tokio::time::timeout(
+                VIRTUAL_DEADLINE,
+                serve_accept_loop(source, Arc::new(AckHandler), ServeLimits::default()),
+            )
+            .await
+            .expect("the loop never gave up");
+
+            let err = outcome.expect_err("the 60th consecutive failure ends the loop");
+            assert_eq!(err.code, "IPC_ACCEPT_FAILED");
+            assert_eq!(err.class, "Runtime");
+            assert_eq!(
+                err.message, "scripted accept failure #60",
+                "the error returned is the last one, not the first"
+            );
+            assert_eq!(
+                call_count(&calls),
+                GIVE_UP,
+                "no 61st accept after giving up"
+            );
+            // 59 sleeps (50+100+200+400+800 ms, then 54 x 1 s) and none after
+            // the 60th error: the same 55.55 s the pure helper's test pins.
+            assert_eq!(
+                started.elapsed(),
+                Duration::from_millis(1550 + 54 * 1000),
+                "the loop sleeps between failures and not after the last"
+            );
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn delays_follow_accept_retry() {
+            // `true` is a failed accept. The success in the middle must send the
+            // back-off back to its 50 ms floor.
+            let outcomes = [
+                true, true, true, true, true, true, true, false, true, true, true,
+            ];
+            let steps = outcomes.iter().map(|&failed| {
+                if failed {
+                    Step::Fail
+                } else {
+                    // The peer end is dropped at once: the connection ends in
+                    // end-of-file and the loop is straight back to accept().
+                    let (server_end, client) = UnixStream::pair().expect("socketpair");
+                    drop(client);
+                    Step::Connect(server_end)
+                }
+            });
+            let (source, calls, drained) = Scripted::new(steps);
+            let mut server = tokio::spawn(serve_accept_loop(
+                source,
+                Arc::new(AckHandler),
+                ServeLimits::default(),
+            ));
+            tokio::time::timeout(VIRTUAL_DEADLINE, async {
+                tokio::select! {
+                    biased;
+                    ended = &mut server => {
+                        panic!("the accept loop returned instead of backing off: {ended:?}")
+                    }
+                    signal = drained => signal.expect("the source outlives the script"),
+                }
+            })
+            .await
+            .expect("the script was never used up");
+            assert!(!server.is_finished(), "the loop must keep serving");
+            server.abort();
+
+            // What a fresh `AcceptRetry` prescribes for the same outcomes: the
+            // gap before the next call is its delay after a failure and nothing
+            // after a success.
+            let mut model = AcceptRetry::new();
+            let want: Vec<Duration> = outcomes
+                .iter()
+                .map(|&failed| {
+                    if failed {
+                        model.on_error().expect("far below the give-up count")
+                    } else {
+                        model.on_success();
+                        Duration::ZERO
+                    }
+                })
+                .collect();
+            let times = calls.lock().expect("calls mutex").clone();
+            let got: Vec<Duration> = times
+                .windows(2)
+                .map(|w| w[1].duration_since(w[0]))
+                .collect();
+            assert_eq!(got, want);
         }
     }
 }
