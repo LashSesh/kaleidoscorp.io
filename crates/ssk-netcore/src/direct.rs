@@ -118,14 +118,23 @@ mod tests {
         accept.await.expect("join");
     }
 
+    /// Far above how long any OS takes to answer a loopback connect; see the test.
+    const RESOLVER_POOL_PROBE_TIMEOUT: Duration = Duration::from_secs(20);
+
     #[test]
     fn ipv6_literal_dial_does_not_wait_for_the_resolver_pool() {
         // With the only blocking thread occupied, a dial that needs the
         // blocking resolver pool (`getaddrinfo`) cannot even start and burns
-        // its whole timeout. A literal needs no lookup, so it must reach the
+        // its WHOLE timeout. A literal needs no lookup, so it must reach the
         // socket layer at once. What the socket layer then says depends on
         // the host (connected, refused, or IPv6 unsupported); only "stuck
         // behind the resolver" is wrong, so that is all this asserts.
+        //
+        // The timeout is deliberately far above any socket-layer answer: Windows
+        // reports a refused connect to a closed loopback port only after its SYN
+        // retransmissions (about 2 s), so a short timeout would also fire for a
+        // dial that is NOT stuck behind the resolver and the test could not tell
+        // the two apart. Only a dial that really waits on the pool uses all of it.
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .max_blocking_threads(1)
@@ -141,8 +150,12 @@ mod tests {
             started_rx
                 .recv_timeout(Duration::from_secs(5))
                 .expect("the blocking pool thread must start");
-            for host in ["::1", "[::1]"] {
-                let result = connect_tcp(host, 9, Duration::from_millis(500)).await;
+            // Concurrent, so a slow refusal costs the test one wait, not two.
+            let (bare, bracketed) = tokio::join!(
+                connect_tcp("::1", 9, RESOLVER_POOL_PROBE_TIMEOUT),
+                connect_tcp("[::1]", 9, RESOLVER_POOL_PROBE_TIMEOUT),
+            );
+            for (host, result) in [("::1", bare), ("[::1]", bracketed)] {
                 assert!(
                     !matches!(result, Err(NetcoreError::Timeout(..))),
                     "dialing the literal {host:?} waited on the resolver pool"
