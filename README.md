@@ -567,13 +567,14 @@ Common incident scenarios and recovery steps are in [`docs/RUNBOOK.md`](docs/RUN
 | Job | What it checks |
 |-----|---------------|
 | `fmt_lint` | `cargo fmt` + `cargo clippy -D warnings` |
-| `build_test` | `cargo build` + `cargo test` workspace-wide |
+| `build_test` | `cargo build` + `cargo test` workspace-wide; the Linux leg sets `SSK_REQUIRE_IPV6=1`, so a runner without `::1` fails the IPv6 dial test instead of skipping it |
 | `proptest_smoke` | Property tests at `PROPTEST_CASES=32` |
 | `replay_vectors` | Deterministic replay integration tests |
 | `interop_contracts` | Interop golden, negative, and fuzz tests |
 | `conformance_suite` | 7-profile interop conformance suite |
-| `config_schema_guard` | Schema snapshot stability + schema export |
-| `breaking_change_guard` | Contract-surface change detection on PRs |
+| `config_schema_guard` | All `ssk-config` tests (schema snapshot stability included, no name filter) + schema export |
+| `breaking_change_guard` | Fails a push or pull request that changes a contract surface (`scripts/ci/contract_surfaces.txt`) without a `docs/COMPATIBILITY_MATRIX.md` entry or a `Compat-Impact: none (<reason>)` commit trailer |
+| `contract_guard_selftest` | `scripts/ci/tests/contract_guard.test.sh`: the guard's logic against throw-away repositories, on every push and pull request |
 | `netadmin_contracts` | Network administration layer contracts |
 | `chaos_drills` | Full fault-injection playbook via `ssk-faultscan` |
 | `no_std_core` | `ssk-types` + `ssk-core` no-default-features check |
@@ -607,8 +608,8 @@ Two caveats, so the badge is not over-read:
    [`docs/WINDOWS_PRODUCT_ROADMAP.md`](docs/WINDOWS_PRODUCT_ROADMAP.md) §5.2. A red result there is
    the answer being asked for, not a badge problem.
 2. `replay_vectors`, `interop_contracts`, `conformance_suite`, `netadmin_contracts`, `chaos_drills`,
-   `no_std_core`, `cargo_audit`, `cargo_deny` and `breaking_change_guard` still run on
-   `ubuntu-latest` only.
+   `no_std_core`, `cargo_audit`, `cargo_deny`, `breaking_change_guard` and `contract_guard_selftest`
+   still run on `ubuntu-latest` only.
 
 `.github/workflows/ci.yml` is authoritative for what actually runs.
 

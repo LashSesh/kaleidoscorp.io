@@ -86,7 +86,14 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       - run: cargo build --locked --workspace --all-targets
+      # `SSK_REQUIRE_IPV6=1` turns "this host has no `::1`" from a printed
+      # `SKIPPED:` into a failure, so the IPv6 literal dial cannot go unexercised
+      # unnoticed. It is set on the step because the `runner` context is not
+      # available in job-level `env:`. Whether the ubuntu runner has `::1` is
+      # UNVERIFIED: a red Linux leg here means "decide", not "ignore".
       - run: cargo test --locked --no-fail-fast --workspace
+        env:
+          SSK_REQUIRE_IPV6: ${{ runner.os == 'Linux' && '1' || '0' }}
       - name: Check read-only VM host assessment with synthetic facts
         if: runner.os == 'Windows'
         shell: pwsh
@@ -146,7 +153,9 @@ jobs:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-      - run: cargo test --locked --no-fail-fast -p ssk-config schema_snapshot_stable
+      # No test-name filter: `cargo test <filter>` that matches nothing exits 0,
+      # so renaming the snapshot test would have turned this step into a no-op.
+      - run: cargo test --locked --no-fail-fast -p ssk-config
       - name: Export config schema and assert it is non-empty
         shell: bash
         run: |
@@ -154,18 +163,58 @@ jobs:
           test -s ssk-config-schema.json
           rm -f ssk-config-schema.json
 
+  # Fails a push or pull request that changes a contract surface
+  # (scripts/ci/contract_surfaces.txt) without a docs/COMPATIBILITY_MATRIX.md
+  # change or a `Compat-Impact: none (<reason>)` commit message line in the same
+  # range. It has no `if:` on purpose: a job that is skipped on `push` is read as
+  # success by `ci_gate`, so a direct push would never have been checked.
+  #
+  # `fetch-depth: 0` is required: `actions/checkout`'s default depth of 1 has no
+  # merge base. The old step then ran `git diff ... | tee`, whose status is tee's
+  # (GitHub's documented default shell, `bash -e`, has no pipefail), so git's exit
+  # 128 was swallowed and the step stayed green.
+  #
+  # UNVERIFIED until a pull request has run it (design 21.3): the checkout depth,
+  # the `github.event.*` fields below and the shell flags. Only the script's logic
+  # is exercised, by `contract_guard_selftest`.
   breaking_change_guard:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
-    if: github.event_name == 'pull_request'
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-      - name: Guard interop and config contract surfaces
+        with:
+          fetch-depth: 0
+      - name: Contract surfaces need a compatibility note
+        shell: bash
+        env:
+          EVENT: ${{ github.event_name }}
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD: ${{ github.event.pull_request.head.sha }}
+          PUSH_BEFORE: ${{ github.event.before }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
         run: |
-          git diff --name-only origin/${{ github.base_ref }}...HEAD | tee /tmp/changed_files.txt
-          if grep -Eq '^crates/ssk-interop/src/lib.rs|^crates/ssk-config/src/lib.rs|^docs/INTEROP_SPEC.md|^docs/COMPATIBILITY_MATRIX.md' /tmp/changed_files.txt; then
-            echo "Contract surface changed; ensure compatibility docs/tests are updated."
+          set -euo pipefail
+          if [ "$EVENT" = "pull_request" ]; then
+            base="$PR_BASE"; head="$PR_HEAD"
+          else
+            head="$GITHUB_SHA"; base="$PUSH_BEFORE"
+            # A new branch (all-zero `before`) or a force push (the old tip is gone):
+            # check everything the branch has beyond the default branch.
+            if ! git cat-file -e "${base}^{commit}" 2>/dev/null; then
+              base="$(git merge-base "origin/${DEFAULT_BRANCH}" "$head")"
+            fi
           fi
+          echo "contract guard: base=$base head=$head"
+          sh scripts/ci/contract_guard.sh "$base" "$head"
+
+  # The guard's logic against throw-away repositories. Runs on every push and
+  # pull request, so it is exercised even when no pull request exists.
+  contract_guard_selftest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - run: sh scripts/ci/tests/contract_guard.test.sh
 
   no_std_core:
     runs-on: ubuntu-latest
@@ -280,13 +329,14 @@ jobs:
       - run: cargo test --locked --no-fail-fast -p ${{ matrix.crate }}
 
   # One check name to require in branch protection. `needs` + `if: always()` makes
-  # it fail when ANY job failed or was cancelled, and a skipped job (for example
-  # breaking_change_guard on push events) does not count as a failure. Without
+  # it fail when ANY job failed or was cancelled, and a skipped job does not
+  # count as a failure (so no gated job may carry an `if:` that skips it on push
+  # or pull_request: it would then be read as green). Without
   # one aggregate check, a red job that nobody marked "required" is easy to miss:
   # the CI run on main for the 2026-10-04 merge had 9 of 25 jobs red.
   ci_gate:
     if: always()
-    needs: [desktop_ui, desktop_host, fmt_lint, build_test, proptest_smoke, replay_vectors, interop_contracts, config_schema_guard, breaking_change_guard, no_std_core, netadmin_contracts, conformance_suite, chaos_drills, cargo_audit, cargo_deny, windows_backends, windows_crate_gates]
+    needs: [desktop_ui, desktop_host, fmt_lint, build_test, proptest_smoke, replay_vectors, interop_contracts, config_schema_guard, breaking_change_guard, contract_guard_selftest, no_std_core, netadmin_contracts, conformance_suite, chaos_drills, cargo_audit, cargo_deny, windows_backends, windows_crate_gates]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:

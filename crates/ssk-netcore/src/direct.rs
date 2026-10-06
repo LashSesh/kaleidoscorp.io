@@ -83,17 +83,51 @@ mod tests {
         ));
     }
 
+    /// What a test does when this host cannot bind `[::1]`: print why and let
+    /// the caller skip, so IPv4-only machines can still run the suite. CI sets
+    /// `SSK_REQUIRE_IPV6=1` (exactly) on a runner that must have IPv6, and a
+    /// skip there would hide that the IPv6 dial was never exercised.
+    fn ipv6_loopback_unavailable(require: Option<&str>, err: &std::io::Error) {
+        assert!(
+            require != Some("1"),
+            "SSK_REQUIRE_IPV6=1 but this host cannot bind [::1] ({err}); the IPv6 dial cannot be exercised here"
+        );
+        eprintln!("SKIPPED: this host cannot bind [::1] ({err}); the IPv6 dial was not exercised");
+    }
+
     /// `None` (with the reason printed) when this host has no IPv6 loopback,
     /// so the test skips instead of failing on IPv4-only runners.
     async fn bind_ipv6_loopback() -> Option<TcpListener> {
         match TcpListener::bind("[::1]:0").await {
             Ok(listener) => Some(listener),
             Err(err) => {
-                eprintln!(
-                    "SKIPPED: this host cannot bind [::1] ({err}); the IPv6 dial was not exercised"
-                );
+                ipv6_loopback_unavailable(std::env::var("SSK_REQUIRE_IPV6").ok().as_deref(), &err);
                 None
             }
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "SSK_REQUIRE_IPV6=1")]
+    fn a_missing_ipv6_loopback_fails_when_ci_requires_it() {
+        let err = std::io::Error::from(std::io::ErrorKind::Unsupported);
+        ipv6_loopback_unavailable(Some("1"), &err);
+    }
+
+    #[test]
+    fn a_missing_ipv6_loopback_is_a_skip_unless_the_value_is_exactly_one() {
+        // `0` is what the Windows leg sets; the others are near misses that must
+        // not turn a skip into a failure by accident.
+        let err = std::io::Error::from(std::io::ErrorKind::Unsupported);
+        for value in [
+            None,
+            Some(""),
+            Some("0"),
+            Some("true"),
+            Some("11"),
+            Some(" 1"),
+        ] {
+            ipv6_loopback_unavailable(value, &err);
         }
     }
 
