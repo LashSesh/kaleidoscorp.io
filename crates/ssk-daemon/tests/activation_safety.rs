@@ -702,7 +702,7 @@ struct SilentDial {
     supervisor: std::sync::Arc<ssk_daemon::supervisor::Supervisor>,
     view: std::sync::Arc<std::sync::Mutex<ssk_daemon::killswitch::KillSwitchView>>,
     accepted: tokio::sync::mpsc::UnboundedReceiver<tokio::net::TcpStream>,
-    _state: tempfile::TempDir,
+    state: tempfile::TempDir,
 }
 
 async fn silent_dial() -> SilentDial {
@@ -759,7 +759,7 @@ async fn silent_dial() -> SilentDial {
         supervisor: std::sync::Arc::new(supervisor),
         view,
         accepted,
-        _state: state,
+        state,
     }
 }
 
@@ -956,5 +956,158 @@ async fn activating_is_observable() {
         settled.state,
         DaemonState::FailClosed,
         "Activating must not be the last word once the dial has ended"
+    );
+}
+
+/// The `ActivateProfile` future is dropped while it holds the mutex across its
+/// dial: the task serving a client that went away is aborted, the runtime is
+/// shutting down, or a caller's own timeout fired. Nothing after the dial's
+/// `await` runs then, so the `Activating` state stayed for ever with no session
+/// behind it and nothing that resets it, and the ledger kept a lone
+/// `DispatchPending` that never got its result.
+#[tokio::test]
+async fn a_cancelled_activation_settles_fail_closed_and_records_it() {
+    use ssk_netadmin::audit::AuditOutcome;
+    use tokio::io::AsyncReadExt;
+
+    let mut dial = silent_dial().await;
+    let mut events = dial.supervisor.subscribe_events().await;
+    let (activation, mut held) = start_silent_activation(&mut dial).await;
+
+    activation.abort();
+    assert!(activation.await.expect_err("aborted").is_cancelled());
+
+    let status = status_within_a_second(&dial.supervisor).await;
+    assert_eq!(
+        status.state,
+        DaemonState::FailClosed,
+        "a cancelled activation must not leave Activating (or Protected) behind"
+    );
+    let error = status
+        .last_error
+        .expect("the interruption must be reported");
+    assert_eq!(error.code, "ACTIVATION_CANCELLED");
+    assert!(status.active_profile.is_none());
+    assert!(status.adapters.is_empty());
+    assert!(!status.dns_protected);
+
+    // The dial was dropped with the future: the half-built tunnel is closed
+    // and the proxy only ever saw the client's greeting before EOF.
+    let mut buffer = [0; 16];
+    let closed = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            match held.read(&mut buffer).await {
+                Ok(0) => return true,
+                Ok(_) => {}
+                Err(error) => return error.kind() == std::io::ErrorKind::ConnectionReset,
+            }
+        }
+    })
+    .await
+    .expect("a cancelled dial must be closed");
+    assert!(closed);
+
+    // The same durable pair every other failed dial leaves, for the same flow.
+    let ledger = ssk_netadmin::audit::AuditLedger::persisted(dial.state.path().join("audit.json"));
+    ledger.verify().expect("durable valid chain");
+    let entries = ledger.entries().expect("entries");
+    assert_eq!(entries.len(), 2);
+    assert_eq!(entries[0].outcome, AuditOutcome::DispatchPending);
+    assert_eq!(entries[1].outcome, AuditOutcome::FailClosed);
+    assert_eq!(entries[0].flow_id, entries[1].flow_id);
+    assert_eq!(
+        status.audit_head.as_deref(),
+        Some(entries[1].entry_hash.as_str())
+    );
+
+    let mut states = Vec::new();
+    while let Ok(event) = events.try_recv() {
+        if let ssk_ipc::Event::StateChanged { to, .. } = event {
+            states.push(to);
+        }
+    }
+    assert_eq!(states, [DaemonState::Activating, DaemonState::FailClosed]);
+}
+
+/// The data plane is real up to the moment it is asked to dial: the handler
+/// panics while it holds `Inner` and the dial is pending. `Inner` sits behind
+/// an async mutex that does not poison, so the next request gets the state the
+/// panic left.
+struct PanicsMidDial(ssk_netcore::NetcoreDataPlane);
+
+impl ssk_netcore::DataPlane for PanicsMidDial {
+    fn probe_route<'a>(
+        &'a self,
+        route: &'a ssk_netadmin::RouteKind,
+        target: (&'a str, u16),
+    ) -> ssk_netcore::BoxFuture<'a, ssk_netcore::ProbeReport> {
+        self.0.probe_route(route, target)
+    }
+
+    fn connect_route<'a>(
+        &'a self,
+        _admission: ssk_netadmin::admission::AdmissionToken,
+    ) -> ssk_netcore::BoxFuture<'a, Result<ssk_netcore::EgressSession, ssk_netcore::NetcoreError>>
+    {
+        Box::pin(async move { panic!("injected: the data plane failed mid-dial") })
+    }
+}
+
+#[tokio::test]
+async fn a_panicking_activation_settles_fail_closed() {
+    use ssk_ipc::CommandHandler;
+
+    let dir = tempfile::tempdir().expect("state directory");
+    let path = dir.path().join("audit.json");
+    let data_plane = PanicsMidDial(ssk_netcore::NetcoreDataPlane::new(std::sync::Arc::new(
+        ssk_netcore::RouteExecutor::new(ssk_netcore::AdapterRegistry::new()),
+    )));
+    let supervisor = std::sync::Arc::new(ssk_daemon::supervisor::Supervisor::new(
+        path.clone(),
+        Box::new(data_plane),
+        Box::new(ssk_daemon::killswitch::NoProvider),
+        Ok(loopback_config()),
+    ));
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("listener");
+
+    // Spawned, as the IPC server spawns a task per connection: the panic ends
+    // that task and nothing else.
+    let activation = {
+        let supervisor = std::sync::Arc::clone(&supervisor);
+        let request = activate(&listener);
+        tokio::spawn(async move { supervisor.handle(request, &test_peer()).await })
+    };
+    let panic = tokio::time::timeout(Duration::from_secs(5), activation)
+        .await
+        .expect("the panicking activation must end")
+        .expect_err("the handler panicked");
+    assert!(panic.is_panic());
+
+    let status = status_within_a_second(&supervisor).await;
+    assert_eq!(
+        status.state,
+        DaemonState::FailClosed,
+        "a panicking activation must not leave Activating (or Protected) behind"
+    );
+    assert_eq!(
+        status
+            .last_error
+            .expect("the failure must be reported")
+            .code,
+        "ACTIVATION_CANCELLED"
+    );
+    assert!(status.active_profile.is_none());
+    assert!(status.adapters.is_empty());
+    assert!(!status.dns_protected);
+    assert_no_connection(&listener).await;
+
+    // The intent is still on record and the chain was not damaged by the
+    // unwinding.
+    let ledger = ssk_netadmin::audit::AuditLedger::persisted(&path);
+    ledger.verify().expect("durable valid chain");
+    let entries = ledger.entries().expect("entries");
+    assert_eq!(
+        entries[0].outcome,
+        ssk_netadmin::audit::AuditOutcome::DispatchPending
     );
 }

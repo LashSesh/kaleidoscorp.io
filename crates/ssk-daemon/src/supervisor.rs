@@ -15,7 +15,7 @@ use ssk_netadmin::audit::AuditOutcome;
 use ssk_netadmin::{FlowDescriptor, FlowRecord, ForensicEntry, ProtocolKind, RiskLevel, RouteKind};
 use ssk_netcore::{DataPlane, EgressSession};
 use ssk_tensor::GenericFileLedgerBackend;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, MutexGuard};
 
 use crate::config_load::DaemonConfigError;
 use crate::killswitch::{KillSwitchProvider, KillSwitchView};
@@ -35,6 +35,12 @@ const ACTIVATE_DIAL_DEADLINE: Duration = Duration::from_secs(20);
 
 /// Machine code for a dial that outlived [`ACTIVATE_DIAL_DEADLINE`].
 const ACTIVATION_CONNECT_TIMEOUT: &str = "ACTIVATION_CONNECT_TIMEOUT";
+
+/// Machine code for an activation whose request ended while it was dialing: its
+/// future was dropped (the client went away, a caller's timeout, shutdown) or
+/// its handler panicked. The requester is gone by then, so clients read it from
+/// `GetStatus` and the warning event, never as a reply.
+const ACTIVATION_CANCELLED: &str = "ACTIVATION_CANCELLED";
 
 /// How long `GetStatus` waits for the supervisor mutex before it asks whether
 /// an activation is the reason. The desktop client gives up on a status read
@@ -119,6 +125,13 @@ struct Inner {
     /// Set from the real session's adapter chain at activation time; never
     /// hardcoded `true`.
     dns_protected: bool,
+    /// The flow and route of an activation whose `DispatchPending` intent is in
+    /// the ledger and whose result is not: set when `record_activation` writes
+    /// the intent, cleared by any other outcome it writes and by
+    /// `refuse_activation` (that activation is over, even when its result could
+    /// not be written). It names the entry an abandoned activation still owes a
+    /// result to, and never one of an earlier activation.
+    pending_activation: Option<(String, RouteKind)>,
 }
 
 impl Inner {
@@ -132,6 +145,7 @@ impl Inner {
 
     fn refuse_activation(&mut self, error: IpcError) -> Response {
         self.clear_egress();
+        self.pending_activation = None;
         let state = if self.config.is_err() {
             DaemonState::ConfigInvalid
         } else {
@@ -185,7 +199,42 @@ impl Inner {
             seq,
             entry_hash: entry.entry_hash,
         });
+        self.pending_activation = match outcome {
+            AuditOutcome::DispatchPending => Some((flow_id.to_string(), route.clone())),
+            _ => None,
+        };
         Ok(())
+    }
+
+    /// Settle an activation whose request ended while the daemon was in
+    /// `Activating`: the future was dropped at the dial (the only `await` after
+    /// the transition) or the handler panicked. Both leave `Inner` behind with
+    /// no session and a state nothing else would ever reset, so the daemon ends
+    /// fail-closed and, when it can, gives the pending intent its result.
+    fn settle_abandoned_activation(&mut self) {
+        let pending = self.pending_activation.take();
+        // A panic that unwinds out of this drop while the thread is already
+        // unwinding aborts the whole process, and the ledger write is file IO
+        // and a chain walk. The state still settles; the intent then stays
+        // without a result, as it would after a crash.
+        if !std::thread::panicking() {
+            if let Some((flow_id, route)) = pending {
+                if let Err(error) =
+                    self.record_activation(&flow_id, &route, AuditOutcome::FailClosed)
+                {
+                    tracing::error!(
+                        code = %error.code,
+                        error = %error,
+                        "abandoned activation could not be given a result in the ledger"
+                    );
+                }
+            }
+        }
+        self.refuse_activation(IpcError::new(
+            "Runtime",
+            ACTIVATION_CANCELLED,
+            "the activation was interrupted before it completed; no session is held",
+        ));
     }
 
     fn status(&mut self, view: KillSwitchView) -> StatusDto {
@@ -225,6 +274,37 @@ impl Inner {
             audit_head,
             version: env!("CARGO_PKG_VERSION").to_string(),
             last_error,
+        }
+    }
+}
+
+/// The supervisor lock as an `ActivateProfile` request holds it. Dropping the
+/// request's future or unwinding through it must not leave the daemon in
+/// `Activating`: the state is entered under this lock and every normal way out
+/// of the request has left it, so finding it still there when the lock is
+/// released means the request was abandoned. Checking the state, and not a flag
+/// that each exit has to remember to clear, is what keeps a new early return
+/// from forgetting it.
+struct ActivationScope<'a>(MutexGuard<'a, Inner>);
+
+impl std::ops::Deref for ActivationScope<'_> {
+    type Target = Inner;
+
+    fn deref(&self) -> &Inner {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for ActivationScope<'_> {
+    fn deref_mut(&mut self) -> &mut Inner {
+        &mut self.0
+    }
+}
+
+impl Drop for ActivationScope<'_> {
+    fn drop(&mut self) {
+        if self.0.state.current() == DaemonState::Activating {
+            self.0.settle_abandoned_activation();
         }
     }
 }
@@ -324,6 +404,7 @@ impl Supervisor {
                 data_plane,
                 active_egress: None,
                 dns_protected: false,
+                pending_activation: None,
             }),
         }
     }
@@ -592,9 +673,11 @@ impl CommandHandler for Supervisor {
                     // read that cannot get `Inner` knows why. Declared before
                     // `inner` so it is released after the mutex is: a reader
                     // must never find the mutex still held by this activation
-                    // with the marker already gone.
+                    // with the marker already gone. The scope settles an
+                    // abandoned activation while it still holds the mutex, so
+                    // that too is finished before the marker goes.
                     let _in_flight = self.activations.enter();
-                    let mut inner = self.inner.lock().await;
+                    let mut inner = ActivationScope(self.inner.lock().await);
                     if let Err(error) = &inner.config {
                         let error = error.clone();
                         return inner.refuse_activation(error);
@@ -1040,6 +1123,14 @@ fn explain_code(code: &str) -> ExplainResponse {
             "The daemon refuses activation instead of reusing an audit identifier.",
             vec!["Preserve and archive the ledger using an approved retention procedure before recovery."],
         ),
+        ACTIVATION_CANCELLED => (
+            "The activation was interrupted before it completed.",
+            "The request that was dialing the route ended before the dial did: its caller went away, the daemon was shutting down, or the handler failed unexpectedly. The attempt was dropped, no session is held and the daemon is fail-closed. An attempt that was cancelled leaves a fail-closed result after its pending intent in the audit ledger; after an unexpected failure of the handler the intent stays without a result.",
+            vec![
+                "Check the daemon log for the cause.",
+                "Activate again once the daemon is running normally.",
+            ],
+        ),
         ACTIVATION_CONNECT_TIMEOUT => (
             "The activation connection did not complete in time.",
             "The route's upstream accepted or stalled the connection but did not finish its handshake before the daemon's activation deadline. The attempt was closed, the daemon is fail-closed, and no direct connection was made instead.",
@@ -1198,6 +1289,16 @@ mod tests {
     #[tokio::test]
     async fn the_unknown_code_is_explainable() {
         let explained = explain_code(crate::killswitch::KILL_SWITCH_STATUS_UNKNOWN);
+        assert!(
+            !explained.summary.starts_with("Unknown error code"),
+            "a code the daemon emits must have an explanation registered: {explained:?}"
+        );
+        assert!(!explained.next_steps.is_empty());
+    }
+
+    #[tokio::test]
+    async fn the_activation_cancelled_code_is_explainable() {
+        let explained = explain_code(ACTIVATION_CANCELLED);
         assert!(
             !explained.summary.starts_with("Unknown error code"),
             "a code the daemon emits must have an explanation registered: {explained:?}"
@@ -1738,6 +1839,38 @@ mod tests {
             .find(|c| c.name == "paths")
             .expect("a paths check must exist");
         assert!(paths.detail.contains("state directory"), "{}", paths.detail);
+    }
+
+    /// The intent an abandoned activation still owes a result to must be the
+    /// unfinished one and nothing older: a written result, a refusal and a new
+    /// intent each replace it.
+    #[tokio::test]
+    async fn the_pending_activation_names_only_the_unfinished_intent() {
+        let (sup, _dir) = supervisor_with(real_data_plane());
+        let mut inner = sup.inner.lock().await;
+        let route = RouteKind::Direct;
+        assert!(inner.pending_activation.is_none());
+
+        inner
+            .record_activation("flow-1", &route, AuditOutcome::DispatchPending)
+            .expect("intent");
+        assert_eq!(
+            inner.pending_activation,
+            Some(("flow-1".to_string(), route.clone()))
+        );
+        inner
+            .record_activation("flow-1", &route, AuditOutcome::FailClosed)
+            .expect("result");
+        assert!(inner.pending_activation.is_none(), "the result ends it");
+
+        inner
+            .record_activation("flow-2", &route, AuditOutcome::DispatchPending)
+            .expect("intent");
+        inner.refuse_activation(IpcError::new("Integrity", "LEDGER_IO_FAILED", "disk full"));
+        assert!(
+            inner.pending_activation.is_none(),
+            "a refusal ends the activation even when its result was never written"
+        );
     }
 
     /// A marker that outlived its request would answer `Activating` for ever,
