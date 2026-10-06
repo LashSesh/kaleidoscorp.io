@@ -131,8 +131,11 @@ decodes it; what is new is that a status read can return it, for up to 20 s, whe
 used to block. Clients must show it as in progress, never as protected, and must not
 read the empty fields as a statement about the previous session or the ledger: an
 absent `audit_head` means not read. Every other request that needs the state lock
-(`Deactivate`, `ListProfiles`, `TraceRoute`, `GetAuditEntries`, `VerifyAuditChain`,
-`RunDoctor`, event subscription) still waits behind the dial. The adapter health
+(a second `ActivateProfile`, `Deactivate`, `ListProfiles`, `TraceRoute`,
+`GetAuditEntries`, `VerifyAuditChain`, `RunDoctor`) still waits behind the dial.
+`InspectFlow`, `ListRecentFlows`, `ExplainError` and `SubscribeEvents` never take that
+lock and answer at once. `SubscribeEvents` only answers `Ack`: the server writes one
+`Response` per `Request` and no IPC client receives events yet. The adapter health
 text of a held session changed from `live (real, connected)` to `connected at
 activation; liveness not monitored`; it is free text, nothing in this repository
 parses it, and consumers must not.

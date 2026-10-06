@@ -341,7 +341,7 @@ ssk [--json] <command>
 | `status` | Query the real daemon (`sskd`) state over its IPC endpoint — Unix domain socket on Unix, named pipe on Windows |
 | `activate --profile <p> --dest <host:port>` | Ask `sskd` to really connect to `host:port` via the policy-decided route; `Protected` only on real success. The connection is opened and held; no application bytes are written through it |
 | `deactivate` | Really tear down the live egress session and return to `Inactive` |
-| `list-profiles` | List profiles known to the daemon (currently one reference profile; a config-driven multi-profile model is future work) |
+| `list-profiles` | List the profiles of the daemon's validated startup configuration (without `SSK_CONFIG_PATH`: only the implicit `default` profile, which has no rules and denies everything) |
 | `system run` | Run the `ssk-system` Crown pipeline over a deterministic fixture and print the fail-closed verdict |
 | `winhost capture` | Enumerate real active TCP/UDP flows via IP Helper (Windows; works unelevated) |
 | `winhost killswitch engage` / `release` | Sever / restore outbound egress via `netsh` and persist a rollback receipt (Windows, Administrator) |
