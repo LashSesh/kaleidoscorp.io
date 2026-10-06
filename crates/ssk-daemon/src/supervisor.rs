@@ -1534,6 +1534,31 @@ mod tests {
         );
     }
 
+    /// `127.1` is 127.0.0.1 to the OS resolver but a name to a label grammar.
+    /// The activation destination obeys the same host grammar as the
+    /// configuration, so it is refused up front: nothing is recorded or dialled.
+    #[tokio::test]
+    async fn activate_refuses_a_numeric_alias_destination_before_any_dial() {
+        let (sup, _dir) = supervisor_with(real_data_plane());
+        let before = audit_entry_count(&sup).await;
+        for host in ["127.1", "0x7f.0.0.1", "2130706433"] {
+            let resp = call(
+                &sup,
+                Request::ActivateProfile(ssk_ipc::ActivateProfileRequest {
+                    profile_id: "default".into(),
+                    dest_host: Some(host.into()),
+                    dest_port: Some(80),
+                }),
+            )
+            .await;
+            match resp {
+                Response::Err(err) => assert_eq!(err.code, "DEST_INVALID", "{host}"),
+                other => panic!("{host} must be refused as invalid, got: {other:?}"),
+            }
+        }
+        assert_eq!(audit_entry_count(&sup).await, before);
+    }
+
     #[tokio::test]
     async fn deactivate_requires_kill_switch_release_when_fail_closed() {
         let (sup, _dir) = supervisor_with(real_data_plane());

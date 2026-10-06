@@ -92,10 +92,11 @@ rule id recorded for it changes with that. To address a literal use `dest_host` 
 its canonical spelling: it compares literals by parsed address only, so `::1` does
 not equal `[::1]` and `127.1` does not equal `127.0.0.1`. Label-boundary matching of
 real names (case, leading and trailing dots, `10.0.0.1.nip.io`, punycode top-level
-labels) is unchanged. Configuration validation still accepts a `domain_suffix` whose
-last label starts with a digit, such as `0.1`, unless it parses as an IP address,
-but such a rule can no longer match any host: a deny rule written that way never
-fires. No wire or ledger format changed.
+labels) is unchanged. Configuration validation used to accept a `domain_suffix` whose
+last label starts with a digit, such as `0.1`, unless it parsed as an IP address,
+although such a rule can no longer match any host: a deny rule written that way never
+fires. It refuses such a suffix now, see "Host grammar in routing configuration". No
+wire or ledger format changed.
 
 ## IPC accept loop (2026-10-06)
 
@@ -139,3 +140,41 @@ lock and answer at once. `SubscribeEvents` only answers `Ack`: the server writes
 text of a held session changed from `live (real, connected)` to `connected at
 activation; liveness not monitored`; it is free text, nothing in this repository
 parses it, and consumers must not.
+
+## Host grammar in routing configuration (2026-10-06)
+
+A routing rule `destination`, a rule `domain_suffix` and an adapter `host`
+(`socks5`, `http_connect`, `tls_tunnel`) now share one host grammar, and it is
+narrower than before: **a configuration file that loaded before can now be
+refused**. The daemon then starts in `ConfigInvalid` with `invalid routing
+configuration: ...`, `ActivateProfile` is refused, `ssk config lint` reports the same
+error, and status and diagnostics stay available. Nothing is rewritten:
+`CURRENT_CONFIG_VERSION` stays 4, no migration step touches these values, and the file
+has to be edited by hand. Error wording is not a contract.
+
+Refused now:
+
+* A host whose last label does not start with an ASCII letter, with or without one
+  trailing dot: `127.1`, `0x7f.0.0.1`, `010.0.0.1`, `2130706433`, `0.1`, `1`,
+  `127.0.0.1.`. The system resolver dials such spellings as IPv4 addresses that
+  `IpAddr` does not parse, and the old label grammar took them for names. Write the
+  dotted-quad address (`127.0.0.1`) instead. Real names are unaffected: a top-level
+  label starts with a letter, punycode `xn--` included, and digits in earlier labels
+  stay valid (`10.0.0.1.nip.io`, `1password.com`).
+* A rule `destination` that is an IPv4-mapped IPv6 address in any spelling
+  (`::ffff:10.0.0.1`, `::ffff:a00:1`). It spells an IPv4 address a second way, and
+  policy compares literals by parsed value, so such a rule never matched the plain
+  IPv4 flow it was written for and a deny rule written this way did not deny it.
+  Write the IPv4 address. Other IPv6 literals (`::1`, `2001:db8::1`) are unchanged,
+  and an IPv4-mapped adapter `host` is still accepted.
+
+Unchanged: IP literals stay valid as destinations and adapter hosts, a name may be
+upper case and carry one trailing dot, labels are at most 63 and names at most 253
+bytes, and a `domain_suffix` is still never an IP literal. The JSON schema does not
+describe host syntax and is unchanged.
+
+`ActivateProfile` (`ssk activate --dest host:port`) applies the same host check to its
+destination: a numeric alias is answered `DEST_INVALID` before policy, audit or any
+dial. Earlier builds evaluated policy for the alias text and, where a rule without
+destination or suffix matched everything, handed it to the dialer, which connects to
+the address the alias spells. No wire or ledger format changed.

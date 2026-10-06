@@ -68,9 +68,12 @@ pub struct RoutingRule {
     pub id: String,
     pub priority: u32,
     /// Exact hostname or literal IP. No DNS resolution occurs during matching.
+    /// A numeric alias (`127.1`) and an IPv4-mapped IPv6 literal are refused:
+    /// write the dotted-quad IPv4 address.
     #[serde(default)]
     pub destination: Option<String>,
-    /// Domain itself and subdomains, matched on label boundaries.
+    /// Domain itself and subdomains, matched on label boundaries. A DNS name
+    /// whose last label starts with a letter, never an address.
     #[serde(default)]
     pub domain_suffix: Option<String>,
     #[serde(default)]
@@ -116,6 +119,27 @@ fn valid_domain(host: &str) -> bool {
                     .bytes()
                     .all(|b| b.is_ascii_alphanumeric() || b == b'-')
         })
+        // The OS resolver dials `127.1`, `0x7f.0.0.1`, `010.0.0.1` and
+        // `2130706433` as IPv4 addresses, yet `IpAddr` refuses to parse them, so
+        // the label grammar alone takes them for names. Every such spelling ends
+        // in a label that starts with a digit and a real TLD never does
+        // (punycode `xn--` starts with a letter): one rule keeps them out of
+        // destinations, suffixes and adapter hosts. Keep it equal to
+        // `is_address_form` in ssk-netadmin's policy.rs; the shared host corpus
+        // test pins both.
+        && host
+            .rsplit('.')
+            .next()
+            .is_some_and(|label| label.starts_with(|c: char| c.is_ascii_alphabetic()))
+}
+
+/// `true` for `::ffff:a.b.c.d` in any spelling. Deliberately not
+/// `Ipv6Addr::to_ipv4`, which also turns `::1` into 0.0.0.1.
+fn is_ipv4_mapped(host: &str) -> bool {
+    matches!(
+        host.parse::<std::net::IpAddr>(),
+        Ok(std::net::IpAddr::V6(ip)) if ip.to_ipv4_mapped().is_some()
+    )
 }
 
 impl RoutingConfig {
@@ -131,7 +155,9 @@ impl RoutingConfig {
                 | AdapterTransport::HttpConnect { host, port }
                 | AdapterTransport::TlsTunnel { host, port } => {
                     if !valid_host(host) || *port == 0 {
-                        return Err(invalid("adapter requires a valid host and nonzero port"));
+                        return Err(invalid(
+                            "adapter requires a valid host and nonzero port (a DNS name must end in a label that starts with a letter)",
+                        ));
                     }
                 }
                 AdapterTransport::OpenVpn { profile_id } if !valid_id(profile_id) => {
@@ -161,6 +187,15 @@ impl RoutingConfig {
                         "rule IDs and priorities must be unique within a profile",
                     ));
                 }
+                // `::ffff:10.0.0.1` is the address 10.0.0.1 spelled a second way.
+                // Policy compares two literals by parsed value and the two are
+                // not equal, so a deny rule written like this never fires on
+                // the plain IPv4 flow. Refuse it; the IPv4 form is the rule.
+                if rule.destination.as_deref().is_some_and(is_ipv4_mapped) {
+                    return Err(invalid(
+                        "rule destination must not be an IPv4-mapped IPv6 address; write the IPv4 address",
+                    ));
+                }
                 if rule
                     .destination
                     .as_ref()
@@ -170,7 +205,9 @@ impl RoutingConfig {
                     })
                     || rule.port == Some(0)
                 {
-                    return Err(invalid("invalid rule destination, domain suffix or port"));
+                    return Err(invalid(
+                        "invalid rule destination, domain suffix or port (a DNS name must end in a label that starts with a letter)",
+                    ));
                 }
                 if let RoutingAction::Adapter { adapter_id } = &rule.action {
                     if !adapters.contains(adapter_id.as_str()) {

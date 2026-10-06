@@ -19,6 +19,9 @@ interface or OS route; it fails closed. See [management controller](OPENVPN_MANA
   suffix on label boundaries, and an optional destination port. Present criteria
   are combined with AND. A rule with no criteria deliberately matches everything.
   Policy matching performs no DNS resolution. Domain rules are not IP/CIDR rules.
+  Hosts are checked at load: a name must end in a label that starts with a letter,
+  so numeric aliases such as `127.1` are refused, and an IPv4-mapped IPv6
+  destination is refused; write the dotted-quad address.
 - Direct, SOCKS5, HTTP CONNECT and TLS tunnel selections use configured adapters.
   This increment's wire regression covers configured SOCKS5 via real daemon IPC;
   existing netcore tests cover the other implemented transports.
