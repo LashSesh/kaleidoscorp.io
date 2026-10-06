@@ -7,9 +7,14 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
 jobs:
   desktop_ui:
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
@@ -24,6 +29,7 @@ jobs:
 
   desktop_host:
     runs-on: windows-latest
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
@@ -39,7 +45,7 @@ jobs:
       - run: cargo fmt --manifest-path apps/desktop/Cargo.toml -- --check
       - run: cargo clippy --manifest-path apps/desktop/Cargo.toml --all-targets --locked -- -D warnings
       - run: cargo build --manifest-path apps/desktop/Cargo.toml --locked
-      - run: cargo test --manifest-path apps/desktop/Cargo.toml --locked
+      - run: cargo test --no-fail-fast --manifest-path apps/desktop/Cargo.toml --locked
       # The explicit WebView startup smoke test needs an interactive Windows session.
 
   # ---------------------------------------------------------------------------
@@ -54,6 +60,7 @@ jobs:
   # ---------------------------------------------------------------------------
   fmt_lint:
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
@@ -65,10 +72,11 @@ jobs:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       - run: cargo fmt --all -- --check
-      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo clippy --locked --workspace --all-targets -- -D warnings
 
   build_test:
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
@@ -77,8 +85,8 @@ jobs:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-      - run: cargo build --workspace --all-targets
-      - run: cargo test --workspace
+      - run: cargo build --locked --workspace --all-targets
+      - run: cargo test --locked --no-fail-fast --workspace
       - name: Check read-only VM host assessment with synthetic facts
         if: runner.os == 'Windows'
         shell: pwsh
@@ -89,6 +97,7 @@ jobs:
   # instead -- portable across every runner shell.
   proptest_smoke:
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
@@ -97,25 +106,27 @@ jobs:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-      - run: cargo test --workspace
+      - run: cargo test --locked --no-fail-fast --workspace
         env:
           PROPTEST_CASES: 32
 
   replay_vectors:
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-      - run: cargo test -p ssk-runtime --test replay_vectors
+      - run: cargo test --locked --no-fail-fast -p ssk-runtime --test replay_vectors
 
   interop_contracts:
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-      - run: cargo test -p ssk-interop
+      - run: cargo test --locked --no-fail-fast -p ssk-interop
 
   # Runs on both OSes: the schema export goes through the `ssk` CLI, which is a
   # shipped Windows binary, so a Windows-only break in that path must be caught
@@ -126,6 +137,7 @@ jobs:
   # backslash-separated path that Git Bash would have to round-trip.
   config_schema_guard:
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
@@ -134,7 +146,7 @@ jobs:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-      - run: cargo test -p ssk-config schema_snapshot_stable
+      - run: cargo test --locked --no-fail-fast -p ssk-config schema_snapshot_stable
       - name: Export config schema and assert it is non-empty
         shell: bash
         run: |
@@ -144,6 +156,7 @@ jobs:
 
   breaking_change_guard:
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     if: github.event_name == 'pull_request'
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -156,35 +169,39 @@ jobs:
 
   no_std_core:
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - uses: dtolnay/rust-toolchain@stable
-      - run: cargo check -p ssk-types --no-default-features
-      - run: cargo check -p ssk-core --no-default-features
+      - run: cargo check --locked -p ssk-types --no-default-features
+      - run: cargo check --locked -p ssk-core --no-default-features
 
   netadmin_contracts:
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-      - run: cargo test -p ssk-netadmin
+      - run: cargo test --locked --no-fail-fast -p ssk-netadmin
 
   conformance_suite:
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-      - run: cargo test -p ssk-interop conformance
+      - run: cargo test --locked --no-fail-fast -p ssk-interop conformance
 
   chaos_drills:
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-      - run: cargo test -p ssk-faultscan
+      - run: cargo test --locked --no-fail-fast -p ssk-faultscan
 
   # cargo-audit / cargo-deny are pinned to exact versions. An unpinned
   # `cargo install --locked` picks up whatever is newest at job start, which
@@ -192,6 +209,7 @@ jobs:
   # with no commit in this repo. Bump these deliberately.
   cargo_audit:
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - uses: dtolnay/rust-toolchain@stable
@@ -200,6 +218,7 @@ jobs:
 
   cargo_deny:
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - uses: dtolnay/rust-toolchain@stable
@@ -217,15 +236,16 @@ jobs:
   # is the operator validation documented in RUNBOOK_WINDOWS.md.
   windows_backends:
     runs-on: windows-latest
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-      - run: cargo build -p ssk-winhost -p ssk-cli
-      - run: cargo clippy -p ssk-winhost --all-targets -- -D warnings
-      - run: cargo test -p ssk-winhost
+      - run: cargo build --locked -p ssk-winhost -p ssk-cli
+      - run: cargo clippy --locked -p ssk-winhost --all-targets -- -D warnings
+      - run: cargo test --locked --no-fail-fast -p ssk-winhost
 
   # Per-crate Windows gates for the four crates that had never been compiled or
   # run on Windows in CI before this job existed: the IPC transport, the daemon,
@@ -244,6 +264,7 @@ jobs:
   # crates' results.
   windows_crate_gates:
     runs-on: windows-latest
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
@@ -254,6 +275,24 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-      - run: cargo build -p ${{ matrix.crate }} --all-targets
-      - run: cargo clippy -p ${{ matrix.crate }} --all-targets -- -D warnings
-      - run: cargo test -p ${{ matrix.crate }}
+      - run: cargo build --locked -p ${{ matrix.crate }} --all-targets
+      - run: cargo clippy --locked -p ${{ matrix.crate }} --all-targets -- -D warnings
+      - run: cargo test --locked --no-fail-fast -p ${{ matrix.crate }}
+
+  # One check name to require in branch protection. `needs` + `if: always()` makes
+  # it fail when ANY job failed or was cancelled, and a skipped job (for example
+  # breaking_change_guard on push events) does not count as a failure. Without
+  # one aggregate check, a red job that nobody marked "required" is easy to miss:
+  # the CI run on main for the 2026-10-04 merge had 9 of 25 jobs red.
+  ci_gate:
+    if: always()
+    needs: [desktop_ui, desktop_host, fmt_lint, build_test, proptest_smoke, replay_vectors, interop_contracts, config_schema_guard, breaking_change_guard, no_std_core, netadmin_contracts, conformance_suite, chaos_drills, cargo_audit, cargo_deny, windows_backends, windows_crate_gates]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Fail if any required job failed or was cancelled
+        env:
+          RESULTS: ${{ toJSON(needs) }}
+        run: |
+          echo "$RESULTS" | jq -r 'to_entries[] | "\(.value.result)\t\(.key)"' | sort
+          echo "$RESULTS" | jq -e 'all(.[]; .result == "success" or .result == "skipped")' > /dev/null
