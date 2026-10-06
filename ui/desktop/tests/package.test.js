@@ -2,8 +2,8 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { mkdtemp, readFile, writeFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join, posix } from "node:path";
-import { packageUi, assets } from "../tools/package.mjs";
+import { join, posix, win32 } from "node:path";
+import { packageUi, assets, outputContainsSource } from "../tools/package.mjs";
 
 test("production package includes its module closure and excludes sample/server assets", async t => {
   const output = await mkdtemp(join(tmpdir(), "ssk desktop bundle "));
@@ -35,4 +35,27 @@ test("native capability grants only the bundled window's read command", async ()
   assert.doesNotMatch(config.app.security.csp, /unsafe-inline|unsafe-eval|https:|\*/);
   const build = await readFile(new URL("build.rs", root), "utf8");
   assert.match(build, /\.commands\(&\["get_panel_snapshot_v2"\]\)/);
+});
+
+// Regression: on the Windows CI runner the checkout is on D:\ while os.tmpdir() is on C:\.
+// path.relative() then returns an ABSOLUTE path, which the old `!startsWith("..")` check
+// read as "output contains the source" and rejected an unrelated output directory.
+test("output guard: win32 cross-drive output is unrelated, not 'containing'", () => {
+  const source = "D:\\a\\kaleidoscorp.io\\ui\\desktop\\";
+  assert.equal(outputContainsSource("C:\\Users\\runner\\AppData\\Local\\Temp\\bundle", source, win32), false);
+  assert.equal(outputContainsSource("D:\\a\\kaleidoscorp.io\\ui\\desktop\\dist", source, win32), false);
+  assert.equal(outputContainsSource("D:\\a\\kaleidoscorp.io\\ui\\desktop", source, win32), true);
+  assert.equal(outputContainsSource("D:\\a\\kaleidoscorp.io", source, win32), true);
+  assert.equal(outputContainsSource("d:\\A\\KALEIDOSCORP.IO\\UI\\DESKTOP", source, win32), true, "win32 paths are case-insensitive");
+});
+
+test("output guard: posix equal, ancestor and descendant outputs", () => {
+  const source = "/work/repo/ui/desktop/";
+  assert.equal(outputContainsSource("/work/repo/ui/desktop", source, posix), true);
+  assert.equal(outputContainsSource("/work/repo", source, posix), true);
+  assert.equal(outputContainsSource("/", source, posix), true);
+  assert.equal(outputContainsSource("/work/repo/ui/desktop/dist", source, posix), false);
+  assert.equal(outputContainsSource("/tmp/bundle", source, posix), false);
+  // A source directory literally named "..foo" is a child of its parent, not an escape.
+  assert.equal(outputContainsSource("/work/repo/ui", "/work/repo/ui/..foo", posix), true);
 });

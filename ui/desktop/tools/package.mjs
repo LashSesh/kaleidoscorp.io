@@ -1,6 +1,6 @@
 // Deterministic asset allow-list: no preview entry, fixtures, tests or server.
 import { readFile, mkdir, writeFile, readdir, lstat } from "node:fs/promises";
-import { resolve, dirname, relative } from "node:path";
+import path, { resolve, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const source = fileURLToPath(new URL("../", import.meta.url));
@@ -10,6 +10,23 @@ export const assets = Object.freeze([
   "src/components/dom.js", "src/components/panel.js", "src/components/kill-switch.js",
   "src/components/audit.js", "src/components/connections.js", "src/components/daemon.js",
 ]);
+
+/**
+ * True when `output` is the UI source directory or one of its ancestors, i.e.
+ * packaging into it would mix generated files into (or over) the source tree.
+ * An output INSIDE the source (e.g. `dist/`) is deliberately allowed.
+ *
+ * `path.relative()` returns an ABSOLUTE path when the two sides cannot be
+ * expressed relative to each other (different drives on Windows). That is not
+ * "contains", so it must not be mistaken for a downward path. The path dialect
+ * is a parameter so the win32 rules can be tested on any host.
+ */
+export function outputContainsSource(output, sourceDir, dialect = path) {
+  const rel = dialect.relative(dialect.resolve(output), dialect.resolve(sourceDir));
+  if (rel === "") return true;
+  if (dialect.isAbsolute(rel)) return false;
+  return rel !== ".." && !rel.startsWith(".." + dialect.sep);
+}
 
 async function inventory(directory, prefix = "") {
   const found = [];
@@ -24,7 +41,7 @@ async function inventory(directory, prefix = "") {
 
 export async function packageUi(destination) {
   const output = resolve(destination);
-  if (output === resolve(source) || relative(output, source).startsWith("..") === false) {
+  if (outputContainsSource(output, source)) {
     throw new Error("Output must not contain the UI source");
   }
   await mkdir(output, { recursive: true });
