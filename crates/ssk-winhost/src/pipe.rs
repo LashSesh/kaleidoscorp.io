@@ -279,9 +279,16 @@ pub fn validate_sid_string(sid: &str) -> Result<(), PipeSecurityError> {
 /// user, and its clients are that same user.
 ///
 /// ```text
-/// D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;<owner>)S:(ML;;NW;;;ME)
+/// O:<owner>D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;<owner>)S:(ML;;NW;;;ME)
 /// ```
 ///
+/// * `O:<owner>` — explicit, as `O:SY` is in P3. Without it the owner is the
+///   creating token's *default owner*, which for an elevated administrator
+///   can be `BUILTIN\Administrators` rather than the user, so "owned by the
+///   user that created it" would hold only for unelevated daemons. Stating it
+///   makes that true on every token. The user's own SID is always a valid
+///   owner for its own token, so this grants and removes no access: the ACEs
+///   below are unchanged.
 /// * `D:P` — protected, so no inherited ACEs. Pipes do not inherit today; `P`
 ///   states the intent and survives a future move to a securable namespace.
 /// * The owner gets `GA` and **this is unavoidable in P2.** The accept loop
@@ -302,7 +309,7 @@ pub fn validate_sid_string(sid: &str) -> Result<(), PipeSecurityError> {
 pub fn sddl_for_user_owned_pipe(owner_sid: &str) -> Result<String, PipeSecurityError> {
     validate_sid_string(owner_sid)?;
     Ok(format!(
-        "D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;{owner_sid}){MEDIUM_INTEGRITY_SACL}"
+        "O:{owner_sid}D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;{owner_sid}){MEDIUM_INTEGRITY_SACL}"
     ))
 }
 
@@ -1474,6 +1481,57 @@ mod win {
         Ok(text)
     }
 
+    /// How the OS spells `sid` in SDDL text, for tests that search rendered
+    /// descriptors.
+    ///
+    /// Built-in and well-known SIDs render as aliases (`S-1-5-32-544` as `BA`,
+    /// the RID-500 account as `LA`), so a test that looks for the literal
+    /// `S-1-5-21-...` string fails on exactly the machines where the user is
+    /// such an account, such as a CI runner. The OS is asked, rather than a
+    /// table of aliases kept here.
+    ///
+    /// Test-only: a measuring instrument, not product API.
+    ///
+    /// # Errors
+    /// [`PipeSecurityError::Win32`] if the SID does not convert or render.
+    #[cfg(test)]
+    pub(super) fn sddl_spelling_of_sid(sid: &str) -> Result<String, PipeSecurityError> {
+        // Interpolated into SDDL text: same grammar gate as the product paths.
+        validate_sid_string(sid)?;
+        let owned = SecurityDescriptor::from_sddl(&format!("O:{sid}"))?;
+        let mut out: sys::PWSTR = ptr::null_mut();
+        // SAFETY: `owned.0` is the live descriptor just converted; `out` is a
+        // valid out-pointer; a null length out-parameter is documented as "not
+        // interested".
+        let ok = unsafe {
+            sys::ConvertSecurityDescriptorToStringSecurityDescriptorW(
+                owned.0,
+                sys::SDDL_REVISION_1,
+                sys::OWNER_SECURITY_INFORMATION,
+                &mut out,
+                ptr::null_mut(),
+            )
+        };
+        if ok == 0 || out.is_null() {
+            return Err(win32(
+                "ConvertSecurityDescriptorToStringSecurityDescriptorW",
+            ));
+        }
+        // SAFETY: on success `out` is a NUL-terminated UTF-16 LocalAlloc'd
+        // string.
+        let text = unsafe { wide_to_string(out) };
+        // SAFETY: freed exactly once, immediately after the copy.
+        unsafe {
+            sys::LocalFree(out.cast::<c_void>());
+        }
+        text.strip_prefix("O:")
+            .map(str::to_owned)
+            .ok_or(PipeSecurityError::MalformedSid {
+                sid: text.chars().take(64).collect(),
+                reason: "rendered owner descriptor does not start with O:",
+            })
+    }
+
     /// Whether the calling thread currently carries an impersonation token.
     ///
     /// The post-condition [`ImpersonationGuard`] must establish:
@@ -1518,8 +1576,16 @@ mod tests {
         let sddl = sddl_for_user_owned_pipe(SID_A).expect("valid sid");
         assert_eq!(
             sddl,
-            format!("D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;{SID_A})S:(ML;;NW;;;ME)")
+            format!("O:{SID_A}D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;{SID_A})S:(ML;;NW;;;ME)")
         );
+    }
+
+    #[test]
+    fn p2_sddl_states_its_owner_explicitly_and_adds_no_second_ace_for_it() {
+        let sddl = sddl_for_user_owned_pipe(SID_A).expect("valid sid");
+        assert!(sddl.starts_with(&format!("O:{SID_A}D:P")), "{sddl}");
+        // The owner field is not an ACE: the DACL still has exactly three.
+        assert_eq!(sddl.matches("(A;;").count(), 3, "{sddl}");
     }
 
     #[test]
@@ -1674,7 +1740,7 @@ mod tests {
 
 #[cfg(all(test, windows))]
 mod windows_tests {
-    use super::win::thread_is_impersonating;
+    use super::win::{sddl_spelling_of_sid, thread_is_impersonating};
     use super::*;
     use ssk_ipc::transport_win::{check_peer_same_user, PeerAuthenticator, PipeFactory};
     use std::sync::atomic::{AtomicU32, Ordering};
@@ -1850,7 +1916,12 @@ mod windows_tests {
     #[tokio::test]
     async fn the_pipe_carries_the_explicit_dacl_and_not_the_default() {
         let name = unique_pipe_name("dacl");
-        let sid = current_user_sid().expect("sid").to_uppercase();
+        let sid = current_user_sid().expect("sid");
+        // The OS renders some SIDs as aliases (the RID-500 account as `LA`), so
+        // search for its SDDL spelling, not the literal `S-1-5-21-...` string.
+        let spelled = sddl_spelling_of_sid(&sid)
+            .expect("the OS can spell the current SID")
+            .to_uppercase();
         let server = factory().create_instance(&name, true, 4).expect("create");
 
         let actual = describe_pipe_security(&server).expect("read back the descriptor");
@@ -1866,7 +1937,7 @@ mod windows_tests {
             "missing admin ACE: {actual}"
         );
         assert!(
-            upper.contains(&format!("(A;;FA;;;{sid})")),
+            upper.contains(&format!("(A;;FA;;;{spelled})")),
             "missing owner ACE: {actual}"
         );
         // Exactly three ACEs — nothing was added, and nothing we asked for was
@@ -1881,7 +1952,7 @@ mod windows_tests {
         // The pipe is owned by this user, which is what makes the owner ACE the
         // daemon's own.
         assert!(
-            upper.starts_with(&format!("O:{sid}")),
+            upper.starts_with(&format!("O:{spelled}")),
             "unexpected owner: {actual}"
         );
         // The mandatory integrity label is PRESENT ON THE OBJECT, read back

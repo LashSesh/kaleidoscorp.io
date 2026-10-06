@@ -369,7 +369,7 @@ async fn run_server(
 ///
 /// * [`ssk_winhost::WindowsPipeFactory::for_current_user`] creates every
 ///   instance through `create_with_security_attributes_raw` carrying the SDDL
-///   `D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;<owner>)S:(ML;;NW;;;ME)`. The
+///   `O:<owner>D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;<owner>)S:(ML;;NW;;;ME)`. The
 ///   measured pre-P2 default DACL granted `FILE_GENERIC_READ` to `Everyone`
 ///   *and* `ANONYMOUS LOGON`; both ACEs are gone under this one.
 /// * [`ssk_winhost::WindowsPeerAuthenticator::new`] impersonates each client
