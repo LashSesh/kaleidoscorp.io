@@ -73,11 +73,20 @@ sha() {
 }
 
 # run_guard REPO BASE HEAD [TABLE]: sets $rc; stdout and stderr land in $work/out
-# and $work/err (joined in $work/both for the assertions).
+# and $work/err (joined in $work/both for the assertions). A non-empty $guard_lc_all
+# is exported as LC_ALL for the guard only: grep reads a path it cannot decode in
+# a UTF-8 locale differently from a byte-wise one.
+guard_lc_all=""
 run_guard() {
   rc=0
-  (cd "$1" && CONTRACT_SURFACES_FILE="${4:-$table}" "$guard_shell" "$guard" "$2" "$3") \
-    > "${work}/out" 2> "${work}/err" || rc=$?
+  (
+    cd "$1"
+    if [ -n "$guard_lc_all" ]; then
+      LC_ALL="$guard_lc_all"
+      export LC_ALL
+    fi
+    CONTRACT_SURFACES_FILE="${4:-$table}" "$guard_shell" "$guard" "$2" "$3"
+  ) > "${work}/out" 2> "${work}/err" || rc=$?
   cat "${work}/out" "${work}/err" > "${work}/both"
 }
 
@@ -93,7 +102,8 @@ check() {
     why="exit status ${rc}, wanted ${want}"
   else
     for text in "$@"; do
-      if ! grep -qF -e "$text" "${work}/both"; then
+      # LC_ALL=C: compare bytes, so a path that is not valid UTF-8 can be asserted.
+      if ! LC_ALL=C grep -qF -e "$text" "${work}/both"; then
         why="output does not contain '${text}'"
         break
       fi
@@ -237,37 +247,99 @@ check "moving a surface file out of its directory fails (renames are not collaps
 
 # --- Every row of the surface table ---------------------------------------------
 
-samples="config crates/ssk-config/tests/golden/schema.json
+# What the table pins: one path for EVERY alternative of every regex (it must
+# fire), and near misses (they must not). A row counts as pinned only when an
+# edit that drops an alternative, loosens an anchor or widens a group makes a case
+# below fail, so a regex written as (a|b|c) needs a sample for each of a, b and c.
+# The table is the policy; changing it on purpose means changing these lists too.
+fires="config crates/ssk-config/src/lib.rs
+config crates/ssk-config/tests/golden/schema.json
+ipc-wire crates/ssk-ipc/src/server.rs
+ipc-wire crates/ssk-ipc/src/state.rs
 ipc-wire crates/ssk-ipc/tests/wire_protocol0.rs
+ipc-wire crates/ssk-ipc/tests/golden/hello.json
 activation-ledger-and-wire-types crates/ssk-netadmin/src/audit.rs
+activation-ledger-and-wire-types crates/ssk-netadmin/src/route.rs
+activation-ledger-and-wire-types crates/ssk-netadmin/src/policy.rs
+activation-ledger-and-wire-types crates/ssk-netadmin/src/adapter.rs
 ingress-ledger crates/ssk-daemon/src/ingress/audit/store.rs
 ui-contract crates/ssk-ui-contract/src/dto.rs
 interop crates/ssk-interop/src/lib.rs
 interop-spec docs/INTEROP_SPEC.md"
 
+# Each near miss is a path a loosened regex would catch: a sibling file or
+# directory, a backup copy, the same path below another root, a different byte
+# where the regex has a literal dot.
+quiet="config crates/ssk-config/tests/roundtrip.rs
+config crates/ssk-config/Cargo.toml
+config crates/ssk-config/src_bak/lib.rs
+config vendor/crates/ssk-config/src/lib.rs
+ipc-wire crates/ssk-ipc/tests/roundtrip.rs
+ipc-wire crates/ssk-ipc/tests/wire.rs
+ipc-wire crates/ssk-ipc/tests/golden_old/hello.json
+ipc-wire crates/ssk-ipc/src_bak/server.rs
+ipc-wire crates/ssk-ipc/Cargo.toml
+ipc-wire vendor/crates/ssk-ipc/src/server.rs
+activation-ledger-and-wire-types crates/ssk-netadmin/src/session.rs
+activation-ledger-and-wire-types crates/ssk-netadmin/src/audit.rs.orig
+activation-ledger-and-wire-types crates/ssk-netadmin/src/audit_rs
+activation-ledger-and-wire-types vendor/crates/ssk-netadmin/src/audit.rs
+ingress-ledger crates/ssk-daemon/src/ingress/auditor.rs
+ingress-ledger vendor/crates/ssk-daemon/src/ingress/audit/store.rs
+ui-contract crates/ssk-ui-contract/Cargo.toml
+ui-contract crates/ssk-ui-contract/src_bak/dto.rs
+ui-contract vendor/crates/ssk-ui-contract/src/dto.rs
+interop crates/ssk-interop/src/other.rs
+interop crates/ssk-interop/src/lib.rs.orig
+interop crates/ssk-interop/src/lib_rs
+interop vendor/crates/ssk-interop/src/lib.rs
+interop-spec docs/INTEROP_SPEC.md.orig
+interop-spec docs/INTEROP_SPEC_md
+interop-spec vendor/docs/INTEROP_SPEC.md"
+
+row=0
 while read -r label path <&3; do
-  r="$(new_repo "row-${label}")"
+  row=$((row + 1))
+  r="$(new_repo "fires-${row}")"
   base="$(sha "$r" HEAD)"
   put "$r" "$path" "changed"
   commit "$r" "change ${path}"
   run_guard "$r" "$base" HEAD
   check "the ${label} surface fires on ${path}" 1 "${label}:" "${path}"
 done 3<<EOF
-${samples}
+${fires}
 EOF
 
-# A row added to the table without a case above would be unpinned.
+row=0
+while read -r label path <&3; do
+  row=$((row + 1))
+  r="$(new_repo "quiet-${row}")"
+  base="$(sha "$r" HEAD)"
+  put "$r" "$path" "changed"
+  commit "$r" "change ${path}"
+  run_guard "$r" "$base" HEAD
+  check "${path} is not a ${label} surface" 0 "no contract surface changed"
+done 3<<EOF
+${quiet}
+EOF
+
+# A row added to the table without paths above would be unpinned.
+# labels_pinned KIND LIST: every table label must occur in LIST (lines "label path").
 table_labels="$(awk -F '\t' '!/^#/ && NF > 0 { print $1 }' "$table" | sort)"
-sample_labels="$(printf '%s\n' "$samples" | awk '{ print $1 }' | sort)"
-total=$((total + 1))
-if [ "$table_labels" = "$sample_labels" ]; then
-  echo "ok ${total} - every row of the surface table has a sample path above"
-else
-  failed=$((failed + 1))
-  echo "not ok ${total} - every row of the surface table has a sample path above"
-  echo "#   table rows:   $(echo "$table_labels" | tr '\n' ' ')"
-  echo "#   sample paths: $(echo "$sample_labels" | tr '\n' ' ')"
-fi
+labels_pinned() {
+  listed_labels="$(printf '%s\n' "$2" | awk '{ print $1 }' | sort -u)"
+  total=$((total + 1))
+  if [ "$table_labels" = "$listed_labels" ]; then
+    echo "ok ${total} - every row of the surface table has a '$1' path above"
+  else
+    failed=$((failed + 1))
+    echo "not ok ${total} - every row of the surface table has a '$1' path above"
+    echo "#   table rows:   $(echo "$table_labels" | tr '\n' ' ')"
+    echo "#   '$1' rows: $(echo "$listed_labels" | tr '\n' ' ')"
+  fi
+}
+labels_pinned fires "$fires"
+labels_pinned quiet "$quiet"
 
 # --- The range ------------------------------------------------------------------
 
@@ -384,6 +456,51 @@ commit "$r" "feat(ssk-config): add a file with a non-ASCII name"
 run_guard "$r" "$base" HEAD
 check "a surface file with a non-ASCII name is still matched" 1 \
   "a contract surface changed but" "crates/ssk-config/src/${umlaut_name}"
+
+# A name that is not valid UTF-8 (one Latin-1 byte). In a UTF-8 locale GNU grep
+# refuses to print such a line, says "binary file matches" on stderr and exits 0,
+# which a guard that reads only stdout takes for "nothing matched". Which locale
+# the runner uses is not ours to choose, so the case runs under a UTF-8 one and
+# under C. The probe makes sure the locale really is multibyte-aware: a machine
+# that falls back to C silently would turn this case into a pass for any guard.
+utf8_locale=""
+for candidate in C.UTF-8 C.utf8 en_US.UTF-8 en_US.utf8; do
+  if [ "$(printf 'a\374\n' | LC_ALL="$candidate" grep -c 'a.')" = 0 ]; then
+    utf8_locale="$candidate"
+    break
+  fi
+done
+
+r="$(new_repo c40b)"
+base="$(sha "$r" HEAD)"
+latin1_name="$(printf '\374bersicht.rs')"
+put "$r" "crates/ssk-config/src/${latin1_name}" "Latin-1 name"
+commit "$r" "feat(ssk-config): add a file whose name is not UTF-8"
+if [ -z "$utf8_locale" ]; then
+  total=$((total + 1))
+  failed=$((failed + 1))
+  echo "not ok ${total} - no UTF-8 locale on this machine (tried C.UTF-8 en_US.UTF-8): the invalid-UTF-8 case cannot run"
+else
+  guard_lc_all="$utf8_locale"
+  run_guard "$r" "$base" HEAD
+  check "a surface file whose name is not valid UTF-8 fails under ${utf8_locale}" 1 \
+    "a contract surface changed but" "crates/ssk-config/src/${latin1_name}"
+fi
+guard_lc_all="C"
+run_guard "$r" "$base" HEAD
+check "a surface file whose name is not valid UTF-8 fails under C" 1 \
+  "a contract surface changed but" "crates/ssk-config/src/${latin1_name}"
+
+# The two escape hatches are looked up with grep -q; such a path must not confuse them.
+put "$r" "$matrix" "matrix v2"
+commit "$r" "docs: record the file with the Latin-1 name"
+if [ -n "$utf8_locale" ]; then
+  guard_lc_all="$utf8_locale"
+  run_guard "$r" "$base" HEAD
+  check "a matrix update excuses a surface file whose name is not valid UTF-8" 0 \
+    "was updated in the same range"
+fi
+guard_lc_all=""
 
 r="$(new_repo c41)"
 base="$(sha "$r" HEAD)"

@@ -5,8 +5,9 @@
 # The surfaces are the rows of scripts/ci/contract_surfaces.txt.
 #
 # Fails CLOSED: a BASE or HEAD that cannot be resolved, a missing or empty or
-# unusable surface table, no merge base, or any failing git command is exit 1,
-# never a pass. A guard that can only say "yes" is what this replaces.
+# unusable surface table, no merge base, any failing git command, or a changed
+# path that cannot be matched reliably is exit 1, never a pass. A guard that can
+# only say "yes" is what this replaces.
 #
 # POSIX sh on purpose (no pipefail, no arrays): every command whose failure must
 # be fatal runs as its own `x="$(...)" || fail`, not as a pipeline stage.
@@ -65,11 +66,15 @@ while IFS="$tab" read -r label re || [ -n "$label" ]; do
   rows=$((rows + 1))
   # grep exits 1 for "no match" (fine) and 2 for an unusable regex or an I/O
   # error; the second must not be read as "nothing matched".
+  # LC_ALL=C: a path is a byte string and every regex here is ASCII. In a UTF-8
+  # locale GNU grep does not print a matching line it cannot decode (a file name
+  # that is not valid UTF-8): stdout stays empty, "binary file matches" goes to
+  # stderr and the status is 0, which reads as "nothing matched" - a pass.
   status=0
-  matched="$(printf '%s\n' "$changed" | grep -E -e "$re")" || status=$?
+  matched="$(printf '%s\n' "$changed" | LC_ALL=C grep -E -e "$re")" || status=$?
   [ "$status" -le 1 ] || fail "surface '${label}': grep rejected the regex '${re}'"
   if [ -n "$matched" ]; then
-    indented="$(printf '%s\n' "$matched" | sed 's/^/    /')"
+    indented="$(printf '%s\n' "$matched" | LC_ALL=C sed 's/^/    /')"
     hits="${hits}${label}:${nl}${indented}${nl}"
   fi
 done < "$surfaces"
