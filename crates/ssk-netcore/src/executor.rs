@@ -7,7 +7,9 @@ use std::time::{Duration, Instant};
 use ssk_netadmin::adapter::{AdapterDescriptor, AdapterKind};
 use ssk_netadmin::route::{HopSpec, RouteKind};
 use tokio::sync::OnceCell;
+use tokio::time::timeout;
 
+use crate::authority::authority;
 use crate::dns::{self, RecordType};
 use crate::error::NetcoreError;
 use crate::probe::ProbeReport;
@@ -15,6 +17,9 @@ use crate::session::{BoxedTransport, EgressSession};
 use crate::{direct, http_connect, socks5, tls};
 
 const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// Bounds a whole `connect`. Longer than one TCP connect, since it also has to
+/// cover every hop's handshake.
+const DEFAULT_DIAL_DEADLINE: Duration = Duration::from_secs(30);
 
 /// Maps the adapter ids a `RouteCandidate`'s `HopSpec`s reference back to
 /// their real `AdapterDescriptor` (kind + address + port + metadata) — the
@@ -52,6 +57,7 @@ impl AdapterRegistry {
 pub struct RouteExecutor {
     registry: AdapterRegistry,
     connect_timeout: Duration,
+    dial_deadline: Duration,
     tls_config: OnceCell<Arc<rustls::ClientConfig>>,
 }
 
@@ -61,6 +67,7 @@ impl RouteExecutor {
         Self {
             registry,
             connect_timeout: DEFAULT_CONNECT_TIMEOUT,
+            dial_deadline: DEFAULT_DIAL_DEADLINE,
             tls_config: OnceCell::new(),
         }
     }
@@ -68,6 +75,17 @@ impl RouteExecutor {
     #[must_use]
     pub fn with_connect_timeout(mut self, timeout: Duration) -> Self {
         self.connect_timeout = timeout;
+        self
+    }
+
+    /// Bounds the whole of [`Self::connect`] (and so [`Self::probe`]): name
+    /// resolution, every hop's TCP connect and every SOCKS5/CONNECT/TLS
+    /// handshake. `with_connect_timeout` only covers each TCP connect, so
+    /// without this a proxy that accepts the connection and then stays silent
+    /// would hold the dial forever.
+    #[must_use]
+    pub fn with_dial_deadline(mut self, deadline: Duration) -> Self {
+        self.dial_deadline = deadline;
         self
     }
 
@@ -112,8 +130,25 @@ impl RouteExecutor {
     /// `target = (host, port)`. Fails closed with a typed [`NetcoreError`]
     /// on any real failure — never falls back to an unplanned adapter, and
     /// never retries one route on another: a `RouteKind::Fallback` is refused
-    /// with `NoRoute` before any socket is opened.
+    /// with `NoRoute` before any socket is opened. The whole dial is bounded
+    /// by the dial deadline and fails with `Timeout`; the half-built transport
+    /// is dropped, which closes the sockets.
     pub async fn connect(
+        &self,
+        route: &RouteKind,
+        target: (&str, u16),
+    ) -> Result<EgressSession, NetcoreError> {
+        timeout(self.dial_deadline, self.dispatch(route, target))
+            .await
+            .unwrap_or_else(|_elapsed| {
+                Err(NetcoreError::Timeout(
+                    authority(target.0, target.1),
+                    self.dial_deadline,
+                ))
+            })
+    }
+
+    async fn dispatch(
         &self,
         route: &RouteKind,
         target: (&str, u16),
@@ -275,5 +310,22 @@ impl RouteExecutor {
             .get_or_try_init(|| async { tls::build_client_config(None, relay_label) })
             .await
             .map(Arc::clone)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dial_deadline_defaults_to_thirty_seconds_and_is_configurable() {
+        let executor = RouteExecutor::new(AdapterRegistry::new());
+        assert_eq!(executor.dial_deadline, Duration::from_secs(30));
+        // The per-TCP-connect timeout is a separate, smaller bound.
+        assert!(executor.connect_timeout < executor.dial_deadline);
+
+        let executor = executor.with_dial_deadline(Duration::from_secs(7));
+        assert_eq!(executor.dial_deadline, Duration::from_secs(7));
+        assert_eq!(executor.connect_timeout, DEFAULT_CONNECT_TIMEOUT);
     }
 }

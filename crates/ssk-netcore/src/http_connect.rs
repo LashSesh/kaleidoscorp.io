@@ -5,6 +5,7 @@
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
+use crate::authority::authority;
 use crate::error::NetcoreError;
 
 /// Response headers larger than this are treated as a protocol violation
@@ -27,9 +28,19 @@ where
 {
     let io_err = |e: std::io::Error| NetcoreError::Io(proxy_label.to_string(), e);
 
-    let mut request = format!(
-        "CONNECT {target_host}:{target_port} HTTP/1.1\r\nHost: {target_host}:{target_port}\r\n"
-    );
+    // The host is interpolated into the request head, so a line break in it
+    // would end the head early and let the rest be read as a second request.
+    // Checked before anything is written; `admit` is not the only guard.
+    if target_host
+        .chars()
+        .any(|c| c.is_whitespace() || c.is_control())
+    {
+        return Err(NetcoreError::InvalidTarget(
+            "CONNECT target host contains whitespace or a control character".into(),
+        ));
+    }
+    let target = authority(target_host, target_port);
+    let mut request = format!("CONNECT {target} HTTP/1.1\r\nHost: {target}\r\n");
     if let Some(header_value) = auth_header {
         request.push_str("Proxy-Authorization: ");
         request.push_str(header_value);
@@ -137,5 +148,101 @@ mod tests {
             .await
             .expect_err("407 must surface as an error, never as an opened tunnel");
         assert!(matches!(err, NetcoreError::ProxyRejected(..)));
+    }
+
+    /// Runs the handshake against an in-memory proxy that records the bytes
+    /// it receives (up to the end of the request head, or EOF) and answers
+    /// 200, so the exact wire request can be asserted without a socket.
+    async fn handshake_against_recording_proxy(
+        host: &str,
+        port: u16,
+    ) -> (Result<(), NetcoreError>, Vec<u8>) {
+        let (client, mut server) = tokio::io::duplex(8192);
+        let proxy = async move {
+            let mut received = Vec::new();
+            let mut chunk = [0u8; 512];
+            loop {
+                let n = server.read(&mut chunk).await.expect("proxy read");
+                if n == 0 {
+                    break;
+                }
+                received.extend_from_slice(&chunk[..n]);
+                if received.windows(4).any(|w| w == b"\r\n\r\n") {
+                    server
+                        .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+                        .await
+                        .expect("proxy reply");
+                    break;
+                }
+            }
+            received
+        };
+        let handshake = async move {
+            handshake_connect(client, host, port, None, "test-proxy")
+                .await
+                .map(drop)
+        };
+        let (result, received) = tokio::join!(handshake, proxy);
+        (result, received)
+    }
+
+    #[tokio::test]
+    async fn ipv6_authority_is_bracketed_on_the_wire() {
+        for host in ["::1", "[::1]"] {
+            let (result, received) = handshake_against_recording_proxy(host, 443).await;
+            result.expect("an IPv6 literal target must be accepted");
+            assert_eq!(
+                String::from_utf8_lossy(&received),
+                "CONNECT [::1]:443 HTTP/1.1\r\nHost: [::1]:443\r\n\r\n",
+                "input {host:?}"
+            );
+        }
+        let (result, received) = handshake_against_recording_proxy("2001:db8::7", 8443).await;
+        result.expect("an IPv6 literal target must be accepted");
+        assert_eq!(
+            String::from_utf8_lossy(&received),
+            "CONNECT [2001:db8::7]:8443 HTTP/1.1\r\nHost: [2001:db8::7]:8443\r\n\r\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn name_and_ipv4_authorities_stay_unbracketed() {
+        for (host, port) in [("example.internal", 443), ("192.0.2.1", 80)] {
+            let (result, received) = handshake_against_recording_proxy(host, port).await;
+            result.expect("a plain target must be accepted");
+            assert_eq!(
+                String::from_utf8_lossy(&received),
+                format!("CONNECT {host}:{port} HTTP/1.1\r\nHost: {host}:{port}\r\n\r\n")
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn whitespace_and_control_characters_are_refused_before_any_byte_is_written() {
+        let hostile = [
+            "bad host",
+            "tab\there",
+            " leading",
+            "trailing ",
+            "lf\nonly",
+            "cr\ronly",
+            "evil.example\r\nX-Injected: 1",
+            "evil.example\r\n\r\nGET / HTTP/1.1",
+            "nul\0byte",
+            "del\u{7f}char",
+            "nel\u{85}char",
+            "nbsp\u{a0}char",
+            "linesep\u{2028}char",
+        ];
+        for host in hostile {
+            let (result, received) = handshake_against_recording_proxy(host, 443).await;
+            assert!(
+                received.is_empty(),
+                "host {host:?} reached the proxy as {:?}",
+                String::from_utf8_lossy(&received)
+            );
+            let err = result.expect_err("a host that can split the request must be refused");
+            assert_eq!(err.code(), "NETCORE_INVALID_TARGET", "host {host:?}");
+        }
     }
 }

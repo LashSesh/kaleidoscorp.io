@@ -7,6 +7,7 @@
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
+use crate::authority::unbracket;
 use crate::error::NetcoreError;
 
 const SOCKS5_VERSION: u8 = 0x05;
@@ -154,6 +155,8 @@ where
 }
 
 fn encode_address(out: &mut Vec<u8>, host: &str, proxy_label: &str) -> Result<(), NetcoreError> {
+    // `[::1]` would otherwise be sent as a domain name the proxy cannot resolve.
+    let host = unbracket(host);
     if let Ok(ip) = host.parse::<std::net::Ipv4Addr>() {
         out.push(ATYP_IPV4);
         out.extend_from_slice(&ip.octets());
@@ -312,5 +315,20 @@ mod tests {
             .await
             .expect_err("client must fail closed when it has no credentials to offer");
         assert!(matches!(err, NetcoreError::ProxyRejected(..)));
+    }
+
+    #[test]
+    fn bracketed_ipv6_literal_is_encoded_like_the_bare_one() {
+        let encode = |host: &str| {
+            let mut out = Vec::new();
+            encode_address(&mut out, host, "test-proxy").expect("encode");
+            out
+        };
+        let bare = encode("2001:db8::7");
+        assert_eq!(
+            bare[0], ATYP_IPV6,
+            "a bare literal is sent as an IPv6 address"
+        );
+        assert_eq!(encode("[2001:db8::7]"), bare);
     }
 }

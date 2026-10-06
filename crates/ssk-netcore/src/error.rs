@@ -38,6 +38,11 @@ pub enum NetcoreError {
     Io(String, std::io::Error),
     #[error("malformed protocol response from {0}: {1}")]
     ProtocolError(String, String),
+    /// Refused locally before any byte reached a proxy. The message never
+    /// echoes the offending target: it is client-influenced text and could
+    /// carry line breaks into logs.
+    #[error("invalid dial target: {0}")]
+    InvalidTarget(String),
 }
 
 impl NetcoreError {
@@ -59,6 +64,7 @@ impl NetcoreError {
             Self::UnknownAdapter(_) => "NETCORE_UNKNOWN_ADAPTER",
             Self::Io(..) => "NETCORE_IO_ERROR",
             Self::ProtocolError(..) => "NETCORE_PROTOCOL_ERROR",
+            Self::InvalidTarget(_) => "NETCORE_INVALID_TARGET",
         }
     }
 }

@@ -15,6 +15,7 @@
 //! fabricates liveness: every [`ProbeReport`] and every [`EgressSession`]
 //! reflects a real attempt that really happened on the wire.
 
+mod authority;
 mod data_plane;
 mod direct;
 mod dns;
@@ -264,5 +265,165 @@ mod tests {
             .await
             .expect("real socks5 chain through the executor must succeed");
         assert_eq!(session.chain(), &[AdapterKind::Socks5]);
+    }
+
+    /// Accepts connections and never answers or closes them, so a client
+    /// waiting on a handshake reply can only be freed by its own deadline.
+    async fn silent_peer() -> u16 {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        tokio::spawn(async move {
+            // Held, not dropped: a dropped socket sends FIN, which turns
+            // "silent" into "EOF" and ends the client's read early.
+            let mut held = Vec::new();
+            while let Ok((sock, _)) = listener.accept().await {
+                held.push(sock);
+            }
+        });
+        port
+    }
+
+    /// A SOCKS5 proxy that completes one CONNECT (a domain-name request, as
+    /// the chain sends for a next hop) and then goes silent, so whatever the
+    /// client speaks through it next gets no answer.
+    async fn socks5_proxy_then_silent() -> u16 {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.expect("accept");
+            let mut greeting = [0u8; 2];
+            sock.read_exact(&mut greeting).await.expect("greeting");
+            let mut methods = vec![0u8; greeting[1] as usize];
+            sock.read_exact(&mut methods).await.expect("methods");
+            sock.write_all(&[0x05, 0x00]).await.expect("method reply");
+
+            let mut head = [0u8; 4];
+            sock.read_exact(&mut head).await.expect("req head");
+            let mut len = [0u8; 1];
+            sock.read_exact(&mut len).await.expect("domain len");
+            let mut rest = vec![0u8; len[0] as usize + 2];
+            sock.read_exact(&mut rest).await.expect("domain + port");
+            sock.write_all(&[0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
+                .await
+                .expect("success reply");
+            std::future::pending::<()>().await;
+        });
+        port
+    }
+
+    fn registry_with(adapters: &[(&str, AdapterKind, u16)]) -> AdapterRegistry {
+        let mut registry = AdapterRegistry::new();
+        for (id, kind, port) in adapters {
+            registry.register(AdapterDescriptor {
+                adapter_id: (*id).into(),
+                kind: *kind,
+                address: "127.0.0.1".into(),
+                port: *port,
+                metadata: vec![],
+            });
+        }
+        registry
+    }
+
+    const TEST_DIAL_DEADLINE: std::time::Duration = std::time::Duration::from_millis(300);
+
+    /// Asserts `route` fails with `Timeout(_, TEST_DIAL_DEADLINE)` soon after
+    /// the deadline. The outer guard turns an unbounded dial into a failing
+    /// assertion instead of a hung test run.
+    async fn assert_dial_is_bounded(executor: &RouteExecutor, route: &RouteKind) {
+        let started = std::time::Instant::now();
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            executor.connect(route, ("upstream.internal", 443)),
+        )
+        .await
+        .expect("the dial hung: a silent peer must be cut off by the dial deadline");
+        let err = outcome.expect_err("a silent peer can never complete a handshake");
+        assert!(
+            matches!(&err, NetcoreError::Timeout(_, d) if *d == TEST_DIAL_DEADLINE),
+            "expected Timeout({TEST_DIAL_DEADLINE:?}), got {err:?}"
+        );
+        assert!(
+            started.elapsed() < TEST_DIAL_DEADLINE + std::time::Duration::from_secs(2),
+            "the deadline fired late: {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[tokio::test]
+    async fn dial_deadline_bounds_a_silent_socks5_proxy() {
+        let port = silent_peer().await;
+        let executor = RouteExecutor::new(registry_with(&[("socks", AdapterKind::Socks5, port)]))
+            .with_dial_deadline(TEST_DIAL_DEADLINE);
+        let route = RouteKind::SingleHop(ssk_netadmin::route::HopSpec::new(
+            "socks",
+            "127.0.0.1",
+            port,
+        ));
+        assert_dial_is_bounded(&executor, &route).await;
+    }
+
+    #[tokio::test]
+    async fn dial_deadline_bounds_a_silent_http_connect_proxy() {
+        let port = silent_peer().await;
+        let executor =
+            RouteExecutor::new(registry_with(&[("http", AdapterKind::HttpConnect, port)]))
+                .with_dial_deadline(TEST_DIAL_DEADLINE);
+        let route =
+            RouteKind::SingleHop(ssk_netadmin::route::HopSpec::new("http", "127.0.0.1", port));
+        assert_dial_is_bounded(&executor, &route).await;
+    }
+
+    #[tokio::test]
+    async fn dial_deadline_bounds_a_silent_tls_relay() {
+        if let Err(err) = crate::tls::build_client_config(None, "tls") {
+            eprintln!(
+                "SKIPPED: no native trust anchors here ({err}); the TLS leg was not exercised"
+            );
+            return;
+        }
+        let port = silent_peer().await;
+        let executor = RouteExecutor::new(registry_with(&[("tls", AdapterKind::TlsTunnel, port)]))
+            .with_dial_deadline(TEST_DIAL_DEADLINE);
+        let route =
+            RouteKind::SingleHop(ssk_netadmin::route::HopSpec::new("tls", "127.0.0.1", port));
+        assert_dial_is_bounded(&executor, &route).await;
+    }
+
+    #[tokio::test]
+    async fn dial_deadline_covers_every_hop_not_just_the_first() {
+        // Hop one answers fully; hop two's greeting travels through it into
+        // silence. A deadline that only guarded the first hop would hang here.
+        let first = socks5_proxy_then_silent().await;
+        let executor = RouteExecutor::new(registry_with(&[
+            ("first", AdapterKind::Socks5, first),
+            ("second", AdapterKind::Socks5, 1),
+        ]))
+        .with_dial_deadline(TEST_DIAL_DEADLINE);
+        let route = RouteKind::MultiHop(vec![
+            ssk_netadmin::route::HopSpec::new("first", "127.0.0.1", first),
+            ssk_netadmin::route::HopSpec::new("second", "second-hop.internal", 1),
+        ]);
+        assert_dial_is_bounded(&executor, &route).await;
+    }
+
+    #[tokio::test]
+    async fn probe_through_a_silent_proxy_is_bounded_by_the_dial_deadline() {
+        let port = silent_peer().await;
+        let executor = RouteExecutor::new(registry_with(&[("socks", AdapterKind::Socks5, port)]))
+            .with_dial_deadline(TEST_DIAL_DEADLINE);
+        let route = RouteKind::SingleHop(ssk_netadmin::route::HopSpec::new(
+            "socks",
+            "127.0.0.1",
+            port,
+        ));
+        let report = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            executor.probe(&route, ("upstream.internal", 443)),
+        )
+        .await
+        .expect("probe hung behind a silent proxy");
+        assert_eq!(report.status, ProbeStatus::Down);
     }
 }
