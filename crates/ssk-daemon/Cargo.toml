@@ -63,7 +63,10 @@ tokio = { version = "1", features = [
 # `flock` for the daemon lock. Same crate and version `ssk-ipc` already carries
 # for its peer-credential check; only the `fs` feature is new. A kernel-held
 # lock is released on `SIGKILL`, which a `create_new` lock file is not.
-rustix = { version = "0.38", default-features = false, features = ["fs"] }
+# `std` is required: without it rustix uses its own no_std `AsFd` polyfill and
+# `std::fs::File` does not implement it, so `flock(&file, ..)` in `lock.rs`
+# fails to compile (E0277) on Linux.
+rustix = { version = "0.38", default-features = false, features = ["fs", "std"] }
 
 [target.'cfg(windows)'.dependencies]
 # The composition root's Windows half. `ssk_ipc::server::serve_named_pipe`
