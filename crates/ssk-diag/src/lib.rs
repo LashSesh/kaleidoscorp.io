@@ -53,6 +53,7 @@ pub mod entropy;
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, PoisonError};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
@@ -70,11 +71,20 @@ pub const LOG_ENV_VAR: &str = "SSK_LOG";
 /// How many rotated log files to keep.
 pub const MAX_LOG_FILES: usize = 14;
 
+/// How many crash records to keep, newest first. [`MAX_LOG_FILES`] bounds the
+/// logs only: every panic writes a record (with a backtrace, and an `fsync`),
+/// so a panic that repeats must not be able to fill the state directory.
+pub const MAX_CRASH_RECORDS: usize = 32;
+
 /// The literal recorded when a panic payload is neither `&str` nor `String`.
 /// Never a fabricated message — the record says it does not know.
 pub const OPAQUE_PAYLOAD: &str = "<non-string panic payload>";
 
 static CRASH_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// Held across a record's write *and* the prune that follows it, so that two
+/// threads panicking together cannot prune against a half-written sibling.
+static CRASH_DIR_LOCK: Mutex<()> = Mutex::new(());
 
 /// Whether a human-readable layer is put on stderr, and under what condition.
 ///
@@ -294,10 +304,22 @@ pub fn payload_text(payload: &(dyn std::any::Any + Send)) -> String {
 /// thread may never be scheduled again — a crash report that lives only in a
 /// userspace buffer is a crash report that is lost.
 ///
+/// Afterwards the directory is pruned to the newest [`MAX_CRASH_RECORDS`]
+/// records. The prune comes **after** the write has been synced, so a failing
+/// prune can never cost the record, and it never selects the record just
+/// written even when a stepped-back clock makes that one look the oldest.
+///
 /// # Errors
-/// Any I/O failure creating or writing the file.
+/// Any I/O failure creating or writing the file. A failed prune is not one: the
+/// record is already durable, and reporting a panic as "could not write a
+/// crash record" because an *old* file would not delete would be a false alarm.
 pub fn write_crash_record(dir: &Path, record: &CrashRecord) -> std::io::Result<PathBuf> {
     use std::io::Write;
+    // Poison-tolerant: the guarded data is `()`, and a panic is exactly the
+    // situation this function runs in.
+    let _serial = CRASH_DIR_LOCK
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
     std::fs::create_dir_all(dir)?;
     let seq = CRASH_SEQ.fetch_add(1, Ordering::Relaxed);
     let path = dir.join(format!(
@@ -309,13 +331,88 @@ pub fn write_crash_record(dir: &Path, record: &CrashRecord) -> std::io::Result<P
     let mut file = std::fs::File::create(&path)?;
     file.write_all(&body)?;
     file.sync_all()?;
+    if let Err(err) = prune_crash_records(dir, &path) {
+        tracing::warn!(
+            target: "ssk.lifecycle",
+            %err,
+            crash_dir = %dir.display(),
+            "could not prune old crash records; the cap is not enforced this time"
+        );
+    }
     Ok(path)
 }
 
+/// Delete all but the newest [`MAX_CRASH_RECORDS`] records in `dir`, counting
+/// `keep` (the record just written) as one of them and never deleting it.
+///
+/// Only a regular file named exactly like a record is counted or deleted: the
+/// directory is the user's, and anything else in it is not ours to remove. The
+/// lock of [`write_crash_record`] serialises this within a process. Between
+/// processes sharing the directory (`ssk` and `sskd`) the cap is best effort:
+/// two prunes may race, and one that finds a file already gone has nothing to
+/// do, so the worst case is a few records over the cap until the next panic.
+fn prune_crash_records(dir: &Path, keep: &Path) -> std::io::Result<()> {
+    let mut first_err = None;
+    let mut others = Vec::new();
+    for entry in std::fs::read_dir(dir)? {
+        // One unreadable entry must not stop the rest from being pruned.
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(err) => {
+                first_err.get_or_insert(err);
+                continue;
+            }
+        };
+        let name = entry.file_name();
+        let Some(age) = name.to_str().and_then(crash_record_age) else {
+            continue;
+        };
+        if Some(name.as_os_str()) == keep.file_name() {
+            continue;
+        }
+        // `file_type` does not follow a symlink, so a link named like a record
+        // is skipped instead of having its target deleted.
+        if entry.file_type().is_ok_and(|kind| kind.is_file()) {
+            others.push((age, entry.path()));
+        }
+    }
+    // Oldest first, so the surplus is a prefix; `keep` holds one of the slots.
+    others.sort_unstable();
+    let surplus = others
+        .len()
+        .saturating_sub(MAX_CRASH_RECORDS.saturating_sub(1));
+    for (_, path) in others.into_iter().take(surplus) {
+        match std::fs::remove_file(&path) {
+            Ok(()) => {}
+            // Another process pruned it first.
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => {
+                first_err.get_or_insert(err);
+            }
+        }
+    }
+    first_err.map_or(Ok(()), Err)
+}
+
+/// How new a crash-record file is, from its name `crash-<unix>-<pid>-<seq>.json`
+/// (the format [`write_crash_record`] builds): the panic's own time, then the
+/// per-process sequence number, which orders a burst inside one second, and the
+/// pid only to make the order total. The name rather than the file's mtime,
+/// which a copy or a backup restore resets. `None` for any other name.
+fn crash_record_age(name: &str) -> Option<(u64, u64, u32)> {
+    let stem = name.strip_prefix("crash-")?.strip_suffix(".json")?;
+    let mut fields = stem.splitn(3, '-');
+    let unix = fields.next()?.parse().ok()?;
+    let pid = fields.next()?.parse().ok()?;
+    let seq = fields.next()?.parse().ok()?;
+    Some((unix, seq, pid))
+}
+
 /// Install the panic hook. Every panic writes a durable record under `crash_dir`
-/// when there is one, emits a `tracing::error!` as well (best effort — the sink
-/// may be the casualty), and then **chains to the previous hook**, so the
-/// default stderr message is not swallowed.
+/// when there is one (the newest [`MAX_CRASH_RECORDS`] are kept), emits a
+/// `tracing::error!` as well (best effort — the sink may be the casualty), and
+/// then **chains to the previous hook**, so the default stderr message is not
+/// swallowed.
 pub fn install_panic_hook(binary: &'static str, crash_dir: Option<PathBuf>, build: &'static str) {
     let started = Instant::now();
     let previous = std::panic::take_hook();
@@ -459,6 +556,170 @@ mod tests {
         let nested = dir.path().join("does").join("not").join("exist");
         let path = write_crash_record(&nested, &record()).expect("write");
         assert!(path.exists());
+    }
+
+    // The 32 is spelled out on purpose: a test that read `MAX_CRASH_RECORDS`
+    // back would keep passing if somebody raised the cap.
+
+    /// The `<unix>` field of every crash-record file in `dir`, sorted. Read
+    /// from the names, which is where the pruning reads it from too: a record
+    /// is exactly `crash-<unix>-<pid>-<seq>.json`.
+    fn crash_record_times(dir: &Path) -> Vec<u64> {
+        let mut times: Vec<u64> = std::fs::read_dir(dir)
+            .expect("crash dir")
+            .filter_map(Result::ok)
+            .filter(|e| e.path().is_file())
+            .filter_map(|e| {
+                let name = e.file_name().to_string_lossy().into_owned();
+                let stem = name.strip_prefix("crash-")?.strip_suffix(".json")?;
+                let parts: Vec<&str> = stem.split('-').collect();
+                let [unix, pid, seq] = parts[..] else {
+                    return None;
+                };
+                pid.parse::<u64>().ok()?;
+                seq.parse::<u64>().ok()?;
+                unix.parse().ok()
+            })
+            .collect();
+        times.sort_unstable();
+        times
+    }
+
+    fn record_at(timestamp_unix: u64) -> CrashRecord {
+        CrashRecord {
+            timestamp_unix,
+            ..record()
+        }
+    }
+
+    #[test]
+    fn crash_records_are_capped_to_32_newest() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // Forty panics, a second apart, so "newest" has one answer.
+        for i in 0..40 {
+            write_crash_record(dir.path(), &record_at(1_000 + i)).expect("write");
+        }
+        assert_eq!(
+            crash_record_times(dir.path()),
+            (1_008..1_040).collect::<Vec<u64>>(),
+            "exactly the 32 newest records must remain"
+        );
+    }
+
+    #[test]
+    fn the_record_just_written_survives_even_when_it_looks_the_oldest() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // A directory left by a build without the cap: 40 records, all newer
+        // than the panic below (a clock stepped backwards looks exactly so).
+        for i in 0..40u64 {
+            let name = format!("crash-{}-1-{i}.json", 2_000 + i);
+            std::fs::write(dir.path().join(name), b"{}").expect("seed");
+        }
+        let path = write_crash_record(dir.path(), &record_at(1_000)).expect("write");
+        assert!(
+            path.is_file(),
+            "the record just written must never be pruned"
+        );
+        // The new record plus the 31 newest of the backlog: 32, not 33.
+        let mut expected = vec![1_000];
+        expected.extend(2_009..2_040);
+        assert_eq!(crash_record_times(dir.path()), expected);
+    }
+
+    #[test]
+    fn pruning_only_touches_files_that_are_crash_records() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let foreign = [
+            "README.txt",
+            "crash-notes.json",
+            "crash-1-2-3-4.json",
+            "crash-1-2-3.json.bak",
+            "notes-1-2-3.json",
+        ];
+        for name in foreign {
+            std::fs::write(dir.path().join(name), b"keep me").expect("seed");
+        }
+        // A directory whose name parses as a record is still not a record. It
+        // is also newer than every real one, so counting it would cost a slot.
+        std::fs::create_dir(dir.path().join("crash-9999-6-7.json")).expect("seed dir");
+
+        for i in 0..40 {
+            write_crash_record(dir.path(), &record_at(1_000 + i)).expect("write");
+        }
+
+        for name in foreign {
+            assert!(
+                dir.path().join(name).is_file(),
+                "`{name}` is not ours to delete"
+            );
+        }
+        assert!(dir.path().join("crash-9999-6-7.json").is_dir());
+        // Foreign names are neither counted against the cap nor deleted.
+        assert_eq!(crash_record_times(dir.path()).len(), 32);
+    }
+
+    #[test]
+    fn a_write_waits_while_another_write_and_prune_is_in_progress() {
+        // The lock is what keeps one thread's prune away from a sibling record
+        // that is created but not yet written. Holding it from the test stands
+        // in for "another panic is mid-write".
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::thread::scope(|scope| {
+            let held = CRASH_DIR_LOCK
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            let writer = scope.spawn(|| write_crash_record(dir.path(), &record()));
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            assert!(
+                crash_record_times(dir.path()).is_empty(),
+                "a second writer must not create its record while the first holds the lock"
+            );
+            drop(held);
+            writer.join().expect("writer").expect("write");
+        });
+        assert_eq!(crash_record_times(dir.path()).len(), 1);
+    }
+
+    #[test]
+    fn a_poisoned_lock_does_not_cost_the_next_crash_record() {
+        // This function runs while the process is panicking, so a thread that
+        // died holding the lock is the expected case, not a corner.
+        let poisoner = std::thread::spawn(|| {
+            let _held = CRASH_DIR_LOCK.lock();
+            panic!("poison the crash-record lock");
+        });
+        assert!(poisoner.join().is_err());
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let written = write_crash_record(dir.path(), &record());
+        CRASH_DIR_LOCK.clear_poison();
+        written.expect("a poisoned lock must not stop the record being written");
+        assert_eq!(crash_record_times(dir.path()).len(), 1);
+    }
+
+    #[test]
+    fn concurrent_panics_leave_exactly_32_records_and_every_write_succeeds() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let barrier = std::sync::Barrier::new(8);
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                let (dir, barrier) = (dir.path(), &barrier);
+                scope.spawn(move || {
+                    barrier.wait();
+                    for _ in 0..10 {
+                        // One shared second and pid: ordering inside the burst
+                        // comes from the sequence number, as in a real panic
+                        // storm.
+                        write_crash_record(dir, &record()).expect("write");
+                    }
+                });
+            }
+        });
+        assert_eq!(
+            crash_record_times(dir.path()).len(),
+            32,
+            "80 racing writers must still converge on the cap"
+        );
     }
 
     #[test]
