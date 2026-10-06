@@ -39,6 +39,8 @@ pub struct MatchCriteria {
     /// Glob-style app identifier prefix.  `None` matches any app.
     pub app_prefix: Option<String>,
     /// Destination hostname suffix (e.g. `".example.com"`).  `None` = any.
+    /// Applies to DNS names only: an IP literal is never matched by a suffix,
+    /// use `dest_host` for those.
     pub dest_suffix: Option<String>,
     /// Specific protocol.  `None` = any.
     pub protocol: Option<ProtocolKind>,
@@ -46,6 +48,16 @@ pub struct MatchCriteria {
     pub min_risk: Option<RiskLevel>,
     /// Maximum risk level to trigger this rule.  `None` = any.
     pub max_risk: Option<RiskLevel>,
+}
+
+/// `true` when `host` is an IP literal (v4, v6, or `[v6]`) rather than a DNS name.
+///
+/// A suffix compares text, so on a literal it would let the rule `0.1` capture
+/// `10.0.0.1`. Neither `:` nor brackets can occur in a DNS name, so a host that
+/// carries one is a literal form `IpAddr` may not parse (`fe80::1%eth0`) and no
+/// domain rule may claim it.
+fn is_ip_literal(host: &str) -> bool {
+    host.parse::<std::net::IpAddr>().is_ok() || host.contains([':', '[', ']'])
 }
 
 impl MatchCriteria {
@@ -85,7 +97,10 @@ impl MatchCriteria {
                 .trim_end_matches('.')
                 .to_ascii_lowercase();
             let suffix = suffix.trim_matches('.').to_ascii_lowercase();
-            if suffix.is_empty() || !(host == suffix || host.ends_with(&format!(".{suffix}"))) {
+            if is_ip_literal(&host)
+                || suffix.is_empty()
+                || !(host == suffix || host.ends_with(&format!(".{suffix}")))
+            {
                 return false;
             }
         }
@@ -227,6 +242,95 @@ mod tests {
             0,
             FlowDescriptor::new(app, host, 443, ProtocolKind::Https, risk),
         )
+    }
+
+    fn suffix_criteria(suffix: &str) -> MatchCriteria {
+        MatchCriteria {
+            dest_suffix: Some(suffix.into()),
+            ..MatchCriteria::default()
+        }
+    }
+
+    #[test]
+    fn suffix_rule_never_matches_ip_literal() {
+        // (suffix, host): every pair matched before the fix, either because the
+        // suffix is a string tail of the literal or because the two are equal.
+        let literals = [
+            // The reported case: "10.0.0.1".ends_with(".0.1").
+            ("0.1", "10.0.0.1"),
+            ("0.0.1", "10.0.0.1"),
+            ("1", "10.0.0.1"),
+            ("0.1", "10.0.0.1."),
+            ("0.1", "::ffff:10.0.0.1"),
+            ("0.1]", "[::ffff:10.0.0.1]"),
+            // A "suffix" that is the whole literal is still not a domain.
+            ("10.0.0.1", "10.0.0.1"),
+            ("::1", "::1"),
+            ("[::1]", "[::1]"),
+            ("fe80::1%eth0", "fe80::1%eth0"),
+        ];
+        let captured: Vec<_> = literals
+            .into_iter()
+            .filter(|(suffix, host)| {
+                suffix_criteria(suffix).matches(&make_flow("app", host, RiskLevel::Low))
+            })
+            .collect();
+        assert!(
+            captured.is_empty(),
+            "suffix rules must not match IP literals, but matched: {captured:?}"
+        );
+
+        // The same literal is still reachable through `dest_host`, which is the
+        // field that is defined for literals.
+        let exact = MatchCriteria {
+            dest_host: Some("10.0.0.1".into()),
+            ..MatchCriteria::default()
+        };
+        assert!(exact.matches(&make_flow("app", "10.0.0.1", RiskLevel::Low)));
+    }
+
+    #[test]
+    fn suffix_rule_still_matches_dns_names_on_label_boundaries() {
+        // (suffix, host): real names, including ones that embed digits or look
+        // like a dotted quad without being one.
+        let matching = [
+            ("corp.example", "corp.example"),
+            ("corp.example", "api.corp.example"),
+            ("corp.example", "a.b.corp.example"),
+            ("corp.example", "API.CORP.EXAMPLE."),
+            (".corp.example", "api.corp.example"),
+            (".corp.example", "corp.example"),
+            ("corp.example.", "api.corp.example"),
+            ("CORP.Example", "api.corp.example"),
+            ("corp.example", "10.corp.example"),
+            ("0.1.example", "10.0.1.example"),
+            ("nip.io", "10.0.0.1.nip.io"),
+            ("example", "xn--bcher-kva.example"),
+            ("internal", "api.internal"),
+        ];
+        for (suffix, host) in matching {
+            assert!(
+                suffix_criteria(suffix).matches(&make_flow("app", host, RiskLevel::Low)),
+                "suffix {suffix:?} must still match name {host:?}"
+            );
+        }
+
+        // Label-boundary behaviour is unchanged.
+        let not_matching = [
+            ("corp.example", "evilcorp.example"),
+            ("corp.example", "corp.example.attacker.test"),
+            ("corp.example", "xcorp.example"),
+            ("corp.example", "example"),
+            ("0.1.example", "20.0.1.example.test"),
+            ("", "corp.example"),
+            (".", "corp.example"),
+        ];
+        for (suffix, host) in not_matching {
+            assert!(
+                !suffix_criteria(suffix).matches(&make_flow("app", host, RiskLevel::Low)),
+                "suffix {suffix:?} must not match name {host:?}"
+            );
+        }
     }
 
     #[test]
