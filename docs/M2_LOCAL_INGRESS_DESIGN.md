@@ -783,3 +783,68 @@ Verdict of the completeness critic: **needs-revision**.
 * Audit retention and privacy: the ledger records the destination host and port of every admitted flow (a local browsing log) for the retention window; defaults are 8 segments of 32 MiB and older history is deleted. Is a persistent local destination log acceptable for this product, how long must history be kept, and should destinations be redacted or hashed for admitted flows (not for denials)? Changing this after v5 ships needs another config version bump, so it should be decided now.
 * Port and discovery: which fixed default listen port should the desktop client ship (config allows 0 for tests only), and is a stable port expected so applications can be configured once?
 * Coverage wording: confirm that the product may only describe M2 as 'applications that use the proxy' and never as system-wide or Protected, and that GUI work (DesktopSnapshotV3, milestone M2.4) is a required gate before anything is called a desktop client release.
+
+---
+
+## Appendix C: decisions of the product owner and execution log
+
+### C.1 Decisions (2026-10-06)
+
+Answers to Appendix B. They bind the revision of this design.
+
+1. **Windows timing.** Milestone 2 counts as done when it is accepted on Linux. On Windows the ingress
+   stays unavailable under `hardening: required` until the Windows-only commits (`C-WIN1` exclusive bind,
+   `C-WIN2` owner check) have been verified on a real Windows machine. This was NOT answered as
+   "single-user Windows only"; do not assume a second local user is acceptable.
+2. **Protocols.** SOCKS5 first. HTTP CONNECT (M2.1) follows as its own, fully specified step. No system
+   proxy-settings writer in M2.
+3. **Audit privacy.** Destination logging is configurable, default plaintext: a config option for plain or
+   hashed destinations of admitted flows (denials stay plaintext). It must be part of the first ingress config
+   version (v5) so no later version bump is needed.
+4. **Arming.** The GUI must be able to arm and disarm the ingress. Today the webview is read-only and a negative
+   test asserts that `activate_profile` is denied, so this needs its own security design first: a dedicated
+   write command with a minimal Tauri capability, authorisation at the daemon, and a replacement for that
+   negative test. It is a gate for any release called a desktop client (formerly M2.4).
+
+Adopted without a question (they are the safe defaults, say so in the ADR): the ingress is described only as
+"applications that use the proxy", never as `Protected` or system-wide; Direct for host NAMES stays out of M2
+(no local DNS, no rebinding window); the default listen port is still to be chosen.
+
+### C.2 Foundation commits (done, pushed)
+
+Each has a regression test that was seen to FAIL on the old code and was independently reproduced by a reviewer.
+
+| ID | Commit | Result |
+|---|---|---|
+| C-N1 | `ed143be` | `RouteKind::Fallback` is not executable; the executor returns `NoRoute` and dials nothing. |
+| C-N2 | `95b9d1b` | The whole dial has a 30 s deadline; IPv6 authorities are bracketed in HTTP CONNECT; whitespace and control characters in the host are refused before any byte is written (`NETCORE_INVALID_TARGET`). |
+| C-P1 | `0982387`, `7857618` | A suffix rule never matches an IP literal or a numeric IPv4 alias; the planner never emits `Fallback`. |
+| C-I1 | `051bfb6` | The Unix accept loop retries with backoff (50 ms to 1 s, give up on the 60th consecutive error). |
+| C-S2 | `f5a1683` | The activation dial is bounded to 20 s, expiry is a durable `FailClosed` with `ACTIVATION_CONNECT_TIMEOUT`. |
+| C-S3 | `f29784d` | `GetStatus` answers `Activating` while an activation dial holds the lock; the adapter health string no longer claims liveness. |
+| docs | `610bce9` | The `Fallback` doc comments in `ssk-netadmin` no longer describe a fallback that does not exist. |
+
+### C.3 Known gaps left by the foundation work (each must be closed or accepted in the revised design)
+
+* **Windows named-pipe accept loop (`C-I1w`) is NOT fixed.** A first attempt was reverted after review: it left a
+  window with no live pipe instance, had no test and cannot be executed here. On Windows `sskd` still exits on the
+  first accept error.
+* The Unix loop wiring (continue on error, return the last error after the give-up) has no regression test; only
+  `AcceptRetry` is unit-tested. After 60 consecutive errors (about 55 s) `sskd` still exits, so sustained fd
+  exhaustion still ends the daemon. `privileged.rs` (SYSTEM control-pipe listener) has the same one-error-ends-it
+  shape.
+* The IPv6 literal Direct dial was never exercised: this machine has no IPv6. Only CI can tell.
+* **Hard requirement for the ingress:** a `dest_host` rule `::1` does not match the flow host `[::1]`, and
+  `ssk-config` still accepts a numeric-looking `domain_suffix` such as `0.1`. Target canonicalisation (strip
+  brackets, canonical IP, reject numeric aliases, lowercase, drop the trailing dot) must happen BEFORE the policy
+  sees the host. A Deny rule on an IPv6 literal can otherwise be bypassed.
+* The daemon activation deadline (20 s) is shorter than the executor's default dial deadline (30 s), so
+  `NETCORE_TIMEOUT` can no longer be produced by an activation, and a slow-but-alive multi-hop dial is cut at
+  20 s. `NETCORE_*` codes have no `explain_code` entry.
+* If the `ActivateProfile` future is dropped mid-dial (task abort, runtime drop), `Inner.state` stays `Activating`
+  with no egress and nothing resets it. Every other handler (`ListProfiles`, `TraceRoute`, `GetAuditEntries`,
+  `VerifyAuditChain`, `RunDoctor`, `Deactivate`, `subscribe_events`) still queues behind the dial for up to 20 s.
+* A blocking `getaddrinfo` already running on tokio's blocking pool cannot be cancelled by the dial deadline.
+* `Inner.active_egress` and the `KillSwitchProvider::view` contract still carry comments that no longer match
+  the code (see the review of `C-S3`).
+* When the ingress exists, the `Activating` answer must overlay a FRESH ingress snapshot (never a cached one).
