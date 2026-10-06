@@ -40,8 +40,9 @@ pub enum AuditOutcome {
     /// Reserved: the kill switch was armed and blocked egress. Not yet
     /// produced until `ssk-netcore`/`ssk-daemon` ship (Phase 3/4).
     KillSwitchBlocked,
-    /// Reserved: a `RouteKind::Fallback` route executed its fallback branch.
-    /// Not yet produced until `ssk-netcore` ships (Phase 3).
+    /// Never produced: `RouteKind::Fallback` is not executable (the executor refuses
+    /// it without dialling), so no fallback branch can ever have been dispatched.
+    /// Kept because removing a variant would change this serialised audit type.
     FallbackDispatched,
 }
 

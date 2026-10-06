@@ -53,7 +53,11 @@ pub enum RouteKind {
     SingleHop(HopSpec),
     /// Route through an ordered chain of hops (multi-hop).
     MultiHop(Vec<HopSpec>),
-    /// Try `primary`; on failure automatically fall back to `fallback`.
+    /// Declared, but deliberately NOT executable: `RouteExecutor::connect` refuses
+    /// it with `NoRoute` and dials nothing, and no planner produces it. A failed
+    /// route must never become another dial (least of all a direct one), so the
+    /// "on failure use `fallback`" meaning this variant once suggested no longer
+    /// exists anywhere.
     Fallback {
         primary: Box<RouteKind>,
         fallback: Box<RouteKind>,
