@@ -678,6 +678,21 @@ pub struct PeerStamp {
 }
 
 // ---------------------------------------------------------------------------
+// Proof that a result is durable
+// ---------------------------------------------------------------------------
+
+pub(crate) mod sealed {
+    pub trait Sealed {}
+}
+
+/// What the SOCKS5 success reply (`socks5::write_success`) demands: a value that
+/// exists only once the `Result` record of the flow is durable in the ledger.
+/// Sealed, so no code outside this crate can mint one; inside the crate the
+/// only implementor is the audit ledger's `ResultReceipt` (`C-A6`), and a
+/// source-scan test there lists the impls.
+pub trait ResultProof: sealed::Sealed {}
+
+// ---------------------------------------------------------------------------
 // Poison-tolerant locks
 // ---------------------------------------------------------------------------
 

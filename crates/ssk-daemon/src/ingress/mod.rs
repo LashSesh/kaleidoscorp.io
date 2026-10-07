@@ -24,6 +24,7 @@
 )]
 
 pub mod budget;
+pub mod socks5;
 pub mod target;
 pub mod types;
 
