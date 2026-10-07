@@ -534,3 +534,304 @@ fn ingress_status_roundtrip_and_an_empty_block_reads_as_unknown() {
     assert_eq!(read.protocol, 0);
     assert!(read.ingress.is_none());
 }
+
+// --- An absent key, in every part of the ingress block ------------------------
+//
+// The block is meant to grow additively inside protocol 1 (design 10.4: "All
+// fields are `#[serde(default)]`"), so a daemon built before a key existed
+// sends a part without it, and a newer client must still read the whole status.
+// That holds only while every part, not just the outermost, is
+// `#[serde(default)]` as a whole. The tests above send either a complete block
+// or an empty map (where the parent's default fills in the nested values), so
+// they cannot see a nested part lose its default. These do, and they find the
+// parts by walking the block, so a part added later is covered without being
+// listed here.
+
+/// The one subtree the walk does not own: `IpcError` is a protocol-0 type whose
+/// `code`, `class` and `message` have always been required, and an error without
+/// a code is not an error to be defaulted.
+fn is_not_ours(path: &[String]) -> bool {
+    path.len() == 1 && path[0] == "last_error"
+}
+
+fn child<'a>(value: &'a Value, step: &str) -> Option<&'a Value> {
+    match value {
+        Value::Map(entries) => entries
+            .iter()
+            .find(|(key, _)| matches!(key, Value::Text(k) if k == step))
+            .map(|(_, inner)| inner),
+        Value::Array(items) => step.parse::<usize>().ok().and_then(|i| items.get(i)),
+        _ => None,
+    }
+}
+
+fn child_mut<'a>(value: &'a mut Value, step: &str) -> Option<&'a mut Value> {
+    match value {
+        Value::Map(entries) => entries
+            .iter_mut()
+            .find(|(key, _)| matches!(key, Value::Text(k) if k == step))
+            .map(|(_, inner)| inner),
+        Value::Array(items) => step.parse::<usize>().ok().and_then(|i| items.get_mut(i)),
+        _ => None,
+    }
+}
+
+fn at<'a>(value: &'a Value, path: &[String]) -> Option<&'a Value> {
+    path.iter().try_fold(value, |node, step| child(node, step))
+}
+
+fn at_mut<'a>(value: &'a mut Value, path: &[String]) -> Option<&'a mut Value> {
+    let mut node = value;
+    for step in path {
+        node = child_mut(node, step)?;
+    }
+    Some(node)
+}
+
+/// Every node under `value` with its path (map keys and array indexes), without
+/// descending into what `is_not_ours`.
+fn nodes(value: &Value) -> Vec<(Vec<String>, &Value)> {
+    fn go<'a>(value: &'a Value, path: &mut Vec<String>, out: &mut Vec<(Vec<String>, &'a Value)>) {
+        out.push((path.clone(), value));
+        if is_not_ours(path) {
+            return;
+        }
+        match value {
+            Value::Map(entries) => {
+                for (key, inner) in entries {
+                    let Value::Text(key) = key else {
+                        panic!("a struct key is text, not {key:?}");
+                    };
+                    path.push(key.clone());
+                    go(inner, path, out);
+                    path.pop();
+                }
+            }
+            Value::Array(items) => {
+                for (index, inner) in items.iter().enumerate() {
+                    path.push(index.to_string());
+                    go(inner, path, out);
+                    path.pop();
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut out = Vec::new();
+    go(value, &mut Vec::new(), &mut out);
+    out
+}
+
+/// What a field reads as when its key is absent, by the rule of the block: no
+/// state word, no coverage word, a flag is off, a counter is zero, an optional
+/// part is missing. A default that "reads well" (an `ok` state, say) is the
+/// failure this guards against.
+fn is_unknown_default(value: &Value) -> bool {
+    match value {
+        Value::Null => true,
+        Value::Bool(flag) => !flag,
+        Value::Integer(number) => i128::from(*number) == 0,
+        Value::Text(word) => word.is_empty(),
+        Value::Array(items) => items.is_empty(),
+        Value::Map(entries) => entries.iter().all(|(_, inner)| is_unknown_default(inner)),
+        _ => false,
+    }
+}
+
+/// Sets every scalar that is at its default to a value that is not, so that a
+/// key dropped later is seen to come back as the default and not to have been
+/// the default all along. A new scalar field needs no edit here.
+fn move_scalars_off_their_defaults(value: &mut Value) {
+    match value {
+        Value::Bool(flag) => *flag = true,
+        Value::Integer(number) if i128::from(*number) == 0 => *number = 7.into(),
+        Value::Text(word) if word.is_empty() => *word = "x".into(),
+        Value::Map(entries) => {
+            for (_, inner) in entries {
+                move_scalars_off_their_defaults(inner);
+            }
+        }
+        Value::Array(items) => {
+            for inner in items {
+                move_scalars_off_their_defaults(inner);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// A block with every part present: each optional part is `Some`, each list has
+/// an element, each scalar is off its default. The seed only says which optional
+/// parts and lists exist (the walk cannot guess the type of a `null`); the
+/// scalars are filled in generically.
+fn every_part_present() -> IngressStatusDto {
+    let seed = IngressStatusDto {
+        listen: Some(String::new()),
+        configured_listen: Some(String::new()),
+        protocols: vec![String::new()],
+        armed_profile: Some(String::new()),
+        arm_profile: Some(String::new()),
+        audit: IngressAuditDto {
+            head: Some(String::new()),
+            oldest_ts_ms: Some(0),
+            dest_key_id: Some(String::new()),
+            ..IngressAuditDto::default()
+        },
+        last_error: Some(IpcError::new("Runtime", "INGRESS_BUSY", "busy")),
+        last_denial: Some(DenialSummaryDto {
+            rule_id: Some(String::new()),
+            ..DenialSummaryDto::default()
+        }),
+        retry_hint: Some(String::new()),
+        last_transition: Some(LastTransitionDto {
+            actor: Some(String::new()),
+            ..LastTransitionDto::default()
+        }),
+        phase: Some(String::new()),
+        limits: IngressLimitsDto {
+            clamped_by: Some(String::new()),
+            fd_soft_limit: Some(0),
+            ..IngressLimitsDto::default()
+        },
+        observations: IngressObservationsDto {
+            route_v4: every_part_of_a_route(),
+            route_v6: every_part_of_a_route(),
+            last_direct_source: Some(ObservedSourceDto::default()),
+            ..IngressObservationsDto::default()
+        },
+        warnings: vec![IngressWarningDto::default()],
+        ..IngressStatusDto::default()
+    };
+    let mut value = Value::serialized(&seed).expect("seed converts");
+    move_scalars_off_their_defaults(&mut value);
+    from_bytes(&to_bytes(&value)).expect("the filled block decodes")
+}
+
+fn every_part_of_a_route() -> ObservedRouteDto {
+    ObservedRouteDto {
+        interface_index: Some(0),
+        interface_alias: Some(String::new()),
+        sampled_age_ms: Some(0),
+        unchanged_for_ms: Some(0),
+        previous: Some(PreviousRouteDto {
+            interface_index: Some(0),
+            interface_alias: Some(String::new()),
+            replaced_ago_ms: 0,
+        }),
+        ..ObservedRouteDto::default()
+    }
+}
+
+/// Decodes `variant` (the full block with one change) and checks that the part
+/// that changed reads as the unknown default and that nothing else moved.
+fn assert_reads_as_unknown(original: &Value, variant: &Value, changed: &[String], what: &str) {
+    let read: IngressStatusDto = from_bytes(&to_bytes(variant))
+        .unwrap_or_else(|error| panic!("{what} makes the whole block undecodable: {error}"));
+    let reread = Value::serialized(&read).expect("converts");
+    let got = at(&reread, changed).unwrap_or_else(|| panic!("{what}: nothing at the path"));
+    assert!(
+        is_unknown_default(got),
+        "{what} does not read as the unknown default but as {got:?}"
+    );
+    let mut expected = original.clone();
+    *at_mut(&mut expected, changed).expect("the path exists in the original") = got.clone();
+    assert_eq!(reread, expected, "{what} changed something else");
+}
+
+#[test]
+fn the_sample_for_the_absent_key_tests_leaves_nothing_at_its_default() {
+    // If a field stayed at its default here, dropping its key would change
+    // nothing and the tests below could not tell. A new optional part or list
+    // that is not in `every_part_present` fails here, by its path.
+    let original = Value::serialized(&every_part_present()).expect("converts");
+    let at_default: Vec<String> = nodes(&original)
+        .into_iter()
+        .filter(|(_, node)| !matches!(node, Value::Map(_)) && is_unknown_default(node))
+        .map(|(path, _)| path.join("/"))
+        .collect();
+    assert!(
+        at_default.is_empty(),
+        "every_part_present leaves {at_default:?} at the default: populate it"
+    );
+}
+
+/// Dropping any one key of any part, at any depth, leaves a status that decodes,
+/// with that key as the unknown default and every other value unchanged. A part
+/// without `#[serde(default)]` as a whole fails on the first of its keys.
+#[test]
+fn a_dropped_key_in_any_part_of_the_ingress_block_reads_as_the_unknown_default() {
+    let original = Value::serialized(&every_part_present()).expect("converts");
+    let mut dropped = Vec::new();
+    for (path, _) in nodes(&original) {
+        let Some((key, parent)) = path.split_last() else {
+            continue;
+        };
+        if !matches!(at(&original, parent), Some(Value::Map(_))) {
+            continue;
+        }
+        let mut variant = original.clone();
+        let Some(Value::Map(entries)) = at_mut(&mut variant, parent) else {
+            panic!("no map at {parent:?}");
+        };
+        entries.retain(|(name, _)| name != &text(key));
+        let what = format!("dropping `{}`", path.join("/"));
+        assert_reads_as_unknown(&original, &variant, &path, &what);
+        dropped.push(path.join("/"));
+    }
+
+    // The walk reached the part of every type of the block (the second route
+    // and the list element included). A floor for the walk itself: a part added
+    // later is found by the walk and the sample check above, not by this list.
+    for reached in [
+        "state",
+        "controls/peer_check",
+        "counters/accepted",
+        "counters/rejected_target/localhost",
+        "audit/state",
+        "last_denial/host",
+        "last_transition/kind",
+        "limits/max_connections",
+        "config/routing",
+        "egress/direct_resolver",
+        "observations/label",
+        "observations/route_v4/status",
+        "observations/route_v4/previous/replaced_ago_ms",
+        "observations/route_v6/status",
+        "observations/last_direct_source/flow_id",
+        "warnings/0/code",
+    ] {
+        assert!(
+            dropped.iter().any(|path| path == reached),
+            "the walk never dropped `{reached}`"
+        );
+    }
+}
+
+/// The same for a part that arrives empty (`{}`) inside a block that is
+/// otherwise there: what a daemon that knows the part but has nothing to say
+/// for it sends, and what the empty-map test above shows only for the block as
+/// a whole.
+#[test]
+fn an_empty_part_inside_the_ingress_block_reads_as_the_unknown_default() {
+    let original = Value::serialized(&every_part_present()).expect("converts");
+    let mut emptied = 0;
+    for (path, node) in nodes(&original) {
+        if !matches!(node, Value::Map(_)) || is_not_ours(&path) {
+            continue;
+        }
+        let mut variant = original.clone();
+        *at_mut(&mut variant, &path).expect("the path exists") = Value::Map(vec![]);
+        assert_reads_as_unknown(
+            &original,
+            &variant,
+            &path,
+            &format!("emptying `/{}`", path.join("/")),
+        );
+        emptied += 1;
+    }
+    // A floor for the walk itself, not a list: the block and fourteen nested
+    // types, of which the route and its `previous` occur twice (v4 and v6), are
+    // seventeen maps. A part added later raises the count and is emptied like
+    // the rest.
+    assert!(emptied >= 17, "the walk found only {emptied} parts");
+}
