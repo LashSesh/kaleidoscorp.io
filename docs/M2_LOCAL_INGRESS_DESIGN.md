@@ -3902,3 +3902,40 @@ something). Next: the ingress modules (`C-G*`, `C-L4`, `C-CO3`), the audit ledge
 * Still open from C.3: the Windows named-pipe accept loop (`C-I1w`), `privileged.rs` has the same one-error-ends-it
   shape, IPv6 Direct dial unexercised on this host.
 * Environment: the volume filled up twice (the incremental cache grew to 8 GB); build with `CARGO_INCREMENTAL=0`.
+
+**Ingress modules landed since (2026-10-07, local gates only; the first CI run of any of it is still outstanding):**
+`C-G1a` (`target.rs`) and its review fix, `C-G1` (`types.rs`), `C-L4` (`budget.rs`, `tests/fd_baseline.rs`), `C-G2`
+(`socks5.rs`), `C-G5` (`limits.rs`), `C-G6` (`pump.rs`), `C-G7a` (`peer.rs`, the pure half), `C-CO3` (`path.rs`),
+`C-G1b` (`guard.rs`, `tests/support/net_fakes.rs`) and its review fix, `C-A2` (`audit/record.rs`, with the format
+paragraph in the compatibility matrix). Each has a "Refinements made at ..." paragraph at its section above; each was
+mutation-tested (the survivors of the first run are listed in the commit messages and are tests now). Two commits
+(`C-G1a` and `C-G1b` + `C-G7a`) were reviewed by an independent adversarial reviewer; the review of `C-G1b`/`C-G7a`
+found a HIGH defect (the `tcp6` header word) that none of the author's tests could see on a machine without IPv6.
+
+**Lessons that apply to every module still to write:**
+
+* A parser of a kernel table must be tested against the REAL text of every table it will read; a machine without the
+  feature (no IPv6 here) hides exactly the bug. Where the real file is unavailable, write the verbatim header from the
+  kernel source into the test and say that it is derived.
+* A test that compares a value with the constant it was computed from proves nothing (`MAX_AGE` against `MAX_AGE`,
+  a sanitiser against itself): pin literals.
+* Dead code that no input can reach is an equivalent mutant; remove it rather than keep a test that cannot fail
+  (the `::/8` branch, the start-of-pump gate check, the zero-byte guard).
+* `tokio::select!` without `biased` is random: a test of an ordering must run many rounds.
+* A `cargo test` run for every mutant costs seconds only if the stale artifacts of earlier runs are deleted; the
+  target directory grew to 24 GB (see the environment note above).
+
+**Carried forward from these modules (open until the commit named is done):**
+
+* `C-E2` (engine): the guard reads the armed profile NOW; the engine must cancel a dial on any gate change and a test
+  must show that no connect survives it (6.10 review (g)). `FlowCtl` must fill `Result.attempted` for a failed literal
+  dial itself.
+* `C-G7b` (peer service): `peer_check` is off when `getuid()` is the overflow uid or the uid map is not the identity
+  (6.10 review (h)); the self-test treats `Table.malformed != 0` as a failed table; the real `tcp6` of a machine with
+  IPv6 must be read by `controls()` and by a test that self-skips without it.
+* `C-E1` (host): `GuardCells::set_listener` with the BOUND address when `listen.port == 0`; `PathSlot` poller; snapshot
+  builder joins the vocabulary scan of `ingress/mod.rs` (`vocabulary_scan`).
+* `C-A6`/`C-A7`: the `*Event` input structs and `PendingInput`; segments, `Continue`; closed vocabularies for
+  `Closed.reason`, `Denied.reason_code`, `Result.error_code`/`refusal` (the pump's `PumpEnd::reason`, the guard's
+  labels and the `Refusal` codes are the producers); `limits::DenialSummary` to `Summary` conversion.
+* `C-WIN2`/`C-CO6w`: nothing of `peer.rs` or `path.rs` runs on Windows; `Controls` are all `false` there until then.
