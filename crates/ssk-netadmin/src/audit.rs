@@ -69,7 +69,14 @@ pub struct ForensicEntry {
     pub entry_hash: String,
 }
 
-fn summarise_route(route: &RouteKind) -> String {
+/// The text that [`ForensicEntry::route_kind_summary`] stores for a route.
+///
+/// Public so another crate that records a route can write the same text the
+/// activation ledger does. It names adapters and nothing else: a hop's
+/// address, port and `auth` never appear, because the text is persisted in the
+/// audit file and returned over IPC. It is hashed into the chain, so a change
+/// to its format is a change to the ledger format.
+pub fn summarise_route(route: &RouteKind) -> String {
     match route {
         RouteKind::OpenVpn {
             adapter_id,

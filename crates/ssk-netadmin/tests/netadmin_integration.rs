@@ -6,7 +6,7 @@
 use ssk_netadmin::{
     adapter::{DataPlaneAdapter, DirectAdapter, Socks5Adapter},
     attestation::{AttestationBinder, RawAttestation},
-    audit::{AuditLedger, AuditOutcome},
+    audit::{summarise_route, AuditLedger, AuditOutcome},
     control::{ControlPlane, OperatorProfile, RolloutMode, TenantContext},
     flow::{FlowDescriptor, FlowRecord, ProtocolKind, RiskLevel},
     policy::{MatchCriteria, PolicyAction, PolicyEngine, PolicyRule},
@@ -353,4 +353,77 @@ fn audit_chain_integrity_multi_entry() {
     ledger
         .verify()
         .expect("chain must be intact after 10 entries");
+}
+
+/// The summary is persisted in the audit file, hashed into its chain and
+/// printed by `ssk`, and the local-proxy ledger must reproduce it from another
+/// crate: it may name adapters, never what a hop is configured with.
+#[test]
+fn summarise_route_never_includes_hop_auth_or_address() {
+    // Every value is unique and none is a substring of an adapter id or of the
+    // summary's own keywords, so a hit can only be a leak.
+    let hop_a =
+        HopSpec::new("hop-a", "relay-a.internal.example", 41871).with_auth("auth-token-a-7c1e");
+    let hop_b = HopSpec::new("hop-b", "203.0.113.77", 41872).with_auth("auth-token-b-4d9f");
+    let hop_c = HopSpec::new("hop-c", "2001:db8::77", 41873).with_auth("auth-token-c-02ab");
+
+    let forbidden: Vec<String> = [&hop_a, &hop_b, &hop_c]
+        .into_iter()
+        .flat_map(|h| {
+            [
+                h.auth.clone().expect("every hop of this test has auth"),
+                h.address.clone(),
+                h.port.to_string(),
+            ]
+        })
+        .collect();
+
+    let routes = [
+        (
+            "SingleHop",
+            RouteKind::SingleHop(hop_a.clone()),
+            vec!["hop-a"],
+        ),
+        (
+            "MultiHop",
+            RouteKind::MultiHop(vec![hop_a.clone(), hop_b.clone(), hop_c.clone()]),
+            vec!["hop-a", "hop-b", "hop-c"],
+        ),
+        (
+            "Fallback",
+            RouteKind::Fallback {
+                primary: Box::new(RouteKind::SingleHop(hop_a.clone())),
+                fallback: Box::new(RouteKind::MultiHop(vec![hop_b.clone(), hop_c.clone()])),
+            },
+            vec!["hop-a", "hop-b", "hop-c"],
+        ),
+        (
+            "nested Fallback",
+            RouteKind::Fallback {
+                primary: Box::new(RouteKind::Fallback {
+                    primary: Box::new(RouteKind::SingleHop(hop_b.clone())),
+                    fallback: Box::new(RouteKind::SingleHop(hop_c.clone())),
+                }),
+                fallback: Box::new(RouteKind::SingleHop(hop_a.clone())),
+            },
+            vec!["hop-a", "hop-b", "hop-c"],
+        ),
+    ];
+
+    for (label, route, adapter_ids) in routes {
+        let summary = summarise_route(&route);
+        // A summary that dropped everything would pass the leak check below.
+        for id in adapter_ids {
+            assert!(
+                summary.contains(id),
+                "{label}: summary {summary:?} must name adapter {id:?}"
+            );
+        }
+        for secret in &forbidden {
+            assert!(
+                !summary.contains(secret.as_str()),
+                "{label}: summary {summary:?} leaks {secret:?}"
+            );
+        }
+    }
 }
