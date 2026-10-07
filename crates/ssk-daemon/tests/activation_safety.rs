@@ -1139,3 +1139,386 @@ async fn a_panicking_activation_settles_fail_closed() {
         ssk_netadmin::audit::AuditOutcome::DispatchPending
     );
 }
+
+// ---------------------------------------------------------------------------
+// Control-plane liveness during an activation dial, over the real Unix
+// transport. The supervisor mutex is held across the dial, and the IPC server
+// serves at most 16 connections at once (`ServeLimits::default`): a request
+// that queues behind the dial keeps its connection, so enough of them leave a
+// status read with no connection to arrive on, whatever the status handler
+// itself does. These tests drive the same `serve_unix_with_limits` loop `sskd`
+// runs, with one client connection per request as separate `ssk` invocations
+// would use.
+// ---------------------------------------------------------------------------
+
+/// The supervisor of a [`SilentDial`], served on a Unix socket.
+#[cfg(unix)]
+struct Served {
+    socket: std::path::PathBuf,
+    _directory: tempfile::TempDir,
+    server: tokio::task::JoinHandle<Result<(), ssk_ipc::IpcError>>,
+}
+
+#[cfg(unix)]
+impl Drop for Served {
+    fn drop(&mut self) {
+        self.server.abort();
+    }
+}
+
+#[cfg(unix)]
+impl Served {
+    async fn connect(&self) -> DaemonClient {
+        DaemonClient::connect_path(&self.socket)
+            .await
+            .expect("connect to the served supervisor")
+    }
+}
+
+#[cfg(unix)]
+async fn serve(supervisor: std::sync::Arc<ssk_daemon::supervisor::Supervisor>) -> Served {
+    let directory = tempfile::tempdir().expect("socket directory");
+    let socket = directory.path().join("sskd.sock");
+    let handler: std::sync::Arc<dyn ssk_ipc::CommandHandler> = supervisor;
+    let server = tokio::spawn(ssk_ipc::server::serve_unix_with_limits(
+        socket.clone(),
+        handler,
+        ssk_ipc::ServeLimits::default(),
+    ));
+    // Readiness is a connection, as in `start`: the socket file appears at bind,
+    // before the accept loop runs.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while DaemonClient::connect_path(&socket).await.is_err() {
+        assert!(
+            Instant::now() < deadline,
+            "the served supervisor never accepted a connection"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    Served {
+        socket,
+        _directory: directory,
+        server,
+    }
+}
+
+/// One request on its own connection, answered within `bound`; `None` when it
+/// was not. The connection is closed afterwards, as the CLI does.
+#[cfg(unix)]
+async fn call_within(served: &Served, request: Request, bound: Duration) -> Option<Response> {
+    let mut client = served.connect().await;
+    tokio::time::timeout(bound, client.call(request))
+        .await
+        .ok()
+        .map(|answer| answer.expect("the daemon answered with a transport error"))
+}
+
+/// [`start_silent_activation`], with the activation sent over the transport.
+#[cfg(unix)]
+async fn start_served_silent_activation(
+    served: &Served,
+    dial: &mut SilentDial,
+) -> (tokio::task::JoinHandle<Response>, tokio::net::TcpStream) {
+    let mut client = served.connect().await;
+    let activation =
+        tokio::spawn(async move { client.call(silent_activation()).await.expect("answer") });
+    let held = tokio::time::timeout(Duration::from_secs(5), dial.accepted.recv())
+        .await
+        .expect("the activation must dial the silent proxy")
+        .expect("proxy accept loop");
+    (activation, held)
+}
+
+#[cfg(unix)]
+fn deactivate_released() -> Request {
+    Request::Deactivate(DeactivateRequest {
+        release_kill_switch: true,
+    })
+}
+
+#[cfg(unix)]
+fn trace_request() -> Request {
+    Request::TraceRoute(ssk_ipc::RouteTraceRequest {
+        app_id: None,
+        dest_host: "127.0.0.1".into(),
+        dest_port: 443,
+        protocol: "tcp".into(),
+        risk: "low".into(),
+    })
+}
+
+/// Every request that is not a mutator used to queue behind the dial for as long
+/// as it lasted (20 s in production). A request is now either answered from
+/// what the daemon holds outside the mutex, or refused at once with the
+/// retriable `DAEMON_BUSY`.
+#[cfg(unix)]
+#[tokio::test]
+async fn read_handlers_answer_or_say_busy_while_activation_dials() {
+    let mut dial = silent_dial().await;
+    let served = serve(std::sync::Arc::clone(&dial.supervisor)).await;
+    let (activation, held) = start_served_silent_activation(&served, &mut dial).await;
+
+    // All at once, as a GUI refresh and a doctor run would arrive.
+    let requests = [
+        ("ListProfiles", Request::ListProfiles),
+        ("RunDoctor", Request::RunDoctor),
+        ("TraceRoute", trace_request()),
+        ("GetAuditEntries", Request::GetAuditEntries { limit: 10 }),
+        ("VerifyAuditChain", Request::VerifyAuditChain),
+    ];
+    let mut pending = Vec::new();
+    for (name, request) in requests {
+        let mut client = served.connect().await;
+        pending.push((
+            name,
+            tokio::spawn(async move {
+                tokio::time::timeout(Duration::from_secs(1), client.call(request))
+                    .await
+                    .ok()
+                    .map(|answer| answer.expect("transport error"))
+            }),
+        ));
+    }
+    let mut answers = Vec::new();
+    for (name, task) in pending {
+        answers.push((name, task.await.expect("request task")));
+    }
+    let blocked: Vec<_> = answers
+        .iter()
+        .filter(|(_, answer)| answer.is_none())
+        .map(|(name, _)| *name)
+        .collect();
+    assert!(
+        blocked.is_empty(),
+        "not answered within 1 s of a silent dial (queued behind it): {blocked:?}"
+    );
+
+    for (name, answer) in answers {
+        match (name, answer.expect("answered")) {
+            ("ListProfiles", Response::Profiles(profiles)) => {
+                assert!(profiles.iter().any(|profile| profile.id == "default"));
+            }
+            ("RunDoctor", Response::Doctor(report)) => {
+                let config = report
+                    .checks
+                    .iter()
+                    .find(|check| check.name == "config")
+                    .expect("the doctor still reports the configuration");
+                assert!(config.ok, "{}", config.detail);
+            }
+            ("TraceRoute" | "GetAuditEntries" | "VerifyAuditChain", Response::Err(error)) => {
+                assert_eq!(error.code, "DAEMON_BUSY", "{name}");
+                assert_eq!(error.class, "Runtime", "{name}");
+                assert!(error.retriable, "{name}: a busy answer is retriable");
+                assert!(!error.next_steps.is_empty(), "{name}: say what to do");
+            }
+            (name, other) => panic!("{name} answered with the wrong shape: {other:?}"),
+        }
+    }
+
+    // Busy is a statement about the dial, not a state of the daemon.
+    end_the_dial(activation, held).await;
+    match call_within(&served, trace_request(), Duration::from_secs(1)).await {
+        Some(Response::RouteTrace(trace)) => {
+            assert!(matches!(trace.route, ssk_netadmin::RouteKind::Direct));
+        }
+        other => panic!("TraceRoute must answer once the dial has ended: {other:?}"),
+    }
+    match call_within(
+        &served,
+        Request::GetAuditEntries { limit: 10 },
+        Duration::from_secs(1),
+    )
+    .await
+    {
+        Some(Response::AuditEntries(entries)) => assert_eq!(entries.len(), 2),
+        other => panic!("GetAuditEntries must answer once the dial has ended: {other:?}"),
+    }
+    match call_within(&served, Request::VerifyAuditChain, Duration::from_secs(1)).await {
+        Some(Response::AuditVerify(verdict)) => assert!(verdict.ok),
+        other => panic!("VerifyAuditChain must answer once the dial has ended: {other:?}"),
+    }
+}
+
+/// The measured defect: one activation and 15 requests that queue behind it use
+/// all 16 connections, and a 17th client asking `GetStatus` was served 0.6 ms
+/// after the dial ended and not before. Mutators are what can still queue, so
+/// they are what the gate counts: the second waits for its turn, the others are
+/// refused at once and give their connections back.
+#[cfg(unix)]
+#[tokio::test]
+async fn status_is_served_while_mutators_queue_on_ipc() {
+    let mut dial = silent_dial().await;
+    let served = serve(std::sync::Arc::clone(&dial.supervisor)).await;
+    let (activation, held) = start_served_silent_activation(&served, &mut dial).await;
+
+    // 15 more: with the activation's own connection that is the whole of
+    // `ServeLimits::default().max_connections`. Each one is a client that sends
+    // one request, reads the answer and goes away.
+    let mut waiting = Vec::new();
+    for _ in 0..15 {
+        let mut client = served.connect().await;
+        waiting.push(tokio::spawn(async move {
+            client.call(deactivate_released()).await.expect("answer")
+        }));
+    }
+    // Long enough for every one of them to be connected and inside its handler.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let started = Instant::now();
+    match call_within(&served, Request::GetStatus, Duration::from_secs(1)).await {
+        Some(Response::Status(status)) => assert_eq!(status.state, DaemonState::Activating),
+        Some(other) => panic!("GetStatus did not answer with a status: {other:?}"),
+        None => panic!(
+            "the 17th client was not served within 1 s: the connections were all held by \
+             requests queued behind the dial"
+        ),
+    }
+    assert!(started.elapsed() < Duration::from_secs(1));
+
+    end_the_dial(activation, held).await;
+    let mut busy = 0;
+    let mut deactivated = 0;
+    for task in waiting {
+        match tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("a queued Deactivate ends with the dial")
+            .expect("request task")
+        {
+            Response::Err(error) if error.code == "DAEMON_BUSY" => busy += 1,
+            Response::Status(status) if status.state == DaemonState::Inactive => deactivated += 1,
+            other => panic!("unexpected answer to a Deactivate behind a dial: {other:?}"),
+        }
+    }
+    assert_eq!(
+        (busy, deactivated),
+        (14, 1),
+        "the activation and one Deactivate are the two mutators; the other 14 are refused"
+    );
+}
+
+/// The gate holds two: the activation that is dialing and one request behind
+/// it. A third mutating request, of either kind, is refused at once, changes
+/// nothing and writes nothing, and the gate is whole again afterwards.
+#[cfg(unix)]
+#[tokio::test]
+async fn third_mutating_request_is_refused_daemon_busy() {
+    use ssk_netadmin::audit::AuditOutcome;
+
+    let mut dial = silent_dial().await;
+    let mut events = dial.supervisor.subscribe_events().await;
+    let served = serve(std::sync::Arc::clone(&dial.supervisor)).await;
+    let (activation, held) = start_served_silent_activation(&served, &mut dial).await;
+
+    let queued = {
+        let mut client = served.connect().await;
+        tokio::spawn(async move { client.call(deactivate_released()).await.expect("answer") })
+    };
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(!queued.is_finished(), "the second mutator waits its turn");
+
+    for (name, request) in [
+        ("ActivateProfile", silent_activation()),
+        ("Deactivate", deactivate_released()),
+    ] {
+        match call_within(&served, request, Duration::from_secs(1)).await {
+            Some(Response::Err(error)) => {
+                assert_eq!(error.code, "DAEMON_BUSY", "{name}");
+                assert_eq!(error.class, "Runtime", "{name}");
+                assert!(error.retriable, "{name}: a busy answer is retriable");
+            }
+            Some(other) => panic!("a third {name} must be refused, got: {other:?}"),
+            None => panic!("a third {name} queued behind two mutators instead of being refused"),
+        }
+    }
+    // Refusing them neither moved the daemon nor disturbed the dial.
+    match call_within(&served, Request::GetStatus, Duration::from_secs(1)).await {
+        Some(Response::Status(status)) => assert_eq!(status.state, DaemonState::Activating),
+        other => panic!("status must still answer around the dial: {other:?}"),
+    }
+
+    end_the_dial(activation, held).await;
+    match tokio::time::timeout(Duration::from_secs(5), queued)
+        .await
+        .expect("the queued Deactivate ends with the dial")
+        .expect("request task")
+    {
+        Response::Status(status) => assert_eq!(status.state, DaemonState::Inactive),
+        other => panic!("the queued Deactivate must run after the activation: {other:?}"),
+    }
+
+    // The two mutators' own transitions and nothing from the refused ones: no
+    // second activation started, no warning was raised for them.
+    let mut states = Vec::new();
+    while let Ok(event) = events.try_recv() {
+        match event {
+            ssk_ipc::Event::StateChanged { to, .. } => states.push(to),
+            ssk_ipc::Event::Warning { code, .. } => panic!("a refusal raised a warning: {code}"),
+            _ => {}
+        }
+    }
+    assert_eq!(
+        states,
+        [
+            DaemonState::Activating,
+            DaemonState::FailClosed,
+            DaemonState::Inactive
+        ]
+    );
+    let ledger = ssk_netadmin::audit::AuditLedger::persisted(dial.state.path().join("audit.json"));
+    ledger.verify().expect("durable valid chain");
+    let entries = ledger.entries().expect("entries");
+    assert_eq!(entries.len(), 2, "a refused activation writes no intent");
+    assert_eq!(entries[0].outcome, AuditOutcome::DispatchPending);
+    assert_eq!(entries[1].outcome, AuditOutcome::FailClosed);
+
+    // Both permits came back: two more mutators can be in flight.
+    match call_within(&served, deactivate_released(), Duration::from_secs(1)).await {
+        Some(Response::Status(status)) => assert_eq!(status.state, DaemonState::Inactive),
+        other => panic!("the gate must be free again: {other:?}"),
+    }
+}
+
+/// `Deactivate` is the one handler that keeps queueing behind a dial, by
+/// design: the mutex is FIFO, so a `Deactivate` sent after an `ActivateProfile`
+/// runs after it and its result stands. An activation that finished after a
+/// `Deactivate` had been answered would undo it.
+#[cfg(unix)]
+#[tokio::test]
+async fn deactivate_waits_its_turn_behind_an_activation() {
+    let mut dial = silent_dial().await;
+    let served = serve(std::sync::Arc::clone(&dial.supervisor)).await;
+    let (activation, held) = start_served_silent_activation(&served, &mut dial).await;
+
+    let deactivate = {
+        let mut client = served.connect().await;
+        tokio::spawn(async move { client.call(deactivate_released()).await.expect("answer") })
+    };
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(
+        !deactivate.is_finished(),
+        "a Deactivate sent after an activation must not overtake it"
+    );
+    match call_within(&served, Request::GetStatus, Duration::from_secs(1)).await {
+        Some(Response::Status(status)) => assert_eq!(status.state, DaemonState::Activating),
+        other => panic!("status must answer around the dial: {other:?}"),
+    }
+
+    end_the_dial(activation, held).await;
+    match tokio::time::timeout(Duration::from_secs(5), deactivate)
+        .await
+        .expect("the Deactivate runs once the activation is over")
+        .expect("request task")
+    {
+        Response::Status(status) => assert_eq!(status.state, DaemonState::Inactive),
+        other => panic!("unexpected answer to the Deactivate: {other:?}"),
+    }
+    match call_within(&served, Request::GetStatus, Duration::from_secs(1)).await {
+        Some(Response::Status(status)) => assert_eq!(
+            status.state,
+            DaemonState::Inactive,
+            "the activation's failure must not have been written over the Deactivate"
+        ),
+        other => panic!("status unavailable: {other:?}"),
+    }
+}

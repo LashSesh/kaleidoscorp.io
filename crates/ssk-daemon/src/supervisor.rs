@@ -15,7 +15,7 @@ use ssk_netadmin::audit::AuditOutcome;
 use ssk_netadmin::{FlowDescriptor, FlowRecord, ForensicEntry, ProtocolKind, RiskLevel, RouteKind};
 use ssk_netcore::{DataPlane, EgressSession};
 use ssk_tensor::GenericFileLedgerBackend;
-use tokio::sync::{Mutex, MutexGuard};
+use tokio::sync::{Mutex, MutexGuard, Semaphore};
 
 use crate::config_load::DaemonConfigError;
 use crate::killswitch::{KillSwitchProvider, KillSwitchView};
@@ -42,11 +42,30 @@ const ACTIVATION_CONNECT_TIMEOUT: &str = "ACTIVATION_CONNECT_TIMEOUT";
 /// `GetStatus` and the warning event, never as a reply.
 const ACTIVATION_CANCELLED: &str = "ACTIVATION_CANCELLED";
 
-/// How long `GetStatus` waits for the supervisor mutex before it asks whether
-/// an activation is the reason. The desktop client gives up on a status read
-/// after 2 s, so the wait has to be a small fraction of that; it is long
-/// enough that an ordinary short handler never trips it.
+/// How long a request that can be answered around an activation (`GetStatus`
+/// and the other callers of `inner_unless_activating`) waits for the supervisor
+/// mutex before it asks whether an activation is the reason. The desktop client
+/// gives up on a status read after 2 s, so the wait has to be a small fraction
+/// of that; it is long enough that an ordinary short handler never trips it.
 const STATUS_LOCK_WAIT: Duration = Duration::from_millis(100);
+
+/// Machine code for a request the daemon turned away at once, changing nothing,
+/// instead of queueing it: it needs the state an activation dial holds, or two
+/// mutating requests are already in flight. Retriable by definition.
+const DAEMON_BUSY: &str = "DAEMON_BUSY";
+
+/// How many requests that change the daemon's state (`ActivateProfile`,
+/// `Deactivate`) may be in flight at once: the one that holds the mutex, and
+/// one queued behind it. The IPC server serves a bounded number of connections
+/// and a request that queues behind a dial keeps its connection, so without
+/// this bound enough waiting mutators leave a status read nowhere to arrive.
+const MAX_MUTATORS: usize = 2;
+
+/// How long the supervisor waits for a held session to shut down gracefully
+/// before it drops it. A TLS stream's shutdown writes `close_notify` and
+/// flushes, and with a peer that does not read that never finishes; the mutex
+/// is held meanwhile. Kept below the desktop client's 2 s read deadline.
+const SESSION_SHUTDOWN_BOUND: Duration = Duration::from_secs(1);
 
 /// What the daemon can say about an adapter of a held session. The session was
 /// connected when activation finished; nothing probes or reads it afterwards,
@@ -82,6 +101,11 @@ pub struct Supervisor {
     /// Outside `Inner` because its whole purpose is to be readable while
     /// `Inner` is held by an activation dial.
     activations: ActivationsInFlight,
+    /// Permits for the requests that change the daemon's state, taken with
+    /// `try_acquire` and never awaited: a request that finds none is refused
+    /// with `DAEMON_BUSY`. Outside `Inner` because it is consulted before the
+    /// mutex is.
+    mutators: Semaphore,
     /// A clone of the sender inside `Inner.state`. Outside `Inner` because its
     /// whole purpose is to be usable while `Inner` is held by an activation
     /// dial; it holds no daemon state, only the bus transitions are published on.
@@ -125,6 +149,15 @@ impl Drop for ActivationInFlight<'_> {
     fn drop(&mut self) {
         self.0.leave();
     }
+}
+
+/// What a reader that must not queue behind an activation dial got.
+enum InnerAccess<'a> {
+    Held(MutexGuard<'a, Inner>),
+    /// The mutex stayed taken for the whole wait and an activation is in
+    /// flight. The reader answers from what the daemon holds outside the mutex,
+    /// or says `DAEMON_BUSY`; it does not wait for the dial.
+    ActivationInFlight,
 }
 
 struct Inner {
@@ -376,6 +409,56 @@ fn activating_status(view: KillSwitchView) -> StatusDto {
     }
 }
 
+/// A request turned away because an activation is in flight and the state it
+/// needs is the state the dial holds. Nothing was changed.
+fn busy_during_activation() -> IpcError {
+    IpcError::new(
+        "Runtime",
+        DAEMON_BUSY,
+        "an activation is in progress and this request needs the state it holds; nothing was changed",
+    )
+    .retriable()
+    .with_next_step("Retry once the activation has finished.")
+    .with_next_step("`ssk status` answers while an activation is in progress.")
+}
+
+/// A request turned away because two requests that change the daemon's state
+/// are already in flight. Nothing was changed.
+fn busy_mutators() -> IpcError {
+    IpcError::new(
+        "Runtime",
+        DAEMON_BUSY,
+        "two requests that change the daemon's state are already in progress; nothing was changed",
+    )
+    .retriable()
+    .with_next_step("Retry once one of them has finished.")
+    .with_next_step("`ssk status` shows what the daemon is doing.")
+}
+
+/// Wait for `shutdown` for at most `bound`; `false` when the bound ended the
+/// wait. The caller drops what it was shutting down either way.
+async fn finishes_within<F>(bound: Duration, shutdown: F) -> bool
+where
+    F: std::future::Future<Output = std::io::Result<()>>,
+{
+    // A shutdown that fails is as good as one that finished: the session is
+    // dropped next, and dropping closes the transport.
+    tokio::time::timeout(bound, shutdown).await.is_ok()
+}
+
+/// Shut a held session down gracefully, for at most [`SESSION_SHUTDOWN_BOUND`],
+/// and let the caller drop it. Every place that closes a held session while it
+/// holds `Inner` goes through here, which is what makes "the mutex is only held
+/// for short, bounded work" true outside the dial.
+async fn close_bounded(session: &mut EgressSession) {
+    if !finishes_within(SESSION_SHUTDOWN_BOUND, session.shutdown()).await {
+        tracing::warn!(
+            bound = ?SESSION_SHUTDOWN_BOUND,
+            "a held session did not shut down in time; dropping its transport"
+        );
+    }
+}
+
 /// Startup validation, shared by both constructors. Even a caller that built a
 /// `LoadedConfig` by hand gets it validated, and a failure becomes the
 /// `CONFIG_INVALID` answer the daemon keeps serving diagnosis with.
@@ -471,6 +554,7 @@ impl Supervisor {
             kill_switch,
             activation_deadline: ACTIVATE_DIAL_DEADLINE,
             activations: ActivationsInFlight::default(),
+            mutators: Semaphore::new(MAX_MUTATORS),
             events,
             inner: Mutex::new(Inner {
                 state,
@@ -529,6 +613,44 @@ impl Supervisor {
         self.inner.lock().await.state.current()
     }
 
+    /// The supervisor mutex for a reader that must not queue behind an
+    /// activation dial.
+    ///
+    /// The mutex is held across the whole dial, so a reader that simply awaits
+    /// it waits the dial out. This waits [`STATUS_LOCK_WAIT`] and, if the mutex
+    /// is still taken, asks whether an activation is the reason: only then does
+    /// it answer `ActivationInFlight`. Any other holder is short and mid-change,
+    /// and what it is changing is what the reader must report, so that case
+    /// keeps waiting.
+    async fn inner_unless_activating(&self) -> InnerAccess<'_> {
+        // Joined once and kept: dropping the timed-out wait would forfeit this
+        // request's place in the mutex's queue.
+        let acquire = self.inner.lock();
+        tokio::pin!(acquire);
+        match tokio::time::timeout(STATUS_LOCK_WAIT, &mut acquire).await {
+            Ok(inner) => InnerAccess::Held(inner),
+            Err(_elapsed) if self.activations.any() => InnerAccess::ActivationInFlight,
+            Err(_elapsed) => InnerAccess::Held(acquire.await),
+        }
+    }
+
+    /// The one place a status answer is built for a caller that does not hold
+    /// the mutex. What is read fresh at this call (the kill-switch view) is read
+    /// here, so no answer carries a copy that an activation has made false.
+    async fn status_answer(&self) -> StatusDto {
+        match self.inner_unless_activating().await {
+            InnerAccess::Held(mut inner) => self.status_held(&mut inner),
+            InnerAccess::ActivationInFlight => activating_status(self.kill_switch.view()),
+        }
+    }
+
+    /// The status answer of a handler that already holds the mutex
+    /// (`ActivateProfile`, `Deactivate`): `status_answer` for the case where
+    /// there is nothing to wait for.
+    fn status_held(&self, inner: &mut Inner) -> StatusDto {
+        inner.status(self.kill_switch.view())
+    }
+
     /// Record that a previously-spawned activation task died unexpectedly
     /// (crash/kill). Moves the daemon to a safe, fail-closed state rather
     /// than silently staying in `Activating` forever.
@@ -543,7 +665,7 @@ impl Supervisor {
         // open in an unknown state; close it for real rather than leaving a
         // dangling connection behind an inconsistent supervisor.
         if let Some(mut session) = inner.active_egress.take() {
-            let _ = session.shutdown().await;
+            close_bounded(&mut session).await;
         }
         inner.dns_protected = false;
         inner.state.transition(target, reason);
@@ -744,25 +866,16 @@ impl CommandHandler for Supervisor {
     fn handle<'a>(&'a self, req: Request, _peer: &'a PeerIdentity) -> BoxFuture<'a, Response> {
         Box::pin(async move {
             match req {
-                Request::GetStatus => {
-                    // Joined once and kept: dropping the timed-out wait would
-                    // forfeit this request's place in the mutex's queue.
-                    let acquire = self.inner.lock();
-                    tokio::pin!(acquire);
-                    let mut inner = match tokio::time::timeout(STATUS_LOCK_WAIT, &mut acquire).await
-                    {
-                        Ok(inner) => inner,
-                        // Only an activation is allowed to be answered around.
-                        // Any other holder is short and mid-change, and what it
-                        // is changing is what this read must report.
-                        Err(_elapsed) if self.activations.any() => {
-                            return Response::Status(activating_status(self.kill_switch.view()));
-                        }
-                        Err(_elapsed) => acquire.await,
-                    };
-                    Response::Status(inner.status(self.kill_switch.view()))
-                }
+                Request::GetStatus => Response::Status(self.status_answer().await),
                 Request::ActivateProfile(req) => {
+                    // At most two requests that change the state are in flight,
+                    // so at most two connections can be occupied by one waiting
+                    // for the dial. Taken first and never awaited; declared
+                    // before everything below, so it is the last thing released.
+                    let Ok(_mutator) = self.mutators.try_acquire() else {
+                        tracing::debug!(target: "ssk.lifecycle", "activate_profile refused: mutator gate full");
+                        return Response::Err(busy_mutators());
+                    };
                     // Before the first await: from here to the answer, a status
                     // read that cannot get `Inner` knows why. Declared before
                     // `inner` so it is released after the mutex is: a reader
@@ -981,20 +1094,32 @@ impl CommandHandler for Supervisor {
                         }
                     }
 
-                    Response::Status(inner.status(self.kill_switch.view()))
+                    Response::Status(self.status_held(&mut inner))
                 }
                 Request::Deactivate(req) => {
+                    // One of the two mutators; see `ActivateProfile`.
+                    let Ok(_mutator) = self.mutators.try_acquire() else {
+                        tracing::debug!(target: "ssk.lifecycle", "deactivate refused: mutator gate full");
+                        return Response::Err(busy_mutators());
+                    };
+                    // Not answered around an activation dial: the mutex is FIFO,
+                    // so a `Deactivate` sent after an `ActivateProfile` runs
+                    // after it and is never undone by it. It waits at most for
+                    // the activation deadline.
                     let mut inner = self.inner.lock().await;
                     if inner.state.current() == DaemonState::FailClosed && !req.release_kill_switch
                     {
+                        // The code stays because clients match on it, but what it
+                        // names is the daemon's own fail-closed state and not the
+                        // firewall rule the broker owns (see the comment below).
                         return Response::Err(
                             IpcError::new(
                                 "Permission",
                                 "KILL_SWITCH_ARMED",
-                                "kill switch is armed; pass release_kill_switch=true to override",
+                                "the daemon is in its fail-closed state; pass release_kill_switch=true to deactivate anyway",
                             )
                             .with_next_step(
-                                "Resolve the underlying route/adapter issue, or explicitly release the kill switch.",
+                                "Resolve the underlying route/adapter issue and activate again, or pass release_kill_switch=true to return the daemon to its inactive state.",
                             ),
                         );
                     }
@@ -1003,7 +1128,7 @@ impl CommandHandler for Supervisor {
                     // label — this is the concrete kill-switch-adjacent
                     // mechanism for the one session the daemon holds.
                     if let Some(mut session) = inner.active_egress.take() {
-                        let _ = session.shutdown().await;
+                        close_bounded(&mut session).await;
                     }
                     inner.active_profile = None;
                     inner.dns_protected = false;
@@ -1020,36 +1145,42 @@ impl CommandHandler for Supervisor {
                     // a `release_kill_switch=true` here does not reach the
                     // broker (routing that verb through it is P3 CLI work, not
                     // done). So this is re-read, not assumed released.
-                    Response::Status(inner.status(self.kill_switch.view()))
+                    Response::Status(self.status_held(&mut inner))
                 }
-                Request::ListProfiles => {
-                    // Still queued behind `Inner` exactly as before the
-                    // configuration and the routing left it. Answering without
-                    // the wait changes what a caller can observe during an
-                    // activation dial, which this refactor does not do.
-                    let _queued = self.inner.lock().await;
-                    match &*self.config {
-                        Ok(_) => Response::Profiles(self.routing.profiles()),
-                        Err(error) => Response::Err(error.clone()),
-                    }
-                }
+                // Read from the configuration and the routing, which sit outside
+                // `Inner`, so an activation dial does not delay the answer.
+                Request::ListProfiles => match &*self.config {
+                    Ok(_) => Response::Profiles(self.routing.profiles()),
+                    Err(error) => Response::Err(error.clone()),
+                },
                 Request::InspectFlow { flow_id: _ } => Response::Err(IpcError::new(
                     "Runtime",
                     "FLOW_NOT_FOUND",
                     "No captured flow is available; use trace-route for a policy preview.",
                 )),
                 Request::TraceRoute(req) => {
-                    let inner = self.inner.lock().await;
                     if let Err(error) = &*self.config {
                         return Response::Err(error.clone());
                     }
-                    // The held session's profile, else the default. An
-                    // activation plans with the profile it was asked for and a
-                    // different flow, and goes on to admit and dial; what the two
-                    // share is `decide`, not their inputs, so a trace answers
-                    // for the inputs it was given and no more.
-                    let profile = inner
-                        .active_profile
+                    // The held session's profile, else the default. The held
+                    // session is `Inner`'s, and while an activation dials it is
+                    // being replaced: neither the old profile nor the default
+                    // would be what the activation is about to make true, so
+                    // the answer is "busy", not a guess. No other source of a
+                    // profile exists yet that would not need `Inner`: the
+                    // request names none and no ingress is armed.
+                    //
+                    // An activation plans with the profile it was asked for and
+                    // a different flow, and goes on to admit and dial; what the
+                    // two share is `decide`, not their inputs, so a trace
+                    // answers for the inputs it was given and no more.
+                    let held_profile = match self.inner_unless_activating().await {
+                        InnerAccess::Held(inner) => inner.active_profile.clone(),
+                        InnerAccess::ActivationInFlight => {
+                            return Response::Err(busy_during_activation());
+                        }
+                    };
+                    let profile = held_profile
                         .as_deref()
                         .unwrap_or(&self.routing.default_profile);
                     let flow = FlowRecord::new(
@@ -1088,7 +1219,14 @@ impl CommandHandler for Supervisor {
                     Response::RecentFlows(vec![])
                 }
                 Request::GetAuditEntries { limit } => {
-                    let inner = self.inner.lock().await;
+                    // The legacy ledger is `Inner`'s and is only readable under
+                    // the mutex: say "busy" rather than queue behind the dial.
+                    let inner = match self.inner_unless_activating().await {
+                        InnerAccess::Held(inner) => inner,
+                        InnerAccess::ActivationInFlight => {
+                            return Response::Err(busy_during_activation());
+                        }
+                    };
                     match inner.audit.entries() {
                         Ok(entries) => {
                             let dtos: Vec<AuditEntryDto> = entries
@@ -1103,7 +1241,13 @@ impl CommandHandler for Supervisor {
                     }
                 }
                 Request::VerifyAuditChain => {
-                    let inner = self.inner.lock().await;
+                    // As for `GetAuditEntries`.
+                    let inner = match self.inner_unless_activating().await {
+                        InnerAccess::Held(inner) => inner,
+                        InnerAccess::ActivationInFlight => {
+                            return Response::Err(busy_during_activation());
+                        }
+                    };
                     match inner.audit.verify() {
                         Ok(()) => {
                             let head = inner
@@ -1125,8 +1269,8 @@ impl CommandHandler for Supervisor {
                     }
                 }
                 Request::RunDoctor => {
-                    // Still queued behind `Inner`; see `ListProfiles`.
-                    let _queued = self.inner.lock().await;
+                    // Environment probes and the hoisted configuration: nothing
+                    // here is `Inner`'s, so a dial does not delay it.
                     let mut checks = run_doctor_checks();
                     let (ok, detail, next_step) = match &*self.config {
                         Ok(loaded) => (
@@ -1264,9 +1408,116 @@ fn explain_code(code: &str) -> ExplainResponse {
             vec!["Supply a real, non-zero key from a secret manager."],
         ),
         "KILL_SWITCH_ARMED" => (
-            "The kill switch is armed and blocking deactivation.",
-            "Deactivating while the kill switch is armed would silently drop protection.",
-            vec!["Pass release_kill_switch=true if you intend to restore direct networking."],
+            "The daemon is in its fail-closed state and did not deactivate.",
+            "After a failed or interrupted activation the daemon stays fail-closed until it is told to let go, so Deactivate refuses unless release_kill_switch=true is passed. This concerns the daemon's own state only: the flag does not reach the firewall kill switch, which the privileged broker owns and the status answer reports separately.",
+            vec![
+                "Resolve the underlying route or adapter problem and activate again.",
+                "Pass release_kill_switch=true to return the daemon to its inactive state.",
+            ],
+        ),
+        DAEMON_BUSY => (
+            "The daemon turned the request away because it is busy.",
+            "Either an activation is dialing and the request needs the state the dial holds (TraceRoute, GetAuditEntries, VerifyAuditChain), or two requests that change the daemon's state (ActivateProfile, Deactivate) are already in progress. Nothing was changed. GetStatus keeps answering during an activation and reports it as in progress.",
+            vec![
+                "Retry the request once the activation has finished; a dial is bounded by the daemon's activation deadline.",
+                "Use `ssk status` to see whether an activation is in progress.",
+            ],
+        ),
+        "NETCORE_TIMEOUT" => (
+            "A connection attempt timed out.",
+            "A TCP connect, a name lookup or a whole dial did not finish within its time limit. The attempt was closed and no direct connection was made instead. An activation is cut at the daemon's own deadline first and reports ACTIVATION_CONNECT_TIMEOUT; this code is for a single connect or lookup that ran out earlier, and for dials the daemon does not bound itself.",
+            vec![
+                "Check that the host or proxy is reachable and answering.",
+                "Retry once it responds.",
+            ],
+        ),
+        "NETCORE_CONNECTION_REFUSED" => (
+            "The connection was refused.",
+            "The host or proxy answered the TCP connection with a refusal: nothing is listening on that address and port, or something rejected it. Nothing was sent and no direct connection was made instead.",
+            vec![
+                "Check the adapter's host and port in the configuration.",
+                "Start the proxy or correct the address, then retry.",
+            ],
+        ),
+        "NETCORE_DNS_FAILED" => (
+            "A host name could not be resolved.",
+            "The name of a destination or of an adapter host did not resolve, or the lookup returned no address. Nothing was connected.",
+            vec![
+                "Check the spelling of the name and the system's name resolution.",
+                "Use an IP literal if the address is meant to be fixed.",
+            ],
+        ),
+        "NETCORE_TLS_FAILED" => (
+            "A TLS handshake or its setup failed.",
+            "The TLS layer of a route could not be established: no trust anchors could be loaded, the client certificate was refused, or the relay's certificate or handshake failed verification. The connection was closed and no direct connection was made instead.",
+            vec![
+                "Check the relay's certificate and the configured client certificate.",
+                "Check that the system trust store can be read.",
+            ],
+        ),
+        "NETCORE_PROXY_REJECTED" => (
+            "A proxy refused the request.",
+            "The SOCKS5 or HTTP CONNECT proxy was reached but declined to carry the connection, for example because it requires authentication, does not allow the destination or has no route to it. No direct connection was made instead.",
+            vec![
+                "Check the proxy's credentials and its rules for this destination.",
+                "Read the proxy's own log for the reason.",
+            ],
+        ),
+        "NETCORE_UNSUPPORTED_ADAPTER" => (
+            "The adapter cannot carry a connection.",
+            "The route names an adapter whose kind has no executor, for example a DNS override used as a hop. Selecting it opens no connection and falls back to nothing.",
+            vec!["Use SOCKS5, HTTP CONNECT or TLS tunnel adapters as the hops of a route."],
+        ),
+        "NETCORE_POLICY_DENIED" => (
+            "The route was denied by policy.",
+            "The planned route is a denial, so the dial was refused before any socket was opened.",
+            vec!["Add a policy rule that allows this destination, if it should be reachable."],
+        ),
+        "NETCORE_NO_ROUTE" => (
+            "There is no route that can be dialed.",
+            "The route could not be executed: it has no hops, or it is a fallback route, which the daemon never dials because a retry on another route could end in an unintended direct connection.",
+            vec!["Fix the profile so that the matching rule names a dialable route."],
+        ),
+        "NETCORE_UNKNOWN_ADAPTER" => (
+            "The route names an adapter that is not registered.",
+            "The adapter id of a hop is not in the registry the daemon was started with. There is no fallback to a direct connection.",
+            vec![
+                "Register the adapter, or fix its id in the rule.",
+                "Restart the daemon after editing the configuration.",
+            ],
+        ),
+        "NETCORE_IO_ERROR" => (
+            "A network operation failed.",
+            "A connect failed for a reason other than a refusal or a timeout (for example the network or host is unreachable), or a read or write on an open connection to a proxy, relay or resolver failed. The connection was closed and no direct connection was made instead.",
+            vec![
+                "Check the network path to the peer named in the message.",
+                "Retry; if it repeats, read the peer's log.",
+            ],
+        ),
+        "NETCORE_PROTOCOL_ERROR" => (
+            "A peer answered with something that is not the expected protocol.",
+            "The proxy or resolver sent a malformed, truncated or unexpected response during its handshake. The connection was closed.",
+            vec!["Check that the configured port belongs to the protocol the adapter says it speaks."],
+        ),
+        "NETCORE_INVALID_TARGET" => (
+            "The destination was refused before anything was sent.",
+            "The target host is not an IP address or a resolvable name, or it contains whitespace or a control character that could end a proxy request early. The text is not repeated in the message.",
+            vec!["Pass a valid host name or IP address and a nonzero port."],
+        ),
+        "NETCORE_RESOLVER_BUSY" => (
+            "The name resolver had no free slot.",
+            "Lookups of destination names are limited in number and in how many may wait. No lookup was started and nothing was connected. Literals and proxied names do not use the resolver.",
+            vec!["Retry in a moment; stuck lookups free their slot when the system resolver returns."],
+        ),
+        "NETCORE_ADDR_REFUSED" => (
+            "The address guard refused an address a name resolved to.",
+            "When a direct dial is guarded, a name whose answers include an address that must not be dialed is refused as a whole, because a mixed answer is what DNS rebinding looks like. No socket was opened. The message does not repeat the name or the address.",
+            vec!["Use a name that resolves only to addresses the daemon may dial."],
+        ),
+        "NETCORE_FAMILY_DISABLED" => (
+            "No address of an enabled address family was available.",
+            "Every address of the dial belongs to an address family that is switched off for this executor, so nothing was dialed.",
+            vec!["Use a destination that has an address of an enabled family, or change which families the dial may use."],
         ),
         crate::killswitch::KILL_SWITCH_STATUS_UNKNOWN => (
             "The kill-switch state could not be established.",
@@ -2243,5 +2494,316 @@ mod tests {
         sup.record_task_failure("adapter task panicked").await;
         assert_eq!(sup.current_state().await, DaemonState::Degraded);
         accept.await.expect("join").expect("accept");
+    }
+
+    /// The shutdown of a held session runs while `Inner` is held, so it must end
+    /// by a deadline of the daemon's own. A peer that never reads leaves a TLS
+    /// `close_notify` unwritten for ever; the answer is to stop waiting and let
+    /// the caller drop the transport, which closes it.
+    #[tokio::test]
+    async fn close_bounded_gives_up_after_the_bound() {
+        let bound = Duration::from_millis(50);
+        let started = std::time::Instant::now();
+        assert!(
+            !finishes_within(bound, std::future::pending::<std::io::Result<()>>()).await,
+            "a shutdown that never finishes must be given up on"
+        );
+        assert!(started.elapsed() >= bound, "gave up before the bound");
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "did not give up at the bound: {:?}",
+            started.elapsed()
+        );
+
+        // A shutdown that ends in time is not cut, whether or not it succeeded:
+        // either way the caller drops the session next.
+        assert!(finishes_within(Duration::from_secs(5), async { Ok(()) }).await);
+        assert!(
+            finishes_within(Duration::from_secs(5), async {
+                Err(std::io::Error::other("peer reset"))
+            })
+            .await
+        );
+
+        // The bound `close_bounded` really passes stays under the desktop
+        // client's 2 s read deadline, or a status behind it would not be seen.
+        assert!(SESSION_SHUTDOWN_BOUND < Duration::from_secs(2));
+    }
+
+    /// `Inner` is held while a session shuts down, so a second, unbounded call
+    /// site would put the mutex back in the hands of the slowest peer.
+    #[test]
+    fn session_shutdown_is_only_called_through_close_bounded() {
+        let source = include_str!("supervisor.rs");
+        let production = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("the file has a production part");
+        let calls: Vec<&str> = production
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.starts_with("//") && line.contains(".shutdown()"))
+            .collect();
+        assert_eq!(
+            calls,
+            ["if !finishes_within(SESSION_SHUTDOWN_BOUND, session.shutdown()).await {"],
+            "a held session must only be shut down through `close_bounded`"
+        );
+    }
+
+    /// The mutex wait of a reader is what it was for `GetStatus`: a holder that
+    /// is not an activation is waited for, and the wait that already ran out is
+    /// not given back, or a reader would queue behind everyone who arrived while
+    /// it was deciding.
+    #[tokio::test]
+    async fn inner_unless_activating_waits_for_a_short_holder_and_keeps_its_place() {
+        let (sup, _dir) = supervisor_with(real_data_plane());
+        let sup = Arc::new(sup);
+        let order = Arc::new(std::sync::Mutex::new(Vec::new()));
+
+        let holder = sup.inner.lock().await;
+        let reader = {
+            let (sup, order) = (Arc::clone(&sup), Arc::clone(&order));
+            tokio::spawn(async move {
+                match sup.inner_unless_activating().await {
+                    InnerAccess::Held(_inner) => order.lock().expect("order").push("reader"),
+                    InnerAccess::ActivationInFlight => {
+                        order.lock().expect("order").push("reader-busy")
+                    }
+                }
+            })
+        };
+        // Queues up while the reader is still inside its own wait. A reader
+        // that gave up its place at the end of that wait and queued again would
+        // land behind this one.
+        tokio::time::sleep(STATUS_LOCK_WAIT / 3).await;
+        let latecomer = {
+            let (sup, order) = (Arc::clone(&sup), Arc::clone(&order));
+            tokio::spawn(async move {
+                let _inner = sup.inner.lock().await;
+                order.lock().expect("order").push("latecomer");
+            })
+        };
+        // Past the reader's wait, so it has stopped waiting for the mutex to
+        // free up on its own and now waits for the holder.
+        tokio::time::sleep(STATUS_LOCK_WAIT * 2).await;
+        assert!(
+            order.lock().expect("order").is_empty(),
+            "nobody may get past a short holder"
+        );
+        drop(holder);
+
+        reader.await.expect("reader");
+        latecomer.await.expect("latecomer");
+        assert_eq!(*order.lock().expect("order"), ["reader", "latecomer"]);
+    }
+
+    /// With an activation in flight the same wait ends in an answer around it,
+    /// after the lock wait and not before.
+    #[tokio::test]
+    async fn inner_unless_activating_answers_around_an_activation() {
+        let (sup, _dir) = supervisor_with(real_data_plane());
+        assert!(
+            matches!(sup.inner_unless_activating().await, InnerAccess::Held(_)),
+            "a free mutex is just taken"
+        );
+
+        let _dial = sup.inner.lock().await;
+        let _in_flight = sup.activations.enter();
+        let started = std::time::Instant::now();
+        assert!(matches!(
+            sup.inner_unless_activating().await,
+            InnerAccess::ActivationInFlight
+        ));
+        assert!(
+            started.elapsed() >= STATUS_LOCK_WAIT,
+            "the mutex is given its wait first"
+        );
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    /// A mutating request that is cancelled (its client left, the task was
+    /// aborted) must give its slot back, or two disconnects would leave the
+    /// daemon refusing every activation for ever.
+    #[tokio::test]
+    async fn a_cancelled_mutator_gives_its_slot_back() {
+        let (sup, _dir) = supervisor_with(real_data_plane());
+        let sup = Arc::new(sup);
+        let other_handler = sup.inner.lock().await;
+        let queued = [
+            Request::ActivateProfile(ssk_ipc::ActivateProfileRequest {
+                profile_id: "default".into(),
+                dest_host: Some("127.0.0.1".into()),
+                dest_port: Some(9),
+            }),
+            Request::Deactivate(ssk_ipc::DeactivateRequest {
+                release_kill_switch: true,
+            }),
+        ]
+        .map(|request| {
+            let sup = Arc::clone(&sup);
+            tokio::spawn(async move { call(&sup, request).await })
+        });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while sup.mutators.available_permits() > 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("both requests must take a slot");
+
+        match call(
+            &sup,
+            Request::Deactivate(ssk_ipc::DeactivateRequest {
+                release_kill_switch: true,
+            }),
+        )
+        .await
+        {
+            Response::Err(error) => assert_eq!(error.code, DAEMON_BUSY),
+            other => panic!("a third mutator must be refused, got: {other:?}"),
+        }
+
+        for task in queued {
+            task.abort();
+            assert!(task.await.expect_err("aborted").is_cancelled());
+        }
+        assert_eq!(sup.mutators.available_permits(), MAX_MUTATORS);
+        drop(other_handler);
+    }
+
+    #[tokio::test]
+    async fn the_daemon_busy_code_is_explainable() {
+        let explained = explain_code(DAEMON_BUSY);
+        assert!(
+            !explained.summary.starts_with("Unknown error code"),
+            "a code the daemon emits must have an explanation registered: {explained:?}"
+        );
+        assert!(!explained.next_steps.is_empty());
+        assert!(busy_during_activation().retriable && busy_mutators().retriable);
+        assert_eq!(busy_during_activation().code, DAEMON_BUSY);
+        assert_eq!(busy_mutators().code, DAEMON_BUSY);
+    }
+
+    /// Every code a failed dial can put into a status is one `ssk explain` can
+    /// say something about. The `match` has no wildcard, so a new `NetcoreError`
+    /// variant does not compile here until it is listed, and the list is then
+    /// checked against the variants it must cover.
+    #[test]
+    fn every_netcore_code_is_explainable() {
+        use ssk_netadmin::adapter::AdapterKind;
+        use ssk_netcore::{DialAttempts, NetcoreError as E};
+
+        const VARIANTS: usize = 17;
+        fn index(error: &E) -> usize {
+            match error {
+                E::OpenVpnNotReady(_) => 0,
+                E::Timeout(..) => 1,
+                E::ConnectionRefused(..) => 2,
+                E::DnsResolutionFailed(..) => 3,
+                E::TlsHandshakeFailed(..) => 4,
+                E::ProxyRejected(..) => 5,
+                E::Unsupported(_) => 6,
+                E::PolicyDenied(_) => 7,
+                E::NoRoute(_) => 8,
+                E::UnknownAdapter(_) => 9,
+                E::Io(..) => 10,
+                E::ProtocolError(..) => 11,
+                E::InvalidTarget(_) => 12,
+                E::ResolverBusy => 13,
+                E::AddressRefused { .. } => 14,
+                E::FamilyDisabled => 15,
+                E::DialFailed { .. } => 16,
+            }
+        }
+        let one_of_each = vec![
+            E::OpenVpnNotReady("p".into()),
+            E::Timeout("h:1".into(), Duration::from_secs(1)),
+            E::ConnectionRefused("h:1".into(), "refused".into()),
+            E::DnsResolutionFailed("h".into(), "os-resolver".into(), "no addresses".into()),
+            E::TlsHandshakeFailed("relay".into(), "bad certificate".into()),
+            E::ProxyRejected("proxy".into(), "denied".into()),
+            E::Unsupported(AdapterKind::DnsOverride),
+            E::PolicyDenied("no rule".into()),
+            E::NoRoute("empty hop chain".into()),
+            E::UnknownAdapter("a".into()),
+            E::Io("h:1".into(), std::io::Error::other("unreachable")),
+            E::ProtocolError("proxy".into(), "short reply".into()),
+            E::InvalidTarget("not a host".into()),
+            E::ResolverBusy,
+            E::AddressRefused {
+                code: "loopback",
+                refused: 1,
+                answers: 1,
+            },
+            E::FamilyDisabled,
+            E::DialFailed {
+                source: Box::new(E::ResolverBusy),
+                attempts: DialAttempts {
+                    answers: 0,
+                    attempted: Vec::new(),
+                },
+            },
+        ];
+        let mut covered: Vec<usize> = one_of_each.iter().map(index).collect();
+        covered.sort_unstable();
+        assert_eq!(
+            covered,
+            (0..VARIANTS).collect::<Vec<_>>(),
+            "the list must hold every variant of NetcoreError exactly once"
+        );
+
+        for error in &one_of_each {
+            let explained = explain_code(error.code());
+            assert!(
+                !explained.summary.starts_with("Unknown error code"),
+                "{} has no explanation: {explained:?}",
+                error.code()
+            );
+            assert!(!explained.next_steps.is_empty(), "{}", error.code());
+        }
+    }
+
+    /// `KILL_SWITCH_ARMED` is the answer of a `Deactivate` while the daemon is in
+    /// its own fail-closed state. It never described the firewall rule, which
+    /// the broker owns and `release_kill_switch` does not reach.
+    #[tokio::test]
+    async fn the_kill_switch_armed_answer_describes_the_daemons_fail_closed_state() {
+        let (sup, _dir) = supervisor_with(real_data_plane());
+        let (_reserved, host, port) = unreachable_dest();
+        call(
+            &sup,
+            Request::ActivateProfile(ssk_ipc::ActivateProfileRequest {
+                profile_id: "default".into(),
+                dest_host: Some(host),
+                dest_port: Some(port),
+            }),
+        )
+        .await;
+        let error = match call(
+            &sup,
+            Request::Deactivate(ssk_ipc::DeactivateRequest {
+                release_kill_switch: false,
+            }),
+        )
+        .await
+        {
+            Response::Err(error) => error,
+            other => panic!("a fail-closed daemon must refuse to deactivate: {other:?}"),
+        };
+        assert_eq!(error.code, "KILL_SWITCH_ARMED");
+        assert!(
+            error.message.contains("fail-closed state"),
+            "{}",
+            error.message
+        );
+        let explained = explain_code(&error.code);
+        for text in [&error.message, &explained.summary, &explained.details] {
+            assert!(
+                !text.contains("kill switch is armed"),
+                "the daemon's own state was called the kill switch: {text}"
+            );
+        }
+        assert!(explained.summary.contains("fail-closed"));
     }
 }

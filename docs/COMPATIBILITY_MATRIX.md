@@ -213,15 +213,54 @@ The `Activating` variant and the shape of `StatusDto` are unchanged, so every cl
 decodes it; what is new is that a status read can return it, for up to 20 s, where it
 used to block. Clients must show it as in progress, never as protected, and must not
 read the empty fields as a statement about the previous session or the ledger: an
-absent `audit_head` means not read. Every other request that needs the state lock
-(a second `ActivateProfile`, `Deactivate`, `ListProfiles`, `TraceRoute`,
-`GetAuditEntries`, `VerifyAuditChain`, `RunDoctor`) still waits behind the dial.
-`InspectFlow`, `ListRecentFlows`, `ExplainError` and `SubscribeEvents` never take that
-lock and answer at once. `SubscribeEvents` only answers `Ack`: the server writes one
-`Response` per `Request` and no IPC client receives events yet. The adapter health
-text of a held session changed from `live (real, connected)` to `connected at
-activation; liveness not monitored`; it is free text, nothing in this repository
-parses it, and consumers must not.
+absent `audit_head` means not read. `InspectFlow`, `ListRecentFlows`, `ExplainError`
+and `SubscribeEvents` never take the state lock and answer at once; how the other
+requests behave during a dial is described in "Requests during an activation" below.
+`SubscribeEvents` only answers `Ack`: the server writes one `Response` per `Request`
+and no IPC client receives events yet. The adapter health text of a held session
+changed from `live (real, connected)` to `connected at activation; liveness not
+monitored`; it is free text, nothing in this repository parses it, and consumers
+must not.
+
+## Requests during an activation (2026-10-07)
+
+An `ActivateProfile` dial (at most 20 s) holds the daemon's state lock. Besides
+`GetStatus`, the other requests no longer queue behind it, except a `Deactivate`
+(last item):
+
+* `ListProfiles` and `RunDoctor` answer at once: they read the startup configuration
+  and the environment, not the state the dial holds.
+* `TraceRoute`, `GetAuditEntries` and `VerifyAuditChain` do need that state. When an
+  activation is in flight and the state lock is still taken after 100 ms, they answer
+  an error with the new code `DAEMON_BUSY` (class `Runtime`, `retriable: true`) and
+  change nothing, instead of waiting for the dial. With no activation in flight they
+  wait for any other holder, as before. A client retries once the activation has
+  ended; a client that does not know the code shows it as unknown, like any string
+  code.
+* At most two requests that change the state (`ActivateProfile`, `Deactivate`) are in
+  flight at once: the one holding the lock and one waiting for it. A third answers
+  `DAEMON_BUSY` at once, writes no ledger entry and emits no event. Reason: the IPC
+  server serves 16 connections at a time and a waiting request keeps its connection;
+  an activation and 15 waiting requests left a 17th client's `GetStatus` unserved for
+  the whole dial (measured).
+* `Deactivate` still waits for an activation that was accepted before it, up to the
+  activation deadline. The lock is first come, first served, so its result is applied
+  after the activation and is not overwritten by it.
+
+Closing a held session, in `Deactivate` and in the watchdog that records a lost worker
+task, now waits at most 1 s for the graceful close and then drops the transport, which
+closes it. Before, a peer that never read could keep the state lock, and with it every
+request above, for as long as it liked.
+
+The text of the `KILL_SWITCH_ARMED` refusal of a `Deactivate` while the daemon is
+fail-closed changed from "kill switch is armed; ..." to "the daemon is in its
+fail-closed state; pass release_kill_switch=true to deactivate anyway", and its
+`ExplainError` text with it. The code, the class and the behaviour are the same: the
+refusal was always about the daemon's own state, and `release_kill_switch` never
+reached the firewall rule, which the privileged broker owns. Messages are free text,
+not a contract. `ExplainError` also answers `DAEMON_BUSY` and the `NETCORE_*` codes
+that `last_error.code` can carry (it said "unknown error code" for them). No request,
+response or DTO shape and no ledger format changed.
 
 ## Host grammar in routing configuration (2026-10-06)
 
