@@ -10,6 +10,11 @@
 //! around by sending a name that resolves to it. The check can only refuse more,
 //! never admit more, so it applies at any rule priority.
 //!
+//! The first hop of a proxy chain (`DialPurpose::FirstHop`) is the operator's own
+//! configuration: a local, LAN or shared-space proxy is legitimate, so it is
+//! asked only about the self-loop and about the classes that are never a proxy
+//! (unspecified, this-network, metadata, multicast, broadcast, reserved, discard).
+//!
 //! There is no exemption mechanism, on purpose: a literal may be opened by an
 //! exact rule (`target::guard_special_use`), a name's answer never.
 //!
@@ -30,7 +35,7 @@ use ssk_netcore::{
 };
 use tokio::sync::watch;
 
-use super::target::{classify_ip, unmap_ip};
+use super::target::{classify_ip, unmap_ip, SpecialUse};
 use super::types::{lock_unpoisoned, Gate, GateMode, IngressCfgView};
 use crate::routing::{ingress_executor_dial_deadline, ConfiguredRouting, DenyIp};
 
@@ -124,11 +129,22 @@ impl IngressDirectGuard {
         let Some(gate) = self.cells.gate.get() else {
             return Self::refuse(REFUSAL_NOT_ARMED);
         };
+        // A gate whose sender is gone is not armed: the host that owned it has
+        // stopped, and `has_changed` is the receiver's way of saying so. (The pump
+        // treats the same condition as a gate change.)
+        if gate.has_changed().is_err() {
+            return Self::refuse(REFUSAL_NOT_ARMED);
+        }
         // The profile that is armed now. The borrow is released before any other
         // work: the guard holds nothing across a call.
         let profile = match &gate.borrow().mode {
             GateMode::Armed { profile } => Arc::clone(profile),
             _ => return Self::refuse(REFUSAL_NOT_ARMED),
+        };
+        // A profile the guard holds no deny set for (not even an empty one) is a
+        // profile it was not built for: refuse, do not assume it has no denials.
+        let Some(denials) = self.denials.get(&*profile) else {
+            return Self::refuse(REFUSAL_NOT_ARMED);
         };
         let ip = unmap_ip(ip);
         // The more specific label first: a self-loop is also loopback.
@@ -138,11 +154,12 @@ impl IngressDirectGuard {
         if let Some(special) = classify_ip(ip) {
             return Self::refuse(special.code());
         }
-        let denied = self.denials.get(&*profile).is_some_and(|denials| {
-            denials
-                .iter()
-                .any(|deny| deny.ip == ip && deny.port.is_none_or(|p| p == port))
-        });
+        // A rule's own address is compared in the same spelling, whatever it was
+        // written as (the configuration refuses a mapped one; this does not rely
+        // on that).
+        let denied = denials
+            .iter()
+            .any(|deny| unmap_ip(deny.ip) == ip && deny.port.is_none_or(|p| p == port));
         if denied {
             return Self::refuse(REFUSAL_DENY_RULE);
         }
@@ -153,10 +170,27 @@ impl IngressDirectGuard {
         let Some(listener) = self.cells.listener() else {
             return Self::refuse(REFUSAL_NOT_ARMED);
         };
-        if Self::loops_back(listener, unmap_ip(ip), port) {
+        let ip = unmap_ip(ip);
+        if Self::loops_back(listener, ip, port) {
             return Self::refuse(REFUSAL_LISTENER);
         }
-        Ok(())
+        // A local, LAN or shared-space proxy is legitimate, so special-use as a
+        // whole is not refused here. These classes are never a proxy, and a
+        // hostile answer for the proxy's NAME could otherwise aim the handshake
+        // bytes at the metadata service or a broadcast address.
+        match classify_ip(ip) {
+            Some(
+                special @ (SpecialUse::Unspecified
+                | SpecialUse::ThisNetwork
+                | SpecialUse::Metadata
+                | SpecialUse::Multicast
+                | SpecialUse::Broadcast
+                | SpecialUse::Reserved
+                | SpecialUse::Discard
+                | SpecialUse::DummyPrefix),
+            ) => Self::refuse(special.code()),
+            _ => Ok(()),
+        }
     }
 }
 
@@ -492,10 +526,9 @@ mod tests {
         assert_eq!(target(&guard, PUBLIC, 443), Ok(()));
         assert_eq!(target(&guard, "93.184.216.50", 443), Err(REFUSAL_DENY_RULE));
 
-        // A profile the guard has no set for has no denial (and the engine will
-        // not have admitted a flow for it).
+        // A profile the guard has no set for is refused (see the test of its own).
         tx.send(gate(3, armed("unknown"))).expect("receiver alive");
-        assert_eq!(target(&guard, PUBLIC, 443), Ok(()));
+        assert_eq!(target(&guard, PUBLIC, 443), Err(REFUSAL_NOT_ARMED));
 
         // Not armed: everything is refused, every mode, every address.
         let unarmed = [
@@ -572,7 +605,8 @@ mod tests {
         assert!(cells.set_gate(rx_a));
         assert!(!cells.set_gate(rx_b), "the first receiver stays");
         cells.set_listener(LISTENER.parse().expect("listener"));
-        let guard = IngressDirectGuard::new(cells, BTreeMap::new());
+        let guard =
+            IngressDirectGuard::new(cells, BTreeMap::from([("main".to_owned(), Vec::new())]));
         assert_eq!(
             target(&guard, PUBLIC, 443),
             Ok(()),
@@ -581,12 +615,81 @@ mod tests {
     }
 
     #[test]
-    fn a_gate_whose_sender_is_gone_still_answers_with_its_last_value() {
-        // The pump and the engine cancel flows on a vanished gate; the guard's
-        // job is only to answer, and the last value is what it knows.
+    fn a_gate_whose_sender_is_gone_is_not_armed() {
+        // The host that owned the gate has stopped; the pump cancels flows on the
+        // same condition, and the guard must not keep admitting on a stale "armed".
         let (guard, tx, _) = guard_in(&plain(), armed("main"));
-        drop(tx);
         assert_eq!(target(&guard, PUBLIC, 443), Ok(()));
+        drop(tx);
+        assert_eq!(target(&guard, PUBLIC, 443), Err(REFUSAL_NOT_ARMED));
+        assert_eq!(target(&guard, "8.8.8.8", 443), Err(REFUSAL_NOT_ARMED));
+    }
+
+    #[test]
+    fn an_armed_profile_the_guard_was_not_built_for_refuses() {
+        let (guard, tx, _) = guard_in(&plain(), armed("main"));
+        tx.send(gate(2, armed("ghost"))).expect("receiver alive");
+        assert_eq!(target(&guard, PUBLIC, 443), Err(REFUSAL_NOT_ARMED));
+        // A profile that has an (empty) set is a profile it was built for.
+        tx.send(gate(3, armed("other"))).expect("receiver alive");
+        assert_eq!(target(&guard, PUBLIC, 443), Ok(()));
+    }
+
+    #[test]
+    fn a_deny_rule_is_not_hidden_by_an_allow_for_the_same_address() {
+        // The allow comes first (lower priority number) and names the very
+        // address that a later deny names; the guard is not the policy engine and
+        // must refuse the answer anyway.
+        let routing = routing(vec![
+            (
+                "main",
+                vec![
+                    rule("allow", 1, PUBLIC, None, RoutingAction::Direct),
+                    rule("deny", 10, PUBLIC, None, RoutingAction::Deny),
+                ],
+            ),
+            ("other", vec![]),
+        ]);
+        let (guard, _tx, _) = guard_in(&routing, armed("main"));
+        assert_eq!(target(&guard, PUBLIC, 443), Err(REFUSAL_DENY_RULE));
+        // Same with a port-specific allow in front of an all-port deny.
+        let routing = self::routing(vec![
+            (
+                "main",
+                vec![
+                    rule("allow", 1, PUBLIC, Some(443), RoutingAction::Direct),
+                    rule("deny", 10, PUBLIC, None, RoutingAction::Deny),
+                ],
+            ),
+            ("other", vec![]),
+        ]);
+        let (guard, _tx, _) = guard_in(&routing, armed("main"));
+        assert_eq!(target(&guard, PUBLIC, 443), Err(REFUSAL_DENY_RULE));
+        assert_eq!(target(&guard, PUBLIC, 80), Err(REFUSAL_DENY_RULE));
+    }
+
+    #[test]
+    fn a_deny_rule_written_in_the_mapped_spelling_still_matches() {
+        // The configuration refuses such a rule; the guard does not rely on that.
+        let mut denials = BTreeMap::new();
+        denials.insert(
+            "main".to_owned(),
+            vec![DenyIp {
+                ip: ip("::ffff:93.184.216.34"),
+                port: None,
+                rule_id: "mapped".into(),
+            }],
+        );
+        let cells = GuardCells::new();
+        cells.set_listener(LISTENER.parse().expect("listener"));
+        let (_tx, rx) = watch::channel(gate(1, armed("main")));
+        assert!(cells.set_gate(rx));
+        let guard = IngressDirectGuard::new(cells, denials);
+        assert_eq!(target(&guard, PUBLIC, 443), Err(REFUSAL_DENY_RULE));
+        assert_eq!(
+            target(&guard, "::ffff:93.184.216.34", 443),
+            Err(REFUSAL_DENY_RULE)
+        );
     }
 
     // -- the first hop ------------------------------------------------------
@@ -618,6 +721,45 @@ mod tests {
         // The same port on another host is not a loop.
         assert_eq!(first_hop(&guard, "192.168.1.9", 10800), Ok(()));
         assert_eq!(first_hop(&guard, PUBLIC, 10800), Ok(()));
+    }
+
+    #[test]
+    fn first_hop_refuses_the_classes_that_are_never_a_proxy() {
+        let (guard, _tx, _) = guard_in(&plain(), armed("main"));
+        for (address, special) in [
+            ("0.0.0.0", SpecialUse::Unspecified),
+            ("0.9.9.9", SpecialUse::ThisNetwork),
+            ("169.254.169.254", SpecialUse::Metadata),
+            ("224.0.0.251", SpecialUse::Multicast),
+            ("ff02::fb", SpecialUse::Multicast),
+            ("255.255.255.255", SpecialUse::Broadcast),
+            ("240.0.0.1", SpecialUse::Reserved),
+            ("::", SpecialUse::Unspecified),
+            ("100::1", SpecialUse::Discard),
+            ("100:0:0:1::1", SpecialUse::DummyPrefix),
+            ("::ffff:169.254.169.254", SpecialUse::Metadata),
+        ] {
+            assert_eq!(
+                first_hop(&guard, address, 1080),
+                Err(special.code()),
+                "{address}"
+            );
+        }
+        // And the legitimate ones stay legitimate: local, LAN, shared space,
+        // link-local other than the metadata address, public.
+        for address in [
+            "127.0.0.1",
+            "::1",
+            "10.1.2.3",
+            "192.168.1.9",
+            "100.64.0.9",
+            "169.254.1.1",
+            "fe80::1",
+            "fd00::1",
+            PUBLIC,
+        ] {
+            assert_eq!(first_hop(&guard, address, 1080), Ok(()), "{address}");
+        }
     }
 
     #[test]

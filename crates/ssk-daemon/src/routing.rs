@@ -475,6 +475,39 @@ mod tests {
         assert!(routing.exact_ip_denials("absent").is_empty());
     }
 
+    /// The reviewer's mutant: dropping a deny whose address an earlier rule also
+    /// names. The guard must see the deny whatever precedes it.
+    #[test]
+    fn exact_ip_denials_keeps_a_deny_that_an_earlier_allow_names_too() {
+        let routing = routing_of(vec![profile(
+            "main",
+            vec![
+                rule("allow", 1, Some("203.0.113.9"), None, RoutingAction::Direct),
+                rule("deny", 10, Some("203.0.113.9"), None, RoutingAction::Deny),
+                rule(
+                    "allow-port",
+                    2,
+                    Some("198.51.100.1"),
+                    Some(443),
+                    RoutingAction::Direct,
+                ),
+                rule(
+                    "deny-all-ports",
+                    20,
+                    Some("198.51.100.1"),
+                    None,
+                    RoutingAction::Deny,
+                ),
+            ],
+        )]);
+        let ids: Vec<String> = routing
+            .exact_ip_denials("main")
+            .into_iter()
+            .map(|d| d.rule_id)
+            .collect();
+        assert_eq!(ids, vec!["deny".to_owned(), "deny-all-ports".to_owned()]);
+    }
+
     /// Only an exact address AND port on a rule that is not a deny can ever
     /// open a special-use address; every other shape must read as "no".
     #[test]

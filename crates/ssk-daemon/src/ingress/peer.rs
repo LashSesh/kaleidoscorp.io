@@ -167,29 +167,50 @@ fn parse_endpoint_v6(text: &str) -> Option<SocketAddr> {
     ))
 }
 
-/// The header both tables start with. Only the column order matters: the data
-/// lines are read by position.
-fn header_is_known(line: &str) -> bool {
-    let columns: Vec<&str> = line.split_whitespace().collect();
-    let position = |name: &str| columns.iter().position(|column| *column == name);
-    match (
-        position("sl"),
-        position("local_address"),
-        position("rem_address"),
-        position("st"),
-        position("uid"),
-        position("inode"),
-    ) {
-        (Some(sl), Some(local), Some(rem), Some(st), Some(uid), Some(inode)) => {
-            sl < local && local < rem && rem < st && st < uid && uid < inode
-        }
-        _ => false,
-    }
+/// The header line of each table, as the kernel prints it, reduced to its words.
+/// The two tables do NOT agree: `tcp` says `rem_address` and `tcp6` says
+/// `remote_address` (`net/ipv4/tcp_ipv4.c` and `net/ipv6/tcp_ipv6.c`). The data
+/// lines are read by absolute position, so the header must be exactly the layout
+/// those positions assume; anything else is refused, not guessed at.
+const HEADER_V4: [&str; 12] = [
+    "sl",
+    "local_address",
+    "rem_address",
+    "st",
+    "tx_queue",
+    "rx_queue",
+    "tr",
+    "tm->when",
+    "retrnsmt",
+    "uid",
+    "timeout",
+    "inode",
+];
+const HEADER_V6: [&str; 12] = [
+    "sl",
+    "local_address",
+    "remote_address",
+    "st",
+    "tx_queue",
+    "rx_queue",
+    "tr",
+    "tm->when",
+    "retrnsmt",
+    "uid",
+    "timeout",
+    "inode",
+];
+
+fn header_is_known(line: &str, ipv6: bool) -> bool {
+    let expected: &[&str; 12] = if ipv6 { &HEADER_V6 } else { &HEADER_V4 };
+    // The kernel writes ASCII; `split_whitespace` would also split on U+0085 and
+    // other Unicode spaces, which a forged table could use.
+    line.split_ascii_whitespace().eq(expected.iter().copied())
 }
 
 fn parse_row(line: &str, ipv6: bool) -> Option<Row> {
     // `sl: local rem st tx:rx tr:tm retrnsmt uid timeout inode ...`
-    let mut fields = line.split_whitespace();
+    let mut fields = line.split_ascii_whitespace();
     let _slot = fields.next()?;
     let local = fields.next()?;
     let remote = fields.next()?;
@@ -234,13 +255,16 @@ fn parse_table(
         return Err(ParseError::TooLarge);
     }
     let mut lines = text.lines();
-    if !lines.next().is_some_and(header_is_known) {
+    if !lines
+        .next()
+        .is_some_and(|header| header_is_known(header, ipv6))
+    {
         return Err(ParseError::UnexpectedHeader);
     }
     for line in lines.filter(|line| !line.trim().is_empty()) {
         if let Some(wanted) = filter {
             // The remote endpoint is the third whitespace-separated field.
-            let remote = line.split_whitespace().nth(2);
+            let remote = line.split_ascii_whitespace().nth(2);
             if remote.is_some_and(|remote| !remote.eq_ignore_ascii_case(wanted)) {
                 continue;
             }
@@ -317,31 +341,34 @@ pub enum RowDecision {
 pub fn decide_row(rows: &[Row], query: &PeerQuery, own_uid: u32) -> RowDecision {
     let client = normalise(query.client);
     let listener = normalise(query.listener);
-    let mut found: Vec<(u8, u32, u64)> = Vec::new();
+    // At most one distinct clear row is ever kept: the second one ends the scan,
+    // so a table of forged rows cannot make this take longer than one pass.
+    let mut clear: Option<(u8, u32, u64)> = None;
     let mut other_state = false;
     for row in rows {
         if normalise(row.local) != client || normalise(row.remote) != listener {
             continue;
         }
-        if matches!(
+        if !matches!(
             row.state,
             STATE_ESTABLISHED | STATE_FIN_WAIT1 | STATE_FIN_WAIT2
         ) {
-            let key = (row.state, row.uid, row.inode);
-            if !found.contains(&key) {
-                found.push(key);
-            }
-        } else {
             other_state = true;
+            continue;
+        }
+        let key = (row.state, row.uid, row.inode);
+        match clear {
+            None => clear = Some(key),
+            Some(first) if first == key => {}
+            Some(_) => return RowDecision::Verdict(PeerVerdict::Unknown),
         }
     }
-    match found.as_slice() {
-        [] if other_state => RowDecision::Verdict(PeerVerdict::Unknown),
-        [] => RowDecision::Miss,
-        [(_, _, 0)] => RowDecision::Verdict(PeerVerdict::Unknown),
-        [(_, uid, _)] if *uid == own_uid => RowDecision::Verdict(PeerVerdict::SameUser),
-        [(_, _, _)] => RowDecision::Verdict(PeerVerdict::DifferentUser),
-        _ => RowDecision::Verdict(PeerVerdict::Unknown),
+    match clear {
+        None if other_state => RowDecision::Verdict(PeerVerdict::Unknown),
+        None => RowDecision::Miss,
+        Some((_, _, 0)) => RowDecision::Verdict(PeerVerdict::Unknown),
+        Some((_, uid, _)) if uid == own_uid => RowDecision::Verdict(PeerVerdict::SameUser),
+        Some(_) => RowDecision::Verdict(PeerVerdict::DifferentUser),
     }
 }
 
@@ -383,6 +410,9 @@ mod tests {
     use super::*;
 
     const HEADER: &str = "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode";
+    /// The header of `/proc/net/tcp6`, as `net/ipv6/tcp_ipv6.c` prints it: the
+    /// third column is `remote_address`, not `rem_address`.
+    const HEADER6: &str = "  sl  local_address                         remote_address                        st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode";
 
     /// Lines as this sandbox's kernel printed them (see the comments for what
     /// each is).
@@ -488,7 +518,7 @@ mod tests {
             u32::from_ne_bytes([0, 0, 0, 1])
         );
         let text = format!(
-            "{HEADER}\n\
+            "{HEADER6}\n\
              0: {mapped_client}:D656 {mapped_client}:931D 01 00000000:00000000 00:00000000 00000000  1000        0 555 1 0000000000000000 100 0 0 10 0\n\
              1: {native}:0050 {loopback6}:01BB 04 00000000:00000000 00:00000000 00000000  0        0 777 1 0000000000000000 100 0 0 10 0\n"
         );
@@ -512,7 +542,13 @@ mod tests {
 
     #[test]
     fn the_header_must_be_the_known_layout() {
-        assert!(header_is_known(HEADER));
+        assert!(header_is_known(HEADER, false));
+        assert!(header_is_known(HEADER6, true));
+        // The two tables are not interchangeable: tcp says rem_address and tcp6
+        // says remote_address, and a parser that accepted the wrong one for a
+        // table would reject (or misread) every real file.
+        assert!(!header_is_known(HEADER, true));
+        assert!(!header_is_known(HEADER6, false));
         for bad in [
             "",
             "garbage",
@@ -520,8 +556,11 @@ mod tests {
             // Same words, wrong order: the positions would mean something else.
             "sl rem_address local_address st tx_queue rx_queue tr tm->when retrnsmt uid timeout inode",
             "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   timeout inode uid",
+            // A header that merely contains the words in order, with others between.
+            "sl local_address rem_address st extra tx_queue rx_queue tr tm->when retrnsmt uid timeout inode",
+            "sl local_address rem_address st uid foo bar baz inode",
         ] {
-            assert!(!header_is_known(bad), "{bad:?}");
+            assert!(!header_is_known(bad, false), "{bad:?}");
             assert_eq!(
                 parse_proc_net_tcp(&format!("{bad}\n   0: 0100007F:1F90 0100007F:0050 01 0:0 0:0 0 0 0 1"), None),
                 Err(ParseError::UnexpectedHeader),
@@ -532,6 +571,65 @@ mod tests {
             parse_proc_net_tcp("", None),
             Err(ParseError::UnexpectedHeader)
         );
+        assert_eq!(
+            parse_proc_net_tcp6(&format!("{HEADER}\n"), None),
+            Err(ParseError::UnexpectedHeader),
+            "the tcp header is not the tcp6 header"
+        );
+        assert_eq!(
+            parse_proc_net_tcp(&format!("{HEADER6}\n"), None),
+            Err(ParseError::UnexpectedHeader)
+        );
+    }
+
+    #[test]
+    fn every_edit_of_the_header_is_refused_for_both_tables() {
+        for (header, ipv6) in [(HEADER, false), (HEADER6, true)] {
+            let words: Vec<&str> = header.split_ascii_whitespace().collect();
+            for at in 0..words.len() {
+                // A word missing.
+                let mut dropped = words.clone();
+                dropped.remove(at);
+                assert!(
+                    !header_is_known(&dropped.join(" "), ipv6),
+                    "missing {}",
+                    words[at]
+                );
+                // A word altered.
+                let mut altered = words.clone();
+                let changed = format!("{}x", words[at]);
+                altered[at] = &changed;
+                assert!(
+                    !header_is_known(&altered.join(" "), ipv6),
+                    "altered {}",
+                    words[at]
+                );
+                // A word added.
+                let mut added = words.clone();
+                added.insert(at, "extra");
+                assert!(
+                    !header_is_known(&added.join(" "), ipv6),
+                    "added before {}",
+                    words[at]
+                );
+                // Two neighbours swapped.
+                if let Some(next) = words.get(at + 1) {
+                    let mut swapped = words.clone();
+                    swapped[at] = next;
+                    swapped[at + 1] = words[at];
+                    assert!(
+                        !header_is_known(&swapped.join(" "), ipv6),
+                        "swapped {}",
+                        words[at]
+                    );
+                }
+            }
+            // Case matters, and so does a Unicode space where the kernel writes ASCII.
+            assert!(!header_is_known(&header.to_uppercase(), ipv6));
+            assert!(!header_is_known(&header.replacen(' ', "\u{85}", 3), ipv6));
+            // Any amount of ASCII white space between the words is fine.
+            assert!(header_is_known(&words.join("\t \t"), ipv6));
+        }
     }
 
     #[test]
@@ -565,6 +663,39 @@ mod tests {
             bad_lines.len() - 1,
             "every non-blank bad line"
         );
+    }
+
+    #[test]
+    fn only_ascii_white_space_separates_the_fields() {
+        // U+0085 (NEL) and the other Unicode spaces are white space to
+        // `split_whitespace`; a forged table could use them to shift fields. The
+        // kernel writes ASCII, so anything else is a malformed line.
+        let good = "   5: 0100007F:D656 0100007F:931D 01 00000000:00000000 00:00000000 00000000     0        0 104052 2 00000000343c1b12 20 0 0 10 -1";
+        let nel = good.replacen(' ', "\u{85}", 40);
+        let table =
+            parse_proc_net_tcp(&format!("{HEADER}\n{good}\n{nel}\n"), None).expect("parses");
+        assert_eq!(
+            table.rows.len(),
+            1,
+            "only the ASCII-separated line is a row"
+        );
+        assert_eq!(table.malformed, 1);
+        // The same for the remote-endpoint filter, which looks at the third field.
+        let word = u32::from_ne_bytes([127, 0, 0, 1]);
+        let forged = format!("   5: {word:08X}:D656\u{a0}{word:08X}:931D 01 0:0 0:0 0 0 0 1");
+        let raw = RawTables {
+            tcp: format!("{HEADER}\n{forged}\n"),
+            tcp6: None,
+        };
+        let table = parse_tables(&raw, sa(LISTENER)).expect("parses");
+        assert!(
+            table.rows.is_empty(),
+            "the filter did not see a remote endpoint"
+        );
+        // The filter skipped the line without parsing it; with Unicode white space
+        // it would have let it through to the row parser, which counts it as
+        // malformed.
+        assert_eq!(table.malformed, 0, "skipped by the filter, not counted");
     }
 
     #[test]
@@ -613,7 +744,7 @@ mod tests {
         // And an empty tcp6 with only its header changes nothing.
         let raw = RawTables {
             tcp: REAL_TCP.to_owned(),
-            tcp6: Some(format!("{HEADER}\n")),
+            tcp6: Some(format!("{HEADER6}\n")),
         };
         assert_eq!(
             parse_tables(&raw, sa(LISTENER)).expect("parses").rows.len(),
@@ -629,6 +760,84 @@ mod tests {
             parse_tables(&raw, sa(LISTENER)),
             Err(ParseError::UnexpectedHeader)
         );
+    }
+
+    #[test]
+    fn a_populated_tcp6_table_goes_through_parse_tables() {
+        // A dual-stack client of 127.0.0.1:37661 shows up in tcp6 in the mapped
+        // form; native IPv6 rows and rows for other listeners are left out. This is
+        // the path a machine with IPv6 takes on every request.
+        let word = u32::from_ne_bytes([127, 0, 0, 1]);
+        let mapped = |port: &str| {
+            format!(
+                "0000000000000000{:08X}{word:08X}:{port}",
+                u32::from_ne_bytes([0, 0, 0xff, 0xff])
+            )
+        };
+        let line = |n: u32, local: &str, remote: &str, state: &str, uid: u32, inode: u32| {
+            format!("{n}: {local} {remote} {state} 00000000:00000000 00:00000000 00000000  {uid}        0 {inode} 1 0000000000000000 100 0 0 10 0")
+        };
+        let text = format!(
+            "{HEADER6}\n{}\n{}\n{}\n",
+            line(0, &mapped("D656"), &mapped("931D"), "01", 1000, 555),
+            line(1, &mapped("931D"), &mapped("D656"), "01", 1000, 556),
+            line(2, &mapped("D657"), &mapped("2710"), "01", 1000, 557),
+        );
+        let raw = RawTables {
+            tcp: format!("{HEADER}\n"),
+            tcp6: Some(text),
+        };
+        let table = parse_tables(&raw, sa(LISTENER)).expect("a real-shaped tcp6 parses");
+        assert_eq!(table.malformed, 0);
+        assert_eq!(
+            table.rows,
+            vec![Row {
+                local: sa("[::ffff:127.0.0.1]:54870"),
+                remote: sa("[::ffff:127.0.0.1]:37661"),
+                state: 1,
+                uid: 1000,
+                inode: 555,
+            }]
+        );
+        assert_eq!(
+            decide_row(&table.rows, &query(CLIENT, LISTENER), 1000),
+            RowDecision::Verdict(PeerVerdict::SameUser)
+        );
+    }
+
+    #[test]
+    fn a_listener_port_below_0x1000_is_spelled_with_four_digits() {
+        // The kernel prints ports as %04X, so 1080 is 0438 and a filter that
+        // printed 438 would match no row at all (which refuses every client of a
+        // listener on a low port, silently).
+        let listener = sa("127.0.0.1:1080");
+        let filter = RemoteFilter::for_listener(listener).expect("ipv4");
+        assert!(filter.tcp.ends_with(":0438"), "{}", filter.tcp);
+        assert!(
+            filter.tcp6_mapped.ends_with(":0438"),
+            "{}",
+            filter.tcp6_mapped
+        );
+        let word = u32::from_ne_bytes([127, 0, 0, 1]);
+        let raw = RawTables {
+            tcp: format!(
+                "{HEADER}\n   1: {word:08X}:D656 {word:08X}:0438 01 00000000:00000000 00:00000000 00000000  1000        0 99 1 0000000000000000 100 0 0 10 0\n"
+            ),
+            tcp6: None,
+        };
+        let table = parse_tables(&raw, listener).expect("parses");
+        assert_eq!(table.rows.len(), 1);
+        assert_eq!(table.rows[0].remote, listener);
+        // And port 0x0001 and the highest ports.
+        for port in [1_u16, 15, 255, 4095, 4096, 65535] {
+            let filter =
+                RemoteFilter::for_listener(sa(&format!("127.0.0.1:{port}"))).expect("ipv4");
+            assert!(
+                filter.tcp.ends_with(&format!(":{port:04X}")),
+                "{port}: {}",
+                filter.tcp
+            );
+        }
     }
 
     #[test]

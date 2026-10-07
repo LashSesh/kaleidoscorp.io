@@ -469,8 +469,9 @@ fn classify_v6(ip: Ipv6Addr) -> Option<SpecialUse> {
 /// descriptors. A superset of the one address that could loop (`0.0.0.0:port`
 /// connects to the local host on Linux), harmless otherwise. A name cannot be
 /// checked before resolution; the resolved-address guard of the ingress
-/// executor (`IngressDirectGuard`, `C-G1b`) covers a name that resolves to
-/// loopback, and until it exists nothing does.
+/// executor (`guard::IngressDirectGuard`) covers a name that resolves to
+/// loopback or to the listener. A name routed through an upstream proxy is
+/// resolved there and cannot be checked locally (design 6.11).
 pub fn guard_self_loop(target: &Target, listener: SocketAddr) -> Result<(), Refusal> {
     let Some(ip) = target.ip else {
         return Ok(());
