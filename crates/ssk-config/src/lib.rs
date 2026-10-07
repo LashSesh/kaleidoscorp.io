@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 use serde::{Deserialize, Serialize};
+use serde_json::{Map, Value};
 use ssk_types::GateId;
 use std::collections::BTreeMap;
 
@@ -18,6 +19,13 @@ pub enum ConfigError {
     Yaml(#[from] serde_yaml::Error),
     #[error("toml parse error: {0}")]
     Toml(#[from] toml::de::Error),
+    /// A document that read as YAML or TOML but does not fit the schema (an
+    /// unknown or missing key, a value of the wrong type). Carries serde's
+    /// message, which names the field; migrated documents have no line or column.
+    #[error("invalid configuration document: {0}")]
+    Document(String),
+    /// Building a JSON value from our own types (the default sections a
+    /// migration inserts). Never a statement about the operator's document.
     #[error("json serialization error: {0}")]
     Json(#[from] serde_json::Error),
     #[error("config version `{found}` is unsupported; expected `{expected}`")]
@@ -810,7 +818,10 @@ impl AppConfig {
 
     pub fn parse_with_migration_yaml(content: &str) -> Result<LoadedConfig, ConfigError> {
         let value: serde_yaml::Value = serde_yaml::from_str(content)?;
-        Self::migrate_value(serde_json::to_value(value)?)
+        // The failure here is a YAML construct JSON cannot hold (a non-string
+        // key), a property of the document.
+        let value = serde_json::to_value(value).map_err(document_error)?;
+        Self::migrate_value(value)
     }
 
     pub fn parse_with_migration_toml(content: &str) -> Result<LoadedConfig, ConfigError> {
@@ -835,23 +846,14 @@ impl AppConfig {
         let config = match version {
             1 => {
                 object.remove("version");
-                Self::upgrade_from_v1(serde_json::from_value(value)?)
+                Self::upgrade_from_v1(from_document(value)?)
             }
-            2 => Self::upgrade_from_v2(serde_json::from_value(value)?),
-            3 => {
-                if object.contains_key("routing") {
-                    return Err(ConfigError::Structure(
-                        "routing requires config version 4".into(),
-                    ));
-                }
-                object.insert("version".into(), CURRENT_CONFIG_VERSION.into());
-                object.insert(
-                    "routing".into(),
-                    serde_json::to_value(routing::RoutingConfig::default())?,
-                );
-                serde_json::from_value(value)?
+            2 => Self::upgrade_from_v2(from_document(value)?),
+            CHAIN_FLOOR..CURRENT_CONFIG_VERSION => {
+                migrate_object_to_current(object, version)?;
+                from_document(value)?
             }
-            CURRENT_CONFIG_VERSION => serde_json::from_value(value)?,
+            CURRENT_CONFIG_VERSION => from_document(value)?,
             found => {
                 return Err(ConfigError::UnsupportedVersion {
                     found,
@@ -912,7 +914,7 @@ impl AppConfig {
                     "type": "object",
                     "required": ["min_protocol", "capabilities", "max_clock_skew_secs"],
                     "properties": {
-                        "min_protocol": {"type": "string", "pattern": "^[0-9]+\\\\.[0-9]+\\\\.[0-9]+$"},
+                        "min_protocol": {"type": "string", "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$"},
                         "capabilities": {"type": "array", "items": {"type": "string"}},
                         "max_clock_skew_secs": {"type": "integer", "minimum": 0}
                     }
@@ -985,7 +987,7 @@ impl AppConfig {
                     "type": "object",
                     "required": ["adversary_model", "linkability_threshold", "require_residue_report"],
                     "properties": {
-                        "adversary_model": {"type": "string", "enum": ["partial_network_observer"]},
+                        "adversary_model": {"type": "string", "enum": ["PartialNetworkObserver"]},
                         "linkability_threshold": {"type": "string", "const": "policy_defined"},
                         "require_residue_report": {"type": "boolean", "const": true}
                     }
@@ -1018,6 +1020,73 @@ impl AppConfig {
             }
         })
     }
+}
+
+/// Deserialises a document that was read as YAML or TOML into a JSON value.
+/// Its failures are about the document, never about serialising anything.
+fn from_document<T: serde::de::DeserializeOwned>(value: Value) -> Result<T, ConfigError> {
+    serde_json::from_value(value).map_err(document_error)
+}
+
+fn document_error(err: serde_json::Error) -> ConfigError {
+    ConfigError::Document(err.to_string())
+}
+
+/// The lowest version that migrates through the chain below. Versions 1 and 2
+/// keep their typed legacy shapes (`LegacyPolicyV1`, `AppConfigV2`).
+const CHAIN_FLOOR: u32 = 3;
+
+/// Applies one step per version from `from` up to `CURRENT_CONFIG_VERSION`.
+/// No step names the current version: a new version adds `step_N_to_M` and one
+/// arm below, and the test `every_version_below_current_has_a_migration_step`
+/// fails until it does.
+fn migrate_object_to_current(
+    object: &mut Map<String, Value>,
+    from: u32,
+) -> Result<(), ConfigError> {
+    let mut at = from;
+    while at < CURRENT_CONFIG_VERSION {
+        match at {
+            3 => step_3_to_4(object)?,
+            other => {
+                return Err(ConfigError::Structure(format!(
+                    "no migration step from config version {other}"
+                )))
+            }
+        }
+        at += 1;
+    }
+    object.insert("version".into(), CURRENT_CONFIG_VERSION.into());
+    Ok(())
+}
+
+/// Version 4 added the required `routing` section, empty and deny-all.
+fn step_3_to_4(object: &mut Map<String, Value>) -> Result<(), ConfigError> {
+    introduce_section(
+        object,
+        "routing",
+        4,
+        serde_json::to_value(routing::RoutingConfig::default())?,
+    )
+}
+
+/// Adds the section a version introduced. A document that declares an older
+/// version and already has the key is refused rather than migrated: an old
+/// file must not smuggle in a section its version does not know, and the
+/// default a step inserts must never silently replace the operator's own.
+fn introduce_section(
+    object: &mut Map<String, Value>,
+    key: &str,
+    version: u32,
+    default: Value,
+) -> Result<(), ConfigError> {
+    if object.contains_key(key) {
+        return Err(ConfigError::Structure(format!(
+            "{key} requires config version {version}"
+        )));
+    }
+    object.insert(key.into(), default);
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1065,6 +1134,50 @@ mod tests {
         assert!(snapshot.contains("strict_mode"));
         assert!(snapshot.contains("projective_connection_hypercube"));
         assert!(snapshot.contains("dissolution"));
+    }
+
+    /// Raising `CURRENT_CONFIG_VERSION` without adding the step that carries
+    /// documents across the new version must be loud, not a file that loads with
+    /// a section silently missing.
+    #[test]
+    fn every_version_below_current_has_a_migration_step() {
+        for from in CHAIN_FLOOR..CURRENT_CONFIG_VERSION {
+            let mut object = Map::new();
+            migrate_object_to_current(&mut object, from)
+                .unwrap_or_else(|err| panic!("no way across version {from}: {err}"));
+            assert_eq!(object["version"], serde_json::json!(CURRENT_CONFIG_VERSION));
+        }
+        // Below the floor the typed legacy shapes migrate; the chain has no step.
+        let err = migrate_object_to_current(&mut Map::new(), CHAIN_FLOOR - 1)
+            .expect_err("the chain does not start below its floor");
+        assert!(
+            matches!(&err, ConfigError::Structure(message)
+                if message == "no migration step from config version 2"),
+            "{err}"
+        );
+    }
+
+    /// The step that introduces a section refuses a document that already has
+    /// it, which is the one place the "an old version cannot smuggle a new
+    /// section" rule lives.
+    #[test]
+    fn a_step_refuses_a_section_its_version_introduces_when_it_is_already_there() {
+        let mut object = Map::new();
+        object.insert(
+            "routing".into(),
+            serde_json::json!({"default_profile": "x"}),
+        );
+        let err = migrate_object_to_current(&mut object, 3).expect_err("routing at version 3");
+        assert!(
+            matches!(&err, ConfigError::Structure(message)
+                if message == "routing requires config version 4"),
+            "{err}"
+        );
+        // Refused, not overwritten: the operator's own section is untouched.
+        assert_eq!(
+            object["routing"],
+            serde_json::json!({"default_profile": "x"})
+        );
     }
 
     #[test]

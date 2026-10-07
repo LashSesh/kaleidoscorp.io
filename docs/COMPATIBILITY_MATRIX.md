@@ -255,3 +255,54 @@ can now see:
   handle the new variants.
 
 No wire, ledger or configuration format changed.
+
+## Config schema evolution and document errors (2026-10-07)
+
+**Config schema evolution.** `CURRENT_CONFIG_VERSION` stays 4 and this entry changes no
+key, default or accepted document; it writes down when a later change needs a bump.
+Compatible within a version, no bump: a new key that has a default, a new value in a
+validated vocabulary, a widened range. Requires a bump, a step in the migration chain
+(one step per version, `migrate_object_to_current`) and a test that an older version
+cannot smuggle the new section: a new required section or key, a changed default, a
+renamed or removed key, a narrowed range, a change of meaning of an existing value.
+What an older build does with a file that uses something new depends on the section.
+The top level and `routing` deny unknown keys, so it refuses the file and names the key
+(one exception today: a `direct` or `deny` rule action ignores extra keys). `policy`,
+`runtime`, `interop`, `system` and the other sections accept unknown keys, so an older
+build loads such a file and ignores the new key; a change there must not rely on an
+older build refusing it. A value of a typed vocabulary that an older build does not
+know is refused with a message that lists the values it does know. Every change to the
+exported schema (`ssk config schema`) or to its golden file,
+`crates/ssk-config/tests/golden/ssk-config-v<N>.schema.json`, needs an entry in this
+file; CI (`breaking_change_guard`) fails a change under `crates/ssk-config/src/` or in
+that directory without one.
+
+**Migration chain.** A version 3 document now migrates through one step per version
+(`step_3_to_4` adds the deny-all `routing` section) instead of one hard-coded arm, so a
+later version adds a step and nothing else changes. Behaviour is the same: a document
+that declares version 3 and already has `routing` is refused with `routing requires
+config version 4`, versions 1 and 2 keep their typed legacy shapes, files are never
+rewritten and `migrated_from` is unchanged.
+
+**Document errors.** A document that reads as YAML or TOML but does not fit the schema
+(an unknown key, a missing key, a value of the wrong type, a YAML mapping key that JSON
+cannot hold) is now reported as `invalid configuration document: ...` where it was
+reported as `json serialization error: ...`, also for YAML and TOML input. The message
+names the field; wording is not a contract, and `ssk config lint`, the daemon's
+`ConfigInvalid` state and the exit codes are unchanged. `ssk_config::ConfigError`
+(library API, not a wire type) has a new variant `Document(String)`; a Rust caller
+that matches the enum exhaustively has to handle it. `ConfigError::Json` now means only
+that a JSON value could not be built from our own defaults.
+
+**Exported schema corrected, same documents.** `ssk config schema` listed two things that
+never matched what the parser reads and writes: `interop.min_protocol` carried a pattern
+that required a literal backslash, so no version string (the default `1.0.0` included)
+satisfied it, and `privacy.adversary_model` listed `partial_network_observer` while the
+value is read and written as `PartialNetworkObserver`. A tool that validated a
+configuration file against the schema of an earlier build refused every file. The
+pattern is now `^[0-9]+\.[0-9]+\.[0-9]+$` and the enumeration is `PartialNetworkObserver`;
+the `$id` stays `ssk-config-v4.json`. No file that `sskd` loaded is refused and none that
+it refused loads. The schema is written by hand and is not a complete description of the
+parser: where it is looser or stricter than `sskd` (a name that is not a valid host, an
+empty `system.name`, a repeated interop capability) the difference is listed in
+`crates/ssk-config/tests/schema_contract.rs`, and a new one fails the build.

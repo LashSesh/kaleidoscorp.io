@@ -571,7 +571,7 @@ Common incident scenarios and recovery steps are in [`docs/RUNBOOK.md`](docs/RUN
 | `replay_vectors` | Deterministic replay integration tests |
 | `interop_contracts` | Interop golden, negative, and fuzz tests |
 | `conformance_suite` | 7-profile interop conformance suite |
-| `config_schema_guard` | All `ssk-config` tests (schema snapshot stability included, no name filter) + schema export |
+| `config_schema_guard` | All `ssk-config` tests (the golden schema file and the schema-against-parser drift tests included, no name filter) + `ssk config schema --json` compared byte for byte with the golden file |
 | `breaking_change_guard` | Fails a push or pull request that changes a contract surface (`scripts/ci/contract_surfaces.txt`) without a `docs/COMPATIBILITY_MATRIX.md` entry or a `Compat-Impact: none (<reason>)` commit trailer |
 | `contract_guard_selftest` | `scripts/ci/tests/contract_guard.test.sh`: the guard's logic against throw-away repositories, on every push and pull request |
 | `netadmin_contracts` | Network administration layer contracts |

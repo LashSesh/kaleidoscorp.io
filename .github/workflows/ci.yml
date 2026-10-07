@@ -137,11 +137,11 @@ jobs:
 
   # Runs on both OSes: the schema export goes through the `ssk` CLI, which is a
   # shipped Windows binary, so a Windows-only break in that path must be caught
-  # here. The redirect + `test -s` are POSIX constructs, so the step declares
-  # `shell: bash` (available on GitHub's Windows runners via Git Bash). The
-  # export target is a relative path inside the checkout rather than the
-  # Unix-only `/tmp` -- and rather than `$RUNNER_TEMP`, which on Windows is a
-  # backslash-separated path that Git Bash would have to round-trip.
+  # here. The redirect, `test` and `cmp` are POSIX constructs, so the step
+  # declares `shell: bash` (available on GitHub's Windows runners via Git
+  # Bash). The export target is a relative path inside the checkout rather than
+  # the Unix-only `/tmp` -- and rather than `$RUNNER_TEMP`, which on Windows is
+  # a backslash-separated path that Git Bash would have to round-trip.
   config_schema_guard:
     runs-on: ${{ matrix.os }}
     timeout-minutes: 45
@@ -156,11 +156,16 @@ jobs:
       # No test-name filter: `cargo test <filter>` that matches nothing exits 0,
       # so renaming the snapshot test would have turned this step into a no-op.
       - run: cargo test --locked --no-fail-fast -p ssk-config
-      - name: Export config schema and assert it is non-empty
+      - name: Export config schema and assert it is the pinned schema
         shell: bash
         run: |
           cargo run -p ssk-cli -- config schema --json > ssk-config-schema.json
           test -s ssk-config-schema.json
+          # A non-empty file proves nothing: the shipped binary must print the
+          # golden schema byte for byte (the golden file is that output).
+          set -- crates/ssk-config/tests/golden/ssk-config-v*.schema.json
+          test "$#" -eq 1
+          cmp ssk-config-schema.json "$1"
           rm -f ssk-config-schema.json
 
   # Fails a push or pull request that changes a contract surface
