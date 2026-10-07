@@ -199,6 +199,14 @@ connect limit and tried the answers in turn. What a user can now see:
   holds its slot until the operating system's call returns, so an activation can meet
   the new code when 16 earlier lookups are still stuck there (a dead DNS server). A
   client that does not know the code shows it as unknown.
+* A name that does not resolve is reported as `NETCORE_DNS_FAILED` where earlier builds
+  reported `NETCORE_IO_ERROR`, and the message text changes with it. This holds for the
+  destination of a `Direct` route and for a first hop that is a name, and it is the
+  `code` that `ssk activate --dest name:port` shows, so a script that matched
+  `NETCORE_IO_ERROR` for an unknown name has to match the new code. A connect error
+  that is not a refusal stays `NETCORE_IO_ERROR`, and `NETCORE_CONNECTION_REFUSED` is
+  now reported only when every answer refused; earlier builds reported what the last
+  address tried returned.
 * Answers are cleaned before the dial: an IPv4-mapped IPv6 answer is dialled as the
   IPv4 address, duplicates are dropped and the first 32 are kept. The name is not
   looked up again for the next answer or after a refusal.
@@ -212,4 +220,5 @@ connect limit and tried the answers in turn. What a user can now see:
   Proxied routes still hand the name to the upstream proxy unresolved.
 
 `EgressSession::resolution()` (library API of `ssk-netcore`, not a wire type) says how
-each dial got its address. No wire, ledger or configuration format changed.
+each dial got its address. No wire, ledger or configuration format changed: the codes
+above are values of the existing `code` string of the activation error.
