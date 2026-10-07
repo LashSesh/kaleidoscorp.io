@@ -23,6 +23,7 @@
     )
 )]
 
+pub mod budget;
 pub mod target;
 pub mod types;
 

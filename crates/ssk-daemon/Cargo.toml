@@ -66,7 +66,10 @@ tokio = { version = "1", features = [
 # `std` is required: without it rustix uses its own no_std `AsFd` polyfill and
 # `std::fs::File` does not implement it, so `flock(&file, ..)` in `lock.rs`
 # fails to compile (E0277) on Linux.
-rustix = { version = "0.38", default-features = false, features = ["fs", "std"] }
+#
+# `process` is `getrlimit` for the ingress descriptor budget (`ingress/budget.rs`):
+# the safe API, so `unsafe_code = "forbid"` holds. The limit is read, never raised.
+rustix = { version = "0.38", default-features = false, features = ["fs", "std", "process"] }
 
 [target.'cfg(windows)'.dependencies]
 # The composition root's Windows half. `ssk_ipc::server::serve_named_pipe`

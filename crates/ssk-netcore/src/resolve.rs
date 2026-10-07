@@ -26,8 +26,9 @@ use crate::authority::authority;
 use crate::error::NetcoreError;
 
 /// Lookups that may run at once, which is also the most blocking-pool threads
-/// lookups can ever hold.
-pub(crate) const MAX_CONCURRENT_LOOKUPS: usize = 16;
+/// lookups can ever hold. Public because the ingress's descriptor budget is
+/// derived from it (`ssk-daemon` `ingress/budget.rs`).
+pub const MAX_CONCURRENT_LOOKUPS: usize = 16;
 /// Dials that may wait for a free lookup slot; the next one fails at once.
 pub(crate) const RESOLVER_WAITERS: usize = 32;
 /// How long a dial waits for a slot before it fails with `ResolverBusy`. A
