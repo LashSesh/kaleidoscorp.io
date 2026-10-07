@@ -3846,3 +3846,40 @@ Two critics attacked draft 2 (an adversarial security critic and an implementer'
 **Rejected outright: none.** Every finding was real as to its core; the narrowed and residual rows say what was not done and why.
 
 **What remains open and is not a high finding:** B18 (retention floor) and the Windows addition to B9, both owner questions; the IPC connection cap residual (E-5); the sufficiency of the resolver numbers for a real browser (E-6); the Windows half of E-11 and `C-WIN0` itself (UNVERIFIED on real Windows); whether hosted CI runners allow the route-flip job (E-17).
+
+### C.4 Implementation progress and carried-forward findings (2026-10-07)
+
+Every commit below has a regression test seen to fail on the old code (or, where the production change IS the
+seam, a mutation proving the test has teeth) and an independent review that re-ran that proof. Local gates only:
+GitHub Actions has not started jobs for this repository since 2026-10-06 (account-level), so NOTHING below has run on
+CI or on Windows.
+
+**Done and pushed (beyond C.2):** `C-CI1`, `C-D0`, `C-L0`, `C-L1`, `C-I1b`, `C-T1`, `C-X1`, `C-A1`, `C-N3`, `C-CO1`,
+`C-N4`, `C-C0`, `C-C1`, `C-A3`, `C-S1`, `C-L2`, `C-L3`, `C-IPC1` (each with fix commits where the review found
+something). Next: the ingress modules (`C-G*`, `C-L4`, `C-CO3`), the audit ledger (`C-A2`..`C-A7`), then `C-G7b`,
+`C-WIN0`, `C-E1`..`C-E3`, `C-F1`, `C-F2`.
+
+**Findings the implementers and reviewers carried forward (each must be closed or accepted before M2 is called done):**
+
+* `C-C0`: a rule action of kind `direct` or `deny` ignores unknown keys (serde does not apply `deny_unknown_fields` to
+  the unit variants of an internally tagged enum): a typo in a policy rule is silently accepted. 16 documented
+  divergences between the hand-written schema and the parser are listed in `ssk-config/tests/schema_contract.rs`
+  (`KNOWN_DIVERGENCES`, may only shrink).
+* `C-C1`: the static self-loop check misses `::ffff:127.0.0.1`; `destination: localhost` rules load but can never
+  fire in the ingress; the schema pattern for `listen.address` is looser than the parser; sequence (positional)
+  decoding of structs still works for the older config sections.
+* `C-N3`/`C-N4`: until the ingress executor is built (`C-G1b`) a Direct name that resolves to loopback or a private
+  address is dialled by the activation executor exactly as before; the ingress executor MUST be the guarded one. A
+  failed LITERAL dial carries no `DialAttempts`, so the engine must fill `Result.attempted` itself; IPv4-mapped IPv6
+  literals are not unmapped by `connect_host` (refused as `FamilyDisabled` under `ipv4_only`).
+* `C-S1`: the plan-failure path of the activation arm sets `FailClosed` but never sets `activation_error`;
+  `rule_binding` treats a Deny with an IP and a port differently from one without a port (decide in `C-G1`).
+* `C-L2`/`C-L3`: `Deactivate` still waits its turn behind an activation dial by design; a hanging graceful shutdown
+  is not tested against a stuck TLS peer; whether 200 ms is enough for the OS-deadline plan on Windows is an owner
+  decision; the daemon cannot be type-checked for the windows-gnu target here (`ring`).
+* `C-IPC1`: the ssk-cli subprocess tests that detect a stale `sskd` (11.9 item 3) belong with `C-F3`;
+  `GetIngressAudit`'s answer DTOs have no container-level `#[serde(default)]`; `apps/desktop` is a separate
+  workspace and was not built.
+* Still open from C.3: the Windows named-pipe accept loop (`C-I1w`), `privileged.rs` has the same one-error-ends-it
+  shape, IPv6 Direct dial unexercised on this host.
+* Environment: the volume filled up twice (the incremental cache grew to 8 GB); build with `CARGO_INCREMENTAL=0`.
