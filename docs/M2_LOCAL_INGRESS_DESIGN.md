@@ -524,18 +524,18 @@ Every client-supplied destination becomes ONE canonical `Target` BEFORE the poli
 * `MatchCriteria::matches` (`policy.rs:91-104`) compares a rule's `dest_host` with the flow host by value only when BOTH sides parse as `IpAddr`; otherwise it compares text. Rule `::1` does not match flow host `[::1]`; rule `::ffff:10.0.0.1` does not match flow `10.0.0.1` and the reverse. A deny rule written in one spelling is bypassed by the other.
 * The OS dials spellings the policy never recognises. glibc `getaddrinfo` on the probe machine returns 127.0.0.1 for `127.1`, `2130706433`, `0x7f.1`, `0177.0.0.1`, `0x7f000001` and 169.254.169.254 for `2852039166`. Rust's `ToSocketAddrs`, which is what tokio's `(host, port)` dial calls (`tokio-1.53.1/src/net/addr.rs:190-222`), returns 8.0.0.1 for `010.0.0.1`.
 * `ssk_config::routing::valid_host` (`routing.rs:102`) accepts all of these as DNS names, and `RoutingConfig::validate` accepts `domain_suffix: 0.1`, `destination: 2130706433` and `destination: ::ffff:10.0.0.1`. `C-P1` already stops a suffix rule from MATCHING an address form (`policy.rs:64-72 is_address_form`); the config still accepts the rule. `C-T1` closes that.
-* `Ipv6Addr::to_ipv4()` turns `::1` into 0.0.0.1 (probe). Only `to_ipv4_mapped()` may be used anywhere in the ingress; a source-scan test enforces it.
+* The std IPv6-to-IPv4 conversion that is not `to_ipv4_mapped()` turns `::1` into 0.0.0.1 (probe). Only `to_ipv4_mapped()` may be used anywhere in the ingress; a source-scan test over `src/ingress` enforces it, in every call form and in comments (it does not scan the rest of the crate).
 
 ```rust
 // pure: no I/O, no tokio, no clock
 pub enum RawTarget { V4(Ipv4Addr, u16), V6(Ipv6Addr, u16), Name(Vec<u8>, u16) }  // Name = raw bytes of SOCKS5 ATYP 3 (HTTP CONNECT authority later feeds the same variant)
-pub struct Target { pub host: String /* canonical, never bracketed */, pub ip: Option<IpAddr>, pub port: u16, pub kind: TargetKind, pub provenance: Provenance }
+pub struct Target { /* private fields: host (canonical, never bracketed), ip, port, kind, provenance; read through host() ip() port() kind() provenance() */ }   // canonicalize() is the only constructor, so host, ip and kind cannot diverge
 pub enum TargetKind { Ipv4, Ipv6, Name }
 pub enum Provenance { ClientSuppliedLiteral, ClientSuppliedName }   // later front ends add NatOriginalDestination
 pub enum Refusal { Malformed, NumericAlias, LocalhostName, SelfLoop, SpecialUse(SpecialUse), SpecialUseNeedsPort(SpecialUse) }
 // RuleBinding { NoExactDestination, ExactWithoutPort, Exact { ip: IpAddr, port: u16 } } is defined in crates/ssk-daemon/src/routing.rs (C-S1, 6.7.1), computed once per rule by
 // ConfiguredRouting::rule_binding, and only imported here: target.rs lands later than the commit that needs the type
-pub enum SpecialUse { Unspecified, ThisNetwork, Loopback, Private, SharedAddressSpace, LinkLocal, Metadata, Multicast, Reserved, Broadcast, Documentation, FakeIp, ProtocolAssignment, Translation, SiteLocal, Discard }  // code() -> &'static str, snake_case
+pub enum SpecialUse { Unspecified, ThisNetwork, Loopback, Private, SharedAddressSpace, LinkLocal, Metadata, Multicast, Reserved, Broadcast, Documentation, FakeIp, ProtocolAssignment, Translation, SiteLocal, Discard, DummyPrefix }  // code() -> &'static str, snake_case; SpecialUse::ALL lists all 17
 pub fn canonicalize(raw: RawTarget) -> Result<Target, Refusal>;          // returns only Malformed | NumericAlias | LocalhostName
 pub fn classify_ip(ip: IpAddr) -> Option<SpecialUse>;                   // unmaps v4-mapped first; see table
 pub fn guard_self_loop(t: &Target, listener: SocketAddr) -> Result<(), Refusal>;       // BEFORE policy, never overridable
@@ -562,7 +562,7 @@ Effects: `[::1]`, `::1`, `0:0:0:0:0:0:0:1`, `::ffff:127.0.0.1` and the domain-ty
 
 **Refusal handling.** `Malformed`, `NumericAlias`, `LocalhostName`: SOCKS reply `08`, close, counted per kind (`rejected_target.malformed|numeric_alias|localhost`) and never recorded individually (raw text is client-controlled). A numeric-alias or localhost attempt is the signature of a page trying to reach a local service through the proxy, which is why the three counters are separate. `SelfLoop`, `SpecialUse`, `SpecialUseNeedsPort`: SOCKS reply `02`, coalesced durable `Denied` (plaintext) with reason codes `TARGET_SELF_LOOP`, `SPECIAL_USE_NEEDS_EXACT_RULE`, `SPECIAL_USE_NEEDS_PORT`; `canonicalize` failures carry `TARGET_MALFORMED`, `TARGET_NUMERIC_ALIAS`, `TARGET_LOCALHOST` in counters and logs.
 
-**Special-use table (`classify_ip`).** Checked most specific first; an IPv4-mapped IPv6 address is unmapped before lookup; the 64:ff9b::/96 row classifies the EMBEDDED IPv4 address (a public embedded address is not special-use; 127.0.0.1 or 10.0.0.1 embedded is). Prefixes were cross-checked against the IANA special-purpose registries on 2026-10-06 through a summarising fetch tool; the implementer must re-check them against the registries when writing the table (UNVERIFIED, 26).
+**Special-use table (`classify_ip`).** Checked most specific first; an IPv4-mapped IPv6 address is unmapped before lookup; the 64:ff9b::/96 NAT64 range is ALWAYS special-use: when the embedded IPv4 address is itself special-use the refusal names that reason (127.0.0.1 embedded is `loopback`), otherwise it is `translation`. Draft 2 classified a public embedded address as not special, which let `64:ff9b::808:808` through with no exact rule; it is another spelling than `8.8.8.8`, a deny rule for the IPv4 address does not match it, and on a network with a NAT64 gateway it reaches 8.8.8.8 (found by the review of `C-G1a`). IPv6 fails closed: everything outside the global unicast block 2000::/3 that is not otherwise named is `reserved`, because nothing is allocated there (this includes ::/8, so the IPv4-translated `::ffff:0:8.8.8.8` is refused). Prefixes were checked against the IANA special-purpose registry XML on 2026-10-07 (the registry lists `100:0:0:1::/64`, RFC 9780, which draft 2 missed); there is no lookup at run time. The table is pinned by an independent longest-prefix-match statement of it in the tests (`V4_ORACLE`, `V6_ORACLE`) probed at the first and last address of every prefix, the addresses next to them, every prefix bit flipped, every /16 block and random addresses; a mutation run over every numeric literal of `classify_v4` and `classify_v6` (229 mutants) is caught by it.
 
 | Code | IPv4 | IPv6 |
 |---|---|---|
@@ -574,18 +574,19 @@ Effects: `[::1]`, `::1`, `0:0:0:0:0:0:0:1`, `::ffff:127.0.0.1` and the domain-ty
 | `link_local` | 169.254/16 | fe80::/10 |
 | `site_local` | none | fec0::/10 (deprecated, not in the IANA registry, refused conservatively) |
 | `multicast` | 224/4 | ff00::/8 |
-| `reserved` / `broadcast` | 240/4, 255.255.255.255 | 5f00::/16 (SRv6 SIDs), ::/96 (deprecated IPv4-compatible form; also covers ::1 and ::) |
+| `reserved` / `broadcast` | 240/4, 255.255.255.255 | everything outside 2000::/3 that is not named below: ::/8 (the deprecated IPv4-compatible ::/96 and the IPv4-translated ::ffff:0:0:0/96 included), 5f00::/16 (SRv6 SIDs), 100::/8 apart from its two /64s, 4000::/2, 8000::/1 |
 | `documentation` | 192.0.2/24, 198.51.100/24, 203.0.113/24 | 2001:db8::/32, 3fff::/20 |
 | `fake_ip` | 198.18.0.0/15 (benchmarking; the project's reserved fake-IP range) | none |
 | `protocol_assignment` | 192.0.0.0/24 | 2001::/23 (covers Teredo 2001::/32) |
-| `translation` | 192.88.99.0/24 | 2002::/16 (6to4), 64:ff9b:1::/48 (local-use NAT64) |
+| `translation` | 192.88.99.0/24 | 2002::/16 (6to4), 64:ff9b::/96 (NAT64; a special-use embedded IPv4 address names its own reason instead), 64:ff9b:1::/48 (local-use NAT64) |
 | `discard` | none | 100::/64 |
+| `dummy_prefix` | none | 100:0:0:1::/64 (RFC 9780) |
 
 **`guard_self_loop`** (runs before policy; no rule can override it): for a LITERAL target, refuse when `port == listener.port()` and (`ip == listener.ip()` or `ip.is_loopback()` or `ip.is_unspecified()`). A superset of the one address that could loop (`0.0.0.0:port` connects to the local host on Linux; Windows behaviour UNVERIFIED), harmless otherwise. A `Name` target cannot be checked before resolution; the resolved-address guard of 6.10 covers it (loopback is always refused there).
 
 **`guard_special_use`** (runs after `evaluate`, because it needs the matched rule): a literal for which `classify_ip` is `Some` is allowed ONLY when `binding == Exact { ip, port }` with `ip == t.ip` and `port == t.port`. `ExactWithoutPort` yields `SpecialUseNeedsPort`; anything else yields `SpecialUse`. A rule with `destination: 127.0.0.1` and no `port` therefore opens nothing (the repo's own fixture `tests/support/routing_config.rs` has exactly that shape and is valid only for the activation path; ingress tests need `loopback_config_for_port(port)`). A port-only rule, a suffix rule, a deny rule, or an exact rule that is not the FIRST match in priority order never opens a special-use address; the operator must order the exact rule first. `Name` targets return `Ok` here: names are never exempt, because the exemption names an address and a name's address is not known before the dial (6.10).
 
-**Proptests** (`ProptestConfig::default()`, so `PROPTEST_CASES=32` of the CI smoke job governs): `canonicalize` never panics on arbitrary bytes; its output host re-canonicalises to itself; an output host never contains `[`, `]`, an upper-case letter or a trailing dot; an output `Name` host never parses as an IP and its final label starts with a letter; two spellings of one address produce byte-identical hosts.
+**Proptests** (`ProptestConfig::default()`, so `PROPTEST_CASES=32` of the CI smoke job governs): `canonicalize` never panics on arbitrary bytes; its output host re-canonicalises to itself; an output host never contains `[`, `]`, an upper-case letter or a trailing dot; an output `Name` host never parses as an IP and its final label starts with a letter; two spellings of one address produce byte-identical hosts. Inputs are host-shaped (names, IPv6 spellings, mapped spellings, numeric aliases), not uniform bytes: uniform bytes are accepted about once in 150 draws and at `PROPTEST_CASES=32` most runs would see no accepted input at all; `generators_produce_mostly_acceptable_input` keeps the generators honest.
 
 ### 6.3 `ingress/socks5.rs` (exact-length reads, no `BufReader`)
 

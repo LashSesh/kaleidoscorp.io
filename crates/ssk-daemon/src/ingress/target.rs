@@ -25,16 +25,48 @@ pub enum RawTarget {
 }
 
 /// A destination in its one canonical spelling.
+///
+/// The fields are private on purpose. `host`, `ip` and `kind` agreeing is the
+/// whole point of this module (policy reads `host`, the dial reads `ip`), and
+/// they agree because [`canonicalize`] is the only constructor: code that could
+/// build a `Target` literal could make them diverge.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Target {
     /// Canonical text, never bracketed: a lower-case DNS name without a
     /// trailing dot, or `IpAddr::to_string()` of the literal.
-    pub host: String,
+    host: String,
     /// `Some` exactly when `kind` is not [`TargetKind::Name`].
-    pub ip: Option<IpAddr>,
-    pub port: u16,
-    pub kind: TargetKind,
-    pub provenance: Provenance,
+    ip: Option<IpAddr>,
+    port: u16,
+    kind: TargetKind,
+    provenance: Provenance,
+}
+
+impl Target {
+    #[must_use]
+    pub fn host(&self) -> &str {
+        &self.host
+    }
+
+    #[must_use]
+    pub const fn ip(&self) -> Option<IpAddr> {
+        self.ip
+    }
+
+    #[must_use]
+    pub const fn port(&self) -> u16 {
+        self.port
+    }
+
+    #[must_use]
+    pub const fn kind(&self) -> TargetKind {
+        self.kind
+    }
+
+    #[must_use]
+    pub const fn provenance(&self) -> Provenance {
+        self.provenance
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -118,9 +150,30 @@ pub enum SpecialUse {
     Translation,
     SiteLocal,
     Discard,
+    DummyPrefix,
 }
 
 impl SpecialUse {
+    pub const ALL: [Self; 17] = [
+        Self::Unspecified,
+        Self::ThisNetwork,
+        Self::Loopback,
+        Self::Private,
+        Self::SharedAddressSpace,
+        Self::LinkLocal,
+        Self::Metadata,
+        Self::Multicast,
+        Self::Reserved,
+        Self::Broadcast,
+        Self::Documentation,
+        Self::FakeIp,
+        Self::ProtocolAssignment,
+        Self::Translation,
+        Self::SiteLocal,
+        Self::Discard,
+        Self::DummyPrefix,
+    ];
+
     /// The closed, snake_case label the ledger and the status use.
     pub fn code(self) -> &'static str {
         match self {
@@ -140,6 +193,7 @@ impl SpecialUse {
             Self::Translation => "translation",
             Self::SiteLocal => "site_local",
             Self::Discard => "discard",
+            Self::DummyPrefix => "dummy_prefix",
         }
     }
 }
@@ -151,8 +205,9 @@ const MAX_NAME_LEN: usize = 253;
 const MAX_LABEL_LEN: usize = 63;
 
 /// An IPv4-mapped IPv6 address is the same host as its IPv4 form. Only the
-/// strict `::ffff:a.b.c.d` range is unmapped: `Ipv6Addr::to_ipv4()` would also
-/// turn `::1` into 0.0.0.1 (a source scan keeps it out of this module tree).
+/// strict `::ffff:a.b.c.d` range is unmapped. The other std conversion of an
+/// IPv6 address to IPv4 also turns `::1` into 0.0.0.1, which is a different
+/// host; a source scan keeps it out of this module tree.
 fn unmap(ip: Ipv6Addr) -> IpAddr {
     match ip.to_ipv4_mapped() {
         Some(v4) => IpAddr::V4(v4),
@@ -285,13 +340,19 @@ fn valid_label(label: &str) -> bool {
 }
 
 /// Which special-use range an address belongs to, if any. An IPv4-mapped IPv6
-/// address is unmapped first. The 64:ff9b::/96 NAT64 range classifies the
-/// IPv4 address it embeds: a public embedded address is not special-use, an
-/// embedded 127.0.0.1 or 10.0.0.1 is. Most specific range first.
+/// address is unmapped first.
 ///
-/// The prefixes follow the IANA special-purpose registries; they were
-/// re-derived from RFC text when this table was written and have no
-/// connection to a registry lookup at run time.
+/// IPv6 fails closed: everything outside the global unicast block 2000::/3 that
+/// is not otherwise named is `Reserved` (no destination lives there), and the
+/// whole 64:ff9b::/96 NAT64 range needs an exact rule. When the embedded IPv4
+/// address is itself special-use the refusal names that reason; otherwise it
+/// is `Translation`. Never "not special": `64:ff9b::808:808` reaches 8.8.8.8
+/// through a translator, but it is a different spelling from `8.8.8.8` and a
+/// deny rule for the IPv4 address does not match it.
+///
+/// The prefixes follow the IANA special-purpose registries (checked against the
+/// registry XML on 2026-10-07, which lists `100:0:0:1::/64`, RFC 9780); there is
+/// no registry lookup at run time.
 pub fn classify_ip(ip: IpAddr) -> Option<SpecialUse> {
     match ip {
         IpAddr::V4(v4) => classify_v4(v4),
@@ -353,13 +414,14 @@ fn classify_v6(ip: Ipv6Addr) -> Option<SpecialUse> {
     } else if a == 0 && low_six_zero && g == 0 && h == 1 {
         Some(SpecialUse::Loopback)
     } else if a == 0x64 && b == 0xff9b && c == 0 && d == 0 && e == 0 && f == 0 {
-        // NAT64: the embedded IPv4 address decides.
+        // NAT64 well-known prefix. Always special; the embedded IPv4 address
+        // only decides which reason is named.
         let [hi_a, hi_b] = g.to_be_bytes();
         let [lo_a, lo_b] = h.to_be_bytes();
-        classify_v4(Ipv4Addr::new(hi_a, hi_b, lo_a, lo_b))
-    } else if a == 0 && low_six_zero {
-        // ::/96, the deprecated IPv4-compatible form (::1 and :: were handled).
-        Some(SpecialUse::Reserved)
+        classify_v4(Ipv4Addr::new(hi_a, hi_b, lo_a, lo_b)).or(Some(SpecialUse::Translation))
+    } else if a == 0x64 && b == 0xff9b && c == 1 {
+        // 64:ff9b:1::/48, the local-use NAT64 prefix.
+        Some(SpecialUse::Translation)
     } else if a & 0xfe00 == 0xfc00 {
         Some(SpecialUse::Private)
     } else if a & 0xffc0 == 0xfe80 {
@@ -368,19 +430,26 @@ fn classify_v6(ip: Ipv6Addr) -> Option<SpecialUse> {
         Some(SpecialUse::SiteLocal)
     } else if a & 0xff00 == 0xff00 {
         Some(SpecialUse::Multicast)
-    } else if a == 0x5f00 {
-        // SRv6 SIDs.
-        Some(SpecialUse::Reserved)
     } else if (a == 0x2001 && b == 0x0db8) || (a == 0x3fff && b & 0xf000 == 0) {
         Some(SpecialUse::Documentation)
     } else if a == 0x2001 && b & 0xfe00 == 0 {
         // 2001::/23, which covers Teredo (2001::/32).
         Some(SpecialUse::ProtocolAssignment)
-    } else if a == 0x2002 || (a == 0x64 && b == 0xff9b && c == 1) {
-        // 6to4 and the local-use NAT64 prefix 64:ff9b:1::/48.
+    } else if a == 0x2002 {
+        // 6to4.
         Some(SpecialUse::Translation)
     } else if a == 0x100 && b == 0 && c == 0 && d == 0 {
         Some(SpecialUse::Discard)
+    } else if a == 0x100 && b == 0 && c == 0 && d == 1 {
+        // 100:0:0:1::/64, the dummy IPv6 prefix of RFC 9780.
+        Some(SpecialUse::DummyPrefix)
+    } else if a & 0xe000 != 0x2000 {
+        // Outside 2000::/3 and not named above: nothing is allocated there.
+        // That is ::/8 (the deprecated IPv4-compatible ::/96, the IPv4-translated
+        // ::ffff:0:0:0/96; the IPv4-mapped ::ffff:0:0/96 never gets here,
+        // `classify_ip` unmaps it), 100::/8 apart from its two named /64s,
+        // 5f00::/16 (SRv6 SIDs), 4000::/2, 8000::/1 and so on.
+        Some(SpecialUse::Reserved)
     } else {
         None
     }
@@ -390,8 +459,9 @@ fn classify_v6(ip: Ipv6Addr) -> Option<SpecialUse> {
 /// back at the listener would make the proxy connect to itself and exhaust its
 /// descriptors. A superset of the one address that could loop (`0.0.0.0:port`
 /// connects to the local host on Linux), harmless otherwise. A name cannot be
-/// checked before resolution; the resolved-address guard covers it (loopback
-/// is always refused there).
+/// checked before resolution; the resolved-address guard of the ingress
+/// executor (`IngressDirectGuard`, `C-G1b`) covers a name that resolves to
+/// loopback, and until it exists nothing does.
 pub fn guard_self_loop(target: &Target, listener: SocketAddr) -> Result<(), Refusal> {
     let Some(ip) = target.ip else {
         return Ok(());
@@ -499,7 +569,7 @@ mod tests {
 
     #[test]
     fn the_plain_ipv6_loopback_is_not_turned_into_an_ipv4_address() {
-        // Ipv6Addr::to_ipv4() would answer 0.0.0.1 for ::1 and 0.0.0.0 for ::.
+        // The lossy std conversion would answer 0.0.0.1 for ::1 and 0.0.0.0 for ::.
         let target = canonicalize(RawTarget::V6(Ipv6Addr::LOCALHOST, 80)).expect("literal");
         assert_eq!(target.ip, Some(ip("::1")));
         let target = canonicalize(RawTarget::V6(Ipv6Addr::UNSPECIFIED, 80)).expect("literal");
@@ -802,7 +872,22 @@ mod tests {
             ("2002::1", Some(SpecialUse::Translation)),
             ("64:ff9b:1::1", Some(SpecialUse::Translation)),
             ("100::1", Some(SpecialUse::Discard)),
-            ("100:0:0:1::1", None),
+            ("100:0:0:1::1", Some(SpecialUse::DummyPrefix)),
+            (
+                "100:0:0:1:ffff:ffff:ffff:ffff",
+                Some(SpecialUse::DummyPrefix),
+            ),
+            ("100:0:0:2::1", Some(SpecialUse::Reserved)),
+            ("100::", Some(SpecialUse::Discard)),
+            ("100:0:0:0:ffff:ffff:ffff:ffff", Some(SpecialUse::Discard)),
+            // Outside 2000::/3 nothing is allocated; IPv4-translated (SIIT) is in ::/8.
+            ("::ffff:0:808:808", Some(SpecialUse::Reserved)),
+            ("4000::1", Some(SpecialUse::Reserved)),
+            ("8000::1", Some(SpecialUse::Reserved)),
+            ("1fff::1", Some(SpecialUse::Reserved)),
+            ("2000::1", None),
+            ("3fff:2000::1", None),
+            ("64:ff9b::808:808", Some(SpecialUse::Translation)),
             ("2606:4700:4700::1111", None),
             ("2a00:1450:4001::1", None),
         ];
@@ -812,7 +897,7 @@ mod tests {
     }
 
     #[test]
-    fn mapped_and_nat64_addresses_classify_the_embedded_ipv4_address() {
+    fn mapped_addresses_classify_as_ipv4_and_nat64_is_always_special() {
         // Mapped: the IPv4 verdict.
         assert_eq!(
             classify_ip(ip("::ffff:127.0.0.1")),
@@ -823,8 +908,15 @@ mod tests {
             Some(SpecialUse::Private)
         );
         assert_eq!(classify_ip(ip("::ffff:8.8.8.8")), None);
-        // NAT64 64:ff9b::/96: a public embedded address is not special-use.
-        assert_eq!(classify_ip(ip("64:ff9b::808:808")), None);
+        // NAT64 64:ff9b::/96 reaches the embedded IPv4 address through a
+        // translator, but it is another spelling than the IPv4 one and a deny
+        // rule for 8.8.8.8 does not match it: it needs an exact rule even when
+        // the embedded address is public.
+        assert_eq!(
+            classify_ip(ip("64:ff9b::808:808")),
+            Some(SpecialUse::Translation)
+        );
+        // ... and a special-use embedded address names its own reason.
         assert_eq!(
             classify_ip(ip("64:ff9b::7f00:1")),
             Some(SpecialUse::Loopback)
@@ -834,30 +926,55 @@ mod tests {
             classify_ip(ip("64:ff9b::a9fe:a9fe")),
             Some(SpecialUse::Metadata)
         );
+        // The refusal reaches the guard: no rule, no NAT64 destination.
+        assert_eq!(
+            guard_special_use(
+                &lit("64:ff9b::808:808", 443),
+                RuleBinding::NoExactDestination
+            ),
+            Err(Refusal::SpecialUse(SpecialUse::Translation))
+        );
+        let exact = RuleBinding::Exact {
+            ip: ip("64:ff9b::808:808"),
+            port: 443,
+        };
+        assert_eq!(
+            guard_special_use(&lit("64:ff9b::808:808", 443), exact),
+            Ok(())
+        );
     }
 
     #[test]
-    fn special_use_codes_are_unique_snake_case() {
-        let all = [
-            SpecialUse::Unspecified,
-            SpecialUse::ThisNetwork,
-            SpecialUse::Loopback,
-            SpecialUse::Private,
-            SpecialUse::SharedAddressSpace,
-            SpecialUse::LinkLocal,
-            SpecialUse::Metadata,
-            SpecialUse::Multicast,
-            SpecialUse::Reserved,
-            SpecialUse::Broadcast,
-            SpecialUse::Documentation,
-            SpecialUse::FakeIp,
-            SpecialUse::ProtocolAssignment,
-            SpecialUse::Translation,
-            SpecialUse::SiteLocal,
-            SpecialUse::Discard,
-        ];
+    fn special_use_codes_are_unique_snake_case_and_all_lists_every_variant() {
+        // An exhaustive match: adding a variant without listing it in ALL
+        // leaves a hole in the index set below, and forgetting the match arm is
+        // a compile error.
+        fn index(special: SpecialUse) -> usize {
+            match special {
+                SpecialUse::Unspecified => 0,
+                SpecialUse::ThisNetwork => 1,
+                SpecialUse::Loopback => 2,
+                SpecialUse::Private => 3,
+                SpecialUse::SharedAddressSpace => 4,
+                SpecialUse::LinkLocal => 5,
+                SpecialUse::Metadata => 6,
+                SpecialUse::Multicast => 7,
+                SpecialUse::Reserved => 8,
+                SpecialUse::Broadcast => 9,
+                SpecialUse::Documentation => 10,
+                SpecialUse::FakeIp => 11,
+                SpecialUse::ProtocolAssignment => 12,
+                SpecialUse::Translation => 13,
+                SpecialUse::SiteLocal => 14,
+                SpecialUse::Discard => 15,
+                SpecialUse::DummyPrefix => 16,
+            }
+        }
+        let indices: Vec<usize> = SpecialUse::ALL.iter().map(|s| index(*s)).collect();
+        assert_eq!(indices, (0..SpecialUse::ALL.len()).collect::<Vec<_>>());
+
         let mut seen = std::collections::BTreeSet::new();
-        for special in all {
+        for special in SpecialUse::ALL {
             let code = special.code();
             assert!(
                 code.bytes().all(|b| b.is_ascii_lowercase() || b == b'_'),
@@ -865,7 +982,8 @@ mod tests {
             );
             assert!(seen.insert(code), "{code} is used twice");
         }
-        assert_eq!(seen.len(), 16);
+        assert_eq!(seen.len(), 17);
+        assert_eq!(SpecialUse::DummyPrefix.code(), "dummy_prefix");
     }
 
     fn listener() -> SocketAddr {
@@ -1023,24 +1141,362 @@ mod tests {
         assert_eq!(TargetKind::Name.as_str(), "name");
     }
 
+    // ----- the special-use table against an independent statement of it -----
+    //
+    // `classify_v4` and `classify_v6` are chains of masks. The tables below say the
+    // same thing as (prefix, length, class) rows copied from the IANA
+    // special-purpose registries and resolved by longest prefix, so a mask that
+    // is a bit too narrow or too wide in either place is a disagreement. The
+    // probes are the places where a classification can change: the first and
+    // last address of every prefix, the addresses next to them, and the
+    // address with each prefix bit flipped.
+
+    type Row4 = (&'static str, u8, SpecialUse);
+
+    const V4_ORACLE: &[Row4] = &[
+        ("0.0.0.0", 32, SpecialUse::Unspecified),
+        ("0.0.0.0", 8, SpecialUse::ThisNetwork),
+        ("10.0.0.0", 8, SpecialUse::Private),
+        ("100.64.0.0", 10, SpecialUse::SharedAddressSpace),
+        ("127.0.0.0", 8, SpecialUse::Loopback),
+        ("169.254.0.0", 16, SpecialUse::LinkLocal),
+        ("169.254.169.254", 32, SpecialUse::Metadata),
+        ("172.16.0.0", 12, SpecialUse::Private),
+        ("192.0.0.0", 24, SpecialUse::ProtocolAssignment),
+        ("192.0.2.0", 24, SpecialUse::Documentation),
+        ("192.88.99.0", 24, SpecialUse::Translation),
+        ("192.168.0.0", 16, SpecialUse::Private),
+        ("198.18.0.0", 15, SpecialUse::FakeIp),
+        ("198.51.100.0", 24, SpecialUse::Documentation),
+        ("203.0.113.0", 24, SpecialUse::Documentation),
+        ("224.0.0.0", 4, SpecialUse::Multicast),
+        ("240.0.0.0", 4, SpecialUse::Reserved),
+        ("255.255.255.255", 32, SpecialUse::Broadcast),
+    ];
+
+    const V6_ORACLE: &[Row4] = &[
+        ("::", 128, SpecialUse::Unspecified),
+        ("::1", 128, SpecialUse::Loopback),
+        ("::", 8, SpecialUse::Reserved),
+        ("64:ff9b::", 96, SpecialUse::Translation),
+        ("64:ff9b:1::", 48, SpecialUse::Translation),
+        ("100::", 64, SpecialUse::Discard),
+        ("100:0:0:1::", 64, SpecialUse::DummyPrefix),
+        ("2001::", 23, SpecialUse::ProtocolAssignment),
+        ("2001:db8::", 32, SpecialUse::Documentation),
+        ("2002::", 16, SpecialUse::Translation),
+        ("3fff::", 20, SpecialUse::Documentation),
+        ("fc00::", 7, SpecialUse::Private),
+        ("fe80::", 10, SpecialUse::LinkLocal),
+        ("fec0::", 10, SpecialUse::SiteLocal),
+        ("ff00::", 8, SpecialUse::Multicast),
+    ];
+
+    fn mask128(len: u8) -> u128 {
+        if len == 0 {
+            0
+        } else {
+            u128::MAX << (128 - u32::from(len))
+        }
+    }
+
+    fn oracle_v4(addr: Ipv4Addr) -> Option<SpecialUse> {
+        let bits = u128::from(u32::from(addr));
+        V4_ORACLE
+            .iter()
+            .filter(|(net, len, _)| {
+                let net: Ipv4Addr = net.parse().expect("oracle row");
+                let mask = mask128(*len + 96) & u128::from(u32::MAX);
+                (bits & mask) == (u128::from(u32::from(net)) & mask)
+            })
+            .max_by_key(|(_, len, _)| *len)
+            .map(|(_, _, class)| *class)
+    }
+
+    fn oracle_v6(addr: Ipv6Addr) -> Option<SpecialUse> {
+        if let Some(v4) = addr.to_ipv4_mapped() {
+            return oracle_v4(v4);
+        }
+        let bits = u128::from(addr);
+        let row = V6_ORACLE
+            .iter()
+            .filter(|(net, len, _)| {
+                let net: Ipv6Addr = net.parse().expect("oracle row");
+                (bits & mask128(*len)) == (u128::from(net) & mask128(*len))
+            })
+            .max_by_key(|(_, len, _)| *len);
+        match row {
+            // NAT64: a special-use embedded address names its own reason.
+            Some(("64:ff9b::", 96, class)) => {
+                let embedded = Ipv4Addr::from(u32::try_from(bits & 0xffff_ffff).expect("32 bits"));
+                oracle_v4(embedded).or(Some(*class))
+            }
+            Some((_, _, class)) => Some(*class),
+            // Outside 2000::/3 nothing is allocated.
+            None if bits >> 125 != 0b001 => Some(SpecialUse::Reserved),
+            None => None,
+        }
+    }
+
+    fn v4_probes() -> Vec<u32> {
+        let mut out = Vec::new();
+        for (net, len, _) in V4_ORACLE {
+            let net: Ipv4Addr = net.parse().expect("oracle row");
+            let host_bits = 32 - u32::from(*len);
+            let first = u32::from(net);
+            let last = first | u32::MAX.checked_shr(32 - host_bits).unwrap_or(0);
+            let last = if host_bits == 0 { first } else { last };
+            out.extend([first, last, first.wrapping_sub(1), last.wrapping_add(1)]);
+            for bit in host_bits..32 {
+                out.push(first ^ (1 << bit));
+                out.push(last ^ (1 << bit));
+            }
+        }
+        out.sort_unstable();
+        out.dedup();
+        out
+    }
+
+    fn v6_probes() -> Vec<u128> {
+        let mut out = Vec::new();
+        for (net, len, _) in V6_ORACLE {
+            let net: Ipv6Addr = net.parse().expect("oracle row");
+            let first = u128::from(net) & mask128(*len);
+            let last = first | !mask128(*len);
+            out.extend([first, last, first.wrapping_sub(1), last.wrapping_add(1)]);
+            for bit in (128 - u32::from(*len))..128 {
+                out.push(first ^ (1 << bit));
+                out.push(last ^ (1 << bit));
+            }
+        }
+        // The NAT64 range around every IPv4 boundary.
+        for probe in v4_probes() {
+            out.push(0x0064_ff9b_u128 << 96 | u128::from(probe));
+        }
+        out.sort_unstable();
+        out.dedup();
+        out
+    }
+
+    #[test]
+    fn the_oracle_rows_are_the_iana_registry_rows() {
+        // Prefixes are aligned: a row whose host bits are not zero is a typo.
+        for (net, len, _) in V4_ORACLE {
+            let net: Ipv4Addr = net.parse().expect("row");
+            let host = u32::MAX.checked_shr(u32::from(*len)).unwrap_or(0);
+            assert_eq!(u32::from(net) & host, 0, "{net}/{len} is not aligned");
+        }
+        for (net, len, _) in V6_ORACLE {
+            let net: Ipv6Addr = net.parse().expect("row");
+            assert_eq!(u128::from(net) & !mask128(*len), 0, "{net}/{len}");
+        }
+        // Every class of SpecialUse except the two that exist only because
+        // their range is split off a wider one is exercised by some row.
+        let used: Vec<SpecialUse> = V4_ORACLE
+            .iter()
+            .chain(V6_ORACLE)
+            .map(|(_, _, class)| *class)
+            .collect();
+        for class in SpecialUse::ALL {
+            assert!(used.contains(&class), "no oracle row yields {class:?}");
+        }
+    }
+
+    #[test]
+    fn ipv4_classification_matches_the_registry_at_every_boundary() {
+        let probes = v4_probes();
+        assert!(probes.len() > 400, "{} probes", probes.len());
+        for bits in probes {
+            let addr = Ipv4Addr::from(bits);
+            let expected = oracle_v4(addr);
+            assert_eq!(classify_ip(IpAddr::V4(addr)), expected, "{addr}");
+            // The mapped spelling is the same host.
+            assert_eq!(
+                classify_ip(IpAddr::V6(addr.to_ipv6_mapped())),
+                expected,
+                "::ffff:{addr}"
+            );
+        }
+    }
+
+    #[test]
+    fn ipv4_classification_matches_the_registry_across_the_whole_space() {
+        // Every /16 block at its first, middle and last address.
+        for block in 0_u32..=0xffff {
+            for low in [0, 0x8000, 0xffff] {
+                let addr = Ipv4Addr::from(block << 16 | low);
+                assert_eq!(classify_ip(IpAddr::V4(addr)), oracle_v4(addr), "{addr}");
+            }
+        }
+    }
+
+    #[test]
+    fn ipv6_classification_matches_the_registry_at_every_boundary() {
+        let probes = v6_probes();
+        assert!(probes.len() > 1000, "{} probes", probes.len());
+        for bits in probes {
+            let addr = Ipv6Addr::from(bits);
+            assert_eq!(classify_ip(IpAddr::V6(addr)), oracle_v6(addr), "{addr}");
+        }
+    }
+
+    #[test]
+    fn the_nat64_range_is_never_unclassified() {
+        // The deny-rule hole: whatever IPv4 address is embedded, the NAT64
+        // spelling of it needs an exact rule.
+        for bits in v4_probes() {
+            let embedded = Ipv4Addr::from(bits);
+            let nat64 = Ipv6Addr::from(0x0064_ff9b_u128 << 96 | u128::from(bits));
+            let class = classify_ip(IpAddr::V6(nat64));
+            assert!(class.is_some(), "{nat64} (embeds {embedded})");
+            if let Some(inner) = classify_ip(IpAddr::V4(embedded)) {
+                assert_eq!(class, Some(inner), "{nat64}");
+            } else {
+                assert_eq!(class, Some(SpecialUse::Translation), "{nat64}");
+            }
+        }
+    }
+
     // ----- properties (PROPTEST_CASES=32 in the CI smoke job) -----
+    //
+    // With 32 cases a property is only worth anything if most of its inputs are
+    // accepted: uniformly random bytes are accepted about once in 150 draws, so
+    // the generators below build host-shaped text (names, IPv6 spellings,
+    // numeric aliases) and `generators_produce_mostly_acceptable_input` keeps
+    // that true.
 
     fn raw_bytes() -> impl Strategy<Value = Vec<u8>> {
         prop_oneof![
             proptest::collection::vec(any::<u8>(), 0..300),
-            // Host-shaped text hits the interesting branches far more often.
             "[A-Za-z0-9.:%\\[\\]_ -]{0,80}".prop_map(String::into_bytes),
         ]
     }
 
+    /// A valid DNS name: one to four labels and a final label that starts with a
+    /// letter, in random case, with or without the trailing dot.
+    fn valid_name() -> impl Strategy<Value = String> {
+        (
+            proptest::collection::vec("[a-z0-9]([a-z0-9-]{0,10}[a-z0-9])?", 0..4),
+            "[a-z]([a-z0-9-]{0,10}[a-z0-9])?",
+            any::<bool>(),
+            proptest::collection::vec(any::<bool>(), 64),
+        )
+            .prop_map(|(mut labels, last, dot, flips)| {
+                labels.push(last);
+                let mut text = labels.join(".");
+                if dot {
+                    text.push('.');
+                }
+                text.chars()
+                    .zip(flips.iter().chain(std::iter::repeat(&false)))
+                    .map(|(c, flip)| if *flip { c.to_ascii_uppercase() } else { c })
+                    .collect()
+            })
+    }
+
+    /// An IPv6 address in one of the spellings a client may use in a name field.
+    fn ipv6_spelling() -> impl Strategy<Value = (Ipv6Addr, String)> {
+        (
+            proptest::array::uniform8(any::<u16>()),
+            0_u8..5,
+            any::<bool>(),
+        )
+            .prop_map(|(segments, style, upper)| {
+                let addr = Ipv6Addr::from(segments);
+                let full = segments.map(|s| format!("{s:04x}")).join(":");
+                let text = match style {
+                    0 => full,
+                    1 => addr.to_string(),
+                    2 => format!("[{addr}]"),
+                    3 => format!("[{full}]"),
+                    _ => segments.map(|s| format!("{s:x}")).join(":"),
+                };
+                (addr, if upper { text.to_uppercase() } else { text })
+            })
+    }
+
+    /// An IPv4-mapped IPv6 address in dotted-tail spellings.
+    fn mapped_spelling() -> impl Strategy<Value = (Ipv4Addr, String)> {
+        (proptest::array::uniform4(any::<u8>()), 0_u8..4).prop_map(|(octets, style)| {
+            let v4 = Ipv4Addr::from(octets);
+            let text = match style {
+                0 => format!("::ffff:{v4}"),
+                1 => format!("0:0:0:0:0:ffff:{v4}"),
+                2 => format!("[::ffff:{v4}]"),
+                _ => format!("::FFFF:{v4}"),
+            };
+            (v4, text)
+        })
+    }
+
+    /// A numeric alias: one to four components in decimal, hex or octal, never
+    /// anything that starts with a letter.
+    fn alias_text() -> impl Strategy<Value = String> {
+        proptest::collection::vec(
+            (0_u8..3, 0_u32..2_000_000).prop_map(|(radix, n)| match radix {
+                0 => n.to_string(),
+                1 => format!("0x{n:x}"),
+                _ => format!("0{n:o}"),
+            }),
+            1..5,
+        )
+        .prop_map(|parts| parts.join("."))
+    }
+
+    fn host_bytes() -> impl Strategy<Value = Vec<u8>> {
+        prop_oneof![
+            1 => raw_bytes(),
+            3 => valid_name().prop_map(String::into_bytes),
+            2 => ipv6_spelling().prop_map(|(_, text)| text.into_bytes()),
+            1 => mapped_spelling().prop_map(|(_, text)| text.into_bytes()),
+            1 => alias_text().prop_map(String::into_bytes),
+        ]
+    }
+
+    #[test]
+    fn generators_produce_mostly_acceptable_input() {
+        use proptest::strategy::ValueTree;
+        use proptest::test_runner::TestRunner;
+
+        fn accepted<S: Strategy<Value = Vec<u8>>>(strategy: S, draws: u32) -> u32 {
+            let mut runner = TestRunner::deterministic();
+            (0..draws)
+                .filter(|_| {
+                    let bytes = strategy.new_tree(&mut runner).expect("tree").current();
+                    canonicalize(RawTarget::Name(bytes, 443)).is_ok()
+                })
+                .count()
+                .try_into()
+                .expect("fits")
+        }
+
+        let draws = 600;
+        // Names are accepted unless they happen to be `localhost`.
+        assert!(accepted(valid_name().prop_map(String::into_bytes), draws) >= draws - 2);
+        // Every spelling of an address is accepted.
+        assert_eq!(
+            accepted(ipv6_spelling().prop_map(|(_, t)| t.into_bytes()), draws),
+            draws
+        );
+        assert_eq!(
+            accepted(mapped_spelling().prop_map(|(_, t)| t.into_bytes()), draws),
+            draws
+        );
+        // The mixture the properties draw from is mostly accepted, unlike raw bytes.
+        let mixed = accepted(host_bytes(), draws);
+        assert!(mixed * 2 >= draws, "only {mixed} of {draws} accepted");
+        let raw = accepted(raw_bytes(), draws);
+        assert!(raw * 20 < draws, "raw bytes unexpectedly accepted: {raw}");
+    }
+
     proptest! {
         #[test]
-        fn canonicalize_never_panics_on_arbitrary_bytes(bytes in raw_bytes(), port in any::<u16>()) {
+        fn canonicalize_never_panics_on_arbitrary_bytes(bytes in host_bytes(), port in any::<u16>()) {
             let _ = canonicalize(RawTarget::Name(bytes, port));
         }
 
         #[test]
-        fn an_accepted_host_re_canonicalises_to_itself(bytes in raw_bytes()) {
+        fn an_accepted_host_re_canonicalises_to_itself(bytes in host_bytes()) {
             if let Ok(target) = canonicalize(RawTarget::Name(bytes, 443)) {
                 let again = canonicalize(RawTarget::Name(target.host.clone().into_bytes(), 443))
                     .expect("a canonical host is accepted again");
@@ -1051,7 +1507,7 @@ mod tests {
         }
 
         #[test]
-        fn an_accepted_host_is_in_the_canonical_alphabet(bytes in raw_bytes()) {
+        fn an_accepted_host_is_in_the_canonical_alphabet(bytes in host_bytes()) {
             if let Ok(target) = canonicalize(RawTarget::Name(bytes, 443)) {
                 prop_assert!(!target.host.contains('['));
                 prop_assert!(!target.host.contains(']'));
@@ -1062,7 +1518,7 @@ mod tests {
         }
 
         #[test]
-        fn an_accepted_name_is_never_an_address_and_ends_in_a_letter(bytes in raw_bytes()) {
+        fn an_accepted_name_is_never_an_address_and_ends_in_a_letter(bytes in host_bytes()) {
             if let Ok(target) = canonicalize(RawTarget::Name(bytes, 443)) {
                 if target.kind == TargetKind::Name {
                     prop_assert!(target.host.parse::<IpAddr>().is_err());
@@ -1074,6 +1530,54 @@ mod tests {
                     prop_assert!(target.ip.is_some());
                     prop_assert_eq!(target.ip.map(|ip| ip.to_string()), Some(target.host.clone()));
                 }
+            }
+        }
+
+        #[test]
+        fn a_valid_name_is_lower_cased_and_loses_one_trailing_dot(text in valid_name()) {
+            let expected = text.to_ascii_lowercase();
+            let expected = expected.strip_suffix('.').unwrap_or(&expected).to_owned();
+            let result = canonicalize(RawTarget::Name(text.clone().into_bytes(), 443));
+            if expected == "localhost" || expected.ends_with(".localhost") {
+                prop_assert_eq!(result, Err(Refusal::LocalhostName));
+            } else {
+                let target = result.expect("a valid name");
+                prop_assert_eq!(target.host, expected);
+                prop_assert_eq!(target.kind, TargetKind::Name);
+                prop_assert_eq!(target.ip, None);
+                prop_assert_eq!(target.provenance, Provenance::ClientSuppliedName);
+                prop_assert_eq!(target.port, 443);
+            }
+        }
+
+        #[test]
+        fn every_spelling_of_an_ipv6_address_gives_the_typed_host((addr, text) in ipv6_spelling()) {
+            let typed = canonicalize(RawTarget::V6(addr, 80)).expect("typed");
+            let named = canonicalize(RawTarget::Name(text.into_bytes(), 80)).expect("spelled");
+            prop_assert_eq!(&named.host, &typed.host);
+            prop_assert_eq!(named.ip, typed.ip);
+            prop_assert_eq!(named.kind, typed.kind);
+            prop_assert_eq!(named.provenance, Provenance::ClientSuppliedName);
+        }
+
+        #[test]
+        fn every_spelling_of_a_mapped_address_gives_the_ipv4_host((v4, text) in mapped_spelling()) {
+            let typed = canonicalize(RawTarget::V4(v4, 80)).expect("typed");
+            let named = canonicalize(RawTarget::Name(text.into_bytes(), 80)).expect("spelled");
+            prop_assert_eq!(&named.host, &typed.host);
+            prop_assert_eq!(named.kind, TargetKind::Ipv4);
+            prop_assert_eq!(named.ip, Some(IpAddr::V4(v4)));
+        }
+
+        #[test]
+        fn a_numeric_alias_is_refused_or_is_a_strict_dotted_quad(text in alias_text()) {
+            match canonicalize(RawTarget::Name(text.clone().into_bytes(), 80)) {
+                Ok(target) => {
+                    // Only the strict, decimal, four-part form is an address.
+                    prop_assert_eq!(target.kind, TargetKind::Ipv4);
+                    prop_assert_eq!(text.parse::<Ipv4Addr>().ok().map(IpAddr::V4), target.ip);
+                }
+                Err(refusal) => prop_assert_eq!(refusal, Refusal::NumericAlias),
             }
         }
 
@@ -1101,12 +1605,28 @@ mod tests {
         }
 
         #[test]
-        fn classification_ignores_the_mapped_spelling(octets in proptest::array::uniform4(any::<u8>())) {
-            let v4 = Ipv4Addr::from(octets);
-            prop_assert_eq!(
-                classify_ip(IpAddr::V4(v4)),
-                classify_ip(IpAddr::V6(v4.to_ipv6_mapped()))
-            );
+        fn random_ipv4_addresses_classify_as_the_registry_says(bits in any::<u32>()) {
+            let addr = Ipv4Addr::from(bits);
+            prop_assert_eq!(classify_ip(IpAddr::V4(addr)), oracle_v4(addr));
+            prop_assert_eq!(classify_ip(IpAddr::V6(addr.to_ipv6_mapped())), oracle_v4(addr));
+        }
+
+        #[test]
+        fn addresses_inside_a_registry_prefix_classify_as_the_registry_says(
+            row in 0..V6_ORACLE.len(),
+            noise in any::<u128>(),
+        ) {
+            let (net, len, _) = V6_ORACLE[row];
+            let net: Ipv6Addr = net.parse().expect("row");
+            let bits = (u128::from(net) & mask128(len)) | (noise & !mask128(len));
+            let addr = Ipv6Addr::from(bits);
+            prop_assert_eq!(classify_ip(IpAddr::V6(addr)), oracle_v6(addr), "{}", addr);
+        }
+
+        #[test]
+        fn any_ipv6_address_classifies_as_the_registry_says(bits in any::<u128>()) {
+            let addr = Ipv6Addr::from(bits);
+            prop_assert_eq!(classify_ip(IpAddr::V6(addr)), oracle_v6(addr));
         }
     }
 }
