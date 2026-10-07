@@ -1365,6 +1365,7 @@ name = "ssk-daemon"
 version = "0.1.0"
 dependencies = [
  "getrandom 0.3.4",
+ "proptest",
  "rustix 0.38.44",
  "serde",
  "serde_json",

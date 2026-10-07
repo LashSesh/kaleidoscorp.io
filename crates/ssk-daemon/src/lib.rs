@@ -7,6 +7,9 @@
 
 pub mod cli;
 pub mod config_load;
+/// The local proxy ingress (design M2_LOCAL_INGRESS_DESIGN.md). Pure modules
+/// first; nothing here is wired into `sskd` yet.
+pub mod ingress;
 // The subscriber, the durable rotated sink, the panic hook and the OS-CSPRNG
 // probe used to live here as `diag` and `entropy`. They are now `ssk-diag`,
 // linked by `ssk`, `sskd` and `ssk-svc` alike: this crate's copy and `ssk-cli`'s

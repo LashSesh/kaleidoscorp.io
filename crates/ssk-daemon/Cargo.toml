@@ -96,6 +96,7 @@ getrandom = "0.3"
 ssk-desktop-client = { path = "../ssk-desktop-client", version = "0.1.0" }
 tempfile.workspace = true
 serde_yaml.workspace = true
+proptest.workspace = true
 # `tests/kill_switch_status.rs` drives a REAL `ssk_netd_helper::Broker` behind a
 # real `PrivilegedServer` over an in-memory `FrameTransport` pair. Building that
 # broker needs its actuation manifest and its `(principal, verb)` table.
