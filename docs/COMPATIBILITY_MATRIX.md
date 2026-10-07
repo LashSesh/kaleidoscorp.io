@@ -178,3 +178,38 @@ destination: a numeric alias is answered `DEST_INVALID` before policy, audit or 
 dial. Earlier builds evaluated policy for the alias text and, where a rule without
 destination or suffix matched everything, handed it to the dialer, which connects to
 the address the alias spells. No wire or ledger format changed.
+
+## Name lookup for Direct dials (2026-10-07)
+
+A host NAME that `sskd` dials itself, that is the destination of a `Direct` route
+(`ssk activate --dest name:port`) or the `host` of an adapter that is a name, is now
+looked up by the operating system's resolver exactly once per dial, through a bounded
+resolver, and the dial then goes to the answers it got. Earlier builds handed the name
+to tokio's `TcpStream::connect`, which ran an unbounded `getaddrinfo` inside the 10 s
+connect limit and tried the answers in turn. What a user can now see:
+
+* A lookup is cut after 5 s as `NETCORE_TIMEOUT`, and the lookup time no longer counts
+  towards the 10 s connect limit, which now starts after the answer. The 30 s dial
+  deadline still bounds the whole dial, and the 20 s activation deadline still cuts an
+  activation earlier, so a slow resolver that answered after 5 to 10 s used to succeed
+  and now fails.
+* At most 16 lookups run at once. A 17th waits up to 500 ms for a free slot and then
+  fails with the new code `NETCORE_RESOLVER_BUSY`; at most 32 dials wait, the next one
+  fails at once. Literals and proxied targets never wait. A lookup that was cut still
+  holds its slot until the operating system's call returns, so an activation can meet
+  the new code when 16 earlier lookups are still stuck there (a dead DNS server). A
+  client that does not know the code shows it as unknown.
+* Answers are cleaned before the dial: an IPv4-mapped IPv6 answer is dialled as the
+  IPv4 address, duplicates are dropped and the first 32 are kept. The name is not
+  looked up again for the next answer or after a refusal.
+* A host that is neither an IP literal nor a plain DNS name is refused with
+  `NETCORE_INVALID_TARGET` before any lookup. Nothing that configuration validation or
+  `--dest` accepts is newly refused (the host grammar of "Host grammar in routing
+  configuration" is the same list); what changes is a caller that reaches the executor
+  without that validation, for example a name with an underscore or an IPv6 zone id.
+* `dns_protected` is unchanged: `true` only for an IP-literal destination, so it stays
+  `false` for a `Direct` name, whose lookup the operating system's resolver did.
+  Proxied routes still hand the name to the upstream proxy unresolved.
+
+`EgressSession::resolution()` (library API of `ssk-netcore`, not a wire type) says how
+each dial got its address. No wire, ledger or configuration format changed.

@@ -43,6 +43,11 @@ pub enum NetcoreError {
     /// carry line breaks into logs.
     #[error("invalid dial target: {0}")]
     InvalidTarget(String),
+    /// No resolver slot was free within the bounded wait, or too many dials
+    /// were already waiting for one. Nothing was looked up and no socket was
+    /// opened; the caller may retry.
+    #[error("name resolver busy: every lookup slot is in use")]
+    ResolverBusy,
 }
 
 impl NetcoreError {
@@ -65,6 +70,7 @@ impl NetcoreError {
             Self::Io(..) => "NETCORE_IO_ERROR",
             Self::ProtocolError(..) => "NETCORE_PROTOCOL_ERROR",
             Self::InvalidTarget(_) => "NETCORE_INVALID_TARGET",
+            Self::ResolverBusy => "NETCORE_RESOLVER_BUSY",
         }
     }
 }

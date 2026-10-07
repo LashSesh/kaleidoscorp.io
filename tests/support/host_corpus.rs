@@ -1,8 +1,10 @@
 // One table of host spellings, shared through `include!` by every crate that
 // reads a host: `ssk_config::routing::valid_host` and `RoutingConfig::validate`
 // (`ssk-config/tests/host_grammar.rs`), and the policy engine's address-form
-// test (`ssk-netadmin/tests/host_corpus.rs`). The ingress target canonicaliser
-// reads the same table once it exists. The three used to disagree: the config
+// test (`ssk-netadmin/tests/host_corpus.rs`), and the resolver's name check
+// (`is_resolvable_name`, unit test in `ssk-netcore/src/resolve.rs`: exactly the
+// `Name` class). The ingress target canonicaliser reads the same table once it
+// exists. The three used to disagree: the config
 // accepted `0.1` as a domain suffix and `127.1` as a destination while the
 // policy engine already refused to match a suffix against either, so a rule
 // could load and then never fire. A layer that disagrees with its column here

@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
 
 use tokio::net::TcpStream;
@@ -7,15 +8,21 @@ use tokio::time::timeout;
 
 use crate::authority::{authority, unbracket};
 use crate::error::NetcoreError;
+use crate::resolve::{is_resolvable_name, normalise_answers, BoundedResolver};
+use crate::session::{DialResolution, ResolutionMode};
 
-/// Opens a real TCP connection to `host:port`, resolving `host` via the OS
-/// resolver (real DNS, real syscalls — this is the baseline real network I/O
-/// the workspace previously had none of anywhere).
+/// Opens a real TCP connection to `host:port`, where `host` is an IP literal
+/// (real syscalls, the baseline real network I/O the workspace previously had
+/// none of anywhere).
 ///
 /// Dials the `(host, port)` pair rather than a joined `"host:port"` string:
 /// an IP literal (IPv4, or IPv6 bare or bracketed) is then used as an address
 /// directly and never goes through the resolver, and `host` is never
 /// re-parsed together with the port.
+///
+/// This is the literal path only. A host NAME handed to this function would be
+/// resolved by tokio on the blocking pool with no bound and no record, so the
+/// executor reaches it only through [`connect_host`], which decides first.
 pub(crate) async fn connect_tcp(
     host: &str,
     port: u16,
@@ -35,9 +42,110 @@ pub(crate) async fn connect_tcp(
     }
 }
 
+/// Opens a real TCP connection to `host:port` for a host that is either an IP
+/// literal or a DNS name, and says how it got the address.
+///
+/// * An IP literal takes the unchanged path of [`connect_tcp`]; no resolver is
+///   involved and nothing is looked up.
+/// * A name is looked up by the OS resolver exactly once, through the bounded
+///   resolver (so a hung lookup cannot hold more than its permit). The dial
+///   then goes to the answers themselves, one after another under one connect
+///   budget, and never asks the resolver again: not for the next address, not
+///   after a refusal. The address that was looked up is the address that is
+///   dialled ("pinned"); the sockets are ordinary ones, with no bind and no
+///   interface, so where they go is the operating system's decision.
+/// * Anything else (a numeric alias such as `127.1`, text with whitespace or
+///   control characters) is refused as `InvalidTarget` before any lookup.
+///
+/// Resolution time is not part of `connect_timeout`; the resolver has its own
+/// deadline and the executor's dial deadline bounds both.
+pub(crate) async fn connect_host(
+    host: &str,
+    port: u16,
+    connect_timeout: Duration,
+    resolver: &BoundedResolver,
+) -> Result<(TcpStream, DialResolution), NetcoreError> {
+    let bare = unbracket(host);
+    if let Ok(ip) = bare.parse::<IpAddr>() {
+        let stream = connect_tcp(host, port, connect_timeout).await?;
+        let dialed = SocketAddr::new(ip, port);
+        let resolution = DialResolution {
+            mode: ResolutionMode::Literal,
+            dialed: Some(dialed),
+            attempted: vec![dialed],
+            answers: 0,
+            local_addr: stream.local_addr().ok(),
+        };
+        return Ok((stream, resolution));
+    }
+    if !is_resolvable_name(bare) {
+        // The text is client-influenced and could carry line breaks into
+        // logs, so it is not echoed.
+        return Err(NetcoreError::InvalidTarget(
+            "the host is neither an IP address nor a resolvable DNS name".into(),
+        ));
+    }
+    let answers = normalise_answers(resolver.resolve_once(bare, port).await?);
+    let (stream, dialed, attempted) =
+        connect_in_order(&answers, &authority(host, port), connect_timeout).await?;
+    let resolution = DialResolution {
+        mode: ResolutionMode::OsResolver,
+        dialed: Some(dialed),
+        attempted,
+        answers: u8::try_from(answers.len()).unwrap_or(u8::MAX),
+        local_addr: stream.local_addr().ok(),
+    };
+    Ok((stream, resolution))
+}
+
+/// Connects to `addrs` one after another and keeps the first that answers. All
+/// attempts share ONE budget, so a blackholed first address spends all of it
+/// and later ones are never tried: the same bound the single
+/// `TcpStream::connect((host, port))` had. Each attempt dials a `SocketAddr`,
+/// which never touches a resolver.
+async fn connect_in_order(
+    addrs: &[SocketAddr],
+    label: &str,
+    connect_timeout: Duration,
+) -> Result<(TcpStream, SocketAddr, Vec<SocketAddr>), NetcoreError> {
+    let attempts = async {
+        let mut attempted = Vec::with_capacity(addrs.len());
+        let mut last: Option<std::io::Error> = None;
+        let mut every_refusal = true;
+        for addr in addrs {
+            attempted.push(*addr);
+            match TcpStream::connect(*addr).await {
+                Ok(stream) => return Ok((stream, *addr, attempted)),
+                Err(err) => {
+                    every_refusal &= err.kind() == std::io::ErrorKind::ConnectionRefused;
+                    last = Some(err);
+                }
+            }
+        }
+        Err((last, every_refusal))
+    };
+    match timeout(connect_timeout, attempts).await {
+        Ok(Ok(dialed)) => Ok(dialed),
+        Ok(Err((Some(err), true))) => Err(NetcoreError::ConnectionRefused(
+            label.to_owned(),
+            err.to_string(),
+        )),
+        Ok(Err((Some(err), false))) => Err(NetcoreError::Io(label.to_owned(), err)),
+        // Unreachable while `resolve_once` refuses an empty answer; typed
+        // anyway, so an empty list can never look like a success.
+        Ok(Err((None, _))) => Err(NetcoreError::DnsResolutionFailed(
+            label.to_owned(),
+            "os-resolver".to_owned(),
+            "no addresses".to_owned(),
+        )),
+        Err(_) => Err(NetcoreError::Timeout(label.to_owned(), connect_timeout)),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::resolve::fakes::{addr, CountingResolver};
     use tokio::net::TcpListener;
 
     #[tokio::test]
@@ -198,5 +306,176 @@ mod tests {
             let _ = release_tx.send(());
             hog.await.expect("join");
         });
+    }
+
+    /// An upper bound, far above any socket-layer answer: Windows reports a
+    /// refused connect to a closed loopback port only after about 2 s, and the
+    /// tests below dial several in turn under one budget. Only a dial that
+    /// really hangs uses all of it.
+    const DIAL_TIMEOUT: Duration = Duration::from_secs(20);
+
+    /// A port that refuses: bound then dropped, so nothing listens on it.
+    async fn closed_port() -> u16 {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        drop(listener);
+        port
+    }
+
+    #[tokio::test]
+    async fn resolver_called_exactly_once_per_dial_even_when_first_address_fails() {
+        let closed = closed_port().await;
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let open = listener.local_addr().expect("addr");
+        let accept = tokio::spawn(async move { listener.accept().await });
+        let first = addr(&format!("127.0.0.1:{closed}"));
+
+        let fake = CountingResolver::answering(vec![first, open]);
+        let resolver = BoundedResolver::new().with_resolver(fake.clone());
+        let (stream, resolution) = connect_host("svc.test", 443, DIAL_TIMEOUT, &resolver)
+            .await
+            .expect("the second answer accepts");
+
+        assert_eq!(
+            fake.calls(),
+            vec![("svc.test".to_owned(), 443)],
+            "one lookup per dial, with the name and port of the dial"
+        );
+        assert_eq!(stream.peer_addr().expect("peer"), open);
+        assert_eq!(resolution.mode, ResolutionMode::OsResolver);
+        assert_eq!(resolution.answers, 2);
+        assert_eq!(resolution.dialed, Some(open));
+        assert_eq!(resolution.attempted, vec![first, open]);
+        accept.await.expect("join").expect("accept");
+    }
+
+    #[tokio::test]
+    async fn numeric_alias_never_reaches_the_resolver() {
+        // Each of these is dialled by the OS resolver as an IPv4 address. The
+        // fake would answer a loopback address that is listening, so a dial
+        // that reached it would succeed: only the refusal keeps them out.
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let fake = CountingResolver::answering(vec![listener.local_addr().expect("addr")]);
+        let resolver = BoundedResolver::new().with_resolver(fake.clone());
+        for alias in [
+            "2130706433",
+            "127.1",
+            "0x7f.1",
+            "010.0.0.1",
+            "0x7f000001",
+            "127.0.0.1.",
+            "1",
+        ] {
+            let err = connect_host(alias, 80, DIAL_TIMEOUT, &resolver)
+                .await
+                .expect_err("a numeric alias must be refused");
+            assert_eq!(err.code(), "NETCORE_INVALID_TARGET", "{alias}: {err:?}");
+            assert!(
+                !err.to_string().contains(alias),
+                "the target is echoed: {err}"
+            );
+        }
+        assert_eq!(fake.calls(), Vec::new(), "the resolver was called");
+    }
+
+    #[tokio::test]
+    async fn text_that_is_no_host_never_reaches_the_resolver() {
+        let fake = CountingResolver::answering(vec![addr("127.0.0.1:9")]);
+        let resolver = BoundedResolver::new().with_resolver(fake.clone());
+        for text in [
+            "",
+            "bad host",
+            "line\nbreak.test",
+            "nul\0.test",
+            "under_score.test",
+            "[name.test]",
+            "fe80::1%eth0",
+            "a..b",
+            "host.test:80",
+        ] {
+            let err = connect_host(text, 80, DIAL_TIMEOUT, &resolver)
+                .await
+                .expect_err("not a host");
+            assert_eq!(err.code(), "NETCORE_INVALID_TARGET", "{text:?}: {err:?}");
+        }
+        assert_eq!(fake.calls(), Vec::new(), "the resolver was called");
+    }
+
+    #[tokio::test]
+    async fn ipv6_and_ipv4_literals_never_call_the_resolver() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let open = listener.local_addr().expect("addr");
+        let accept = tokio::spawn(async move { listener.accept().await });
+        let fake = CountingResolver::answering(vec![addr("192.0.2.1:9")]);
+        let resolver = BoundedResolver::new().with_resolver(fake.clone());
+
+        let (_stream, resolution) = connect_host("127.0.0.1", open.port(), DIAL_TIMEOUT, &resolver)
+            .await
+            .expect("the IPv4 literal dials directly");
+        assert_eq!(resolution.mode, ResolutionMode::Literal);
+        assert_eq!(resolution.dialed, Some(open));
+        assert_eq!(resolution.answers, 0);
+        accept.await.expect("join").expect("accept");
+
+        // The IPv6 spellings may well fail on a host without IPv6 or with
+        // nothing listening (a timeout is as good as a refusal here); what they
+        // must not do is ask the resolver.
+        let closed = closed_port().await;
+        for host in ["::1", "[::1]", "::ffff:127.0.0.1", "[::ffff:127.0.0.1]"] {
+            let outcome = connect_host(host, closed, Duration::from_millis(500), &resolver).await;
+            if let Err(err) = &outcome {
+                assert_ne!(err.code(), "NETCORE_INVALID_TARGET", "{host}: {err:?}");
+                assert_ne!(err.code(), "NETCORE_DNS_FAILED", "{host}: {err:?}");
+            }
+        }
+        assert_eq!(fake.calls(), Vec::new(), "a literal reached the resolver");
+    }
+
+    #[tokio::test]
+    async fn mapped_and_duplicate_answers_are_dialed_once_as_ipv4() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let open = listener.local_addr().expect("addr");
+        let accept = tokio::spawn(async move { listener.accept().await });
+        let mapped = addr(&format!("[::ffff:127.0.0.1]:{}", open.port()));
+
+        let resolver = BoundedResolver::new()
+            .with_resolver(CountingResolver::answering(vec![mapped, open, mapped]));
+        let (_stream, resolution) = connect_host("svc.test", 443, DIAL_TIMEOUT, &resolver)
+            .await
+            .expect("the unmapped IPv4 address accepts");
+        assert_eq!(resolution.answers, 1, "three answers are one address");
+        assert_eq!(resolution.attempted, vec![open], "dialled once, as IPv4");
+        assert_eq!(resolution.dialed, Some(open));
+        accept.await.expect("join").expect("accept");
+    }
+
+    #[tokio::test]
+    async fn a_name_whose_every_answer_refuses_is_a_refusal_not_an_io_error() {
+        let (one, two) = (closed_port().await, closed_port().await);
+        let fake = CountingResolver::answering(vec![
+            addr(&format!("127.0.0.1:{one}")),
+            addr(&format!("127.0.0.1:{two}")),
+        ]);
+        let resolver = BoundedResolver::new().with_resolver(fake.clone());
+        let err = connect_host("svc.test", 443, DIAL_TIMEOUT, &resolver)
+            .await
+            .expect_err("nothing listens");
+        assert!(
+            matches!(&err, NetcoreError::ConnectionRefused(label, _) if label == "svc.test:443"),
+            "{err:?}"
+        );
+        assert_eq!(
+            fake.calls().len(),
+            1,
+            "a refusal is not a reason to look up again"
+        );
+    }
+
+    #[tokio::test]
+    async fn connect_in_order_types_an_empty_list_instead_of_succeeding() {
+        let err = connect_in_order(&[], "svc.test:443", DIAL_TIMEOUT)
+            .await
+            .expect_err("no address to dial");
+        assert_eq!(err.code(), "NETCORE_DNS_FAILED");
     }
 }

@@ -17,7 +17,7 @@ rustls-pki-types = "1"
 rustls-native-certs = "0.8"
 
 [dev-dependencies]
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "io-util"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "io-util", "test-util"] }
 
 [lints]
 workspace = true

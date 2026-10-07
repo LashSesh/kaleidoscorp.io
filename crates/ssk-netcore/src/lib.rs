@@ -23,6 +23,7 @@ mod error;
 mod executor;
 mod http_connect;
 mod probe;
+mod resolve;
 mod session;
 mod socks5;
 mod tls;
@@ -32,7 +33,8 @@ pub use dns::RecordType;
 pub use error::NetcoreError;
 pub use executor::{AdapterRegistry, RouteExecutor};
 pub use probe::{ProbeReport, ProbeStatus};
-pub use session::{EgressSession, Transport};
+pub use resolve::{is_resolvable_name, NameResolver, OsResolver};
+pub use session::{DialResolution, EgressSession, ResolutionMode, SessionResolution, Transport};
 
 #[cfg(test)]
 mod tests {
