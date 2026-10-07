@@ -2,6 +2,7 @@
 //! execution. This does not create interfaces, install routes or start VPNs.
 use std::collections::BTreeMap;
 use std::net::IpAddr;
+use std::time::Duration;
 
 use ssk_config::routing::{AdapterTransport, RoutingAction, RoutingConfig, RoutingRule};
 use ssk_ipc::{IpcError, ProfileSummaryDto};
@@ -287,6 +288,34 @@ impl ConfiguredRouting {
             .map(|profile| profile.denials.clone())
             .unwrap_or_default()
     }
+}
+
+/// Slack above the engine's own bounds before the ingress executor cuts a dial.
+const INGRESS_DIAL_MARGIN: Duration = Duration::from_secs(5);
+
+/// The whole-dial deadline for the ingress's own `RouteExecutor` (design 12.9):
+/// the executor's resolve timeout `r`, plus its per-TCP connect timeout `c`,
+/// plus 5 s.
+///
+/// The ingress engine bounds an upstream dial itself, by the configured
+/// `connect_timeout` (resolution and proxy handshakes included), so the executor
+/// must not cut a dial before that bound or before its own steps have had their
+/// turns: `r + c` is every step it can be in the middle of, and the margin keeps
+/// the executor's deadline strictly behind both. The deadline stays as the safety
+/// net for a caller that brings no bound of its own, `probe` for one. Pure, so
+/// that its table can be tested without an executor, and saturating, so that no
+/// configured value can make it panic.
+///
+/// The activation executor does not use this: it keeps its 10 s and 30 s, above
+/// the supervisor's own 20 s activation deadline.
+#[must_use]
+pub fn ingress_executor_dial_deadline(
+    resolve_timeout: Duration,
+    connect_timeout: Duration,
+) -> Duration {
+    resolve_timeout
+        .saturating_add(connect_timeout)
+        .saturating_add(INGRESS_DIAL_MARGIN)
 }
 
 #[cfg(test)]
@@ -644,5 +673,45 @@ mod tests {
             "the activation's transition reason embeds this text"
         );
         assert_eq!(IpcError::from(plan).code, "UNKNOWN_ADAPTER");
+    }
+
+    #[test]
+    fn ingress_executor_deadline_exceeds_the_engine_outer_bound() {
+        // (connect_timeout `c`, resolve timeout `r` = min(5 s, c), deadline)
+        // for the smallest, the default and the largest configurable `c`.
+        let table = [
+            (
+                Duration::from_millis(100),
+                Duration::from_millis(100),
+                Duration::from_millis(5200),
+            ),
+            (
+                Duration::from_secs(20),
+                Duration::from_secs(5),
+                Duration::from_secs(30),
+            ),
+            (
+                Duration::from_secs(120),
+                Duration::from_secs(5),
+                Duration::from_secs(130),
+            ),
+        ];
+        for (connect, resolve, expected) in table {
+            let deadline = ingress_executor_dial_deadline(resolve, connect);
+            assert_eq!(deadline, expected, "connect_timeout {connect:?}");
+            // The engine's outer bound is `connect_timeout`; the executor's
+            // deadline is above it and above both of the executor's own steps
+            // by the whole margin, so it is never what ends an ingress dial.
+            assert!(deadline > connect, "{deadline:?} <= {connect:?}");
+            assert!(
+                deadline >= resolve + connect + Duration::from_secs(5),
+                "{deadline:?}"
+            );
+        }
+        assert_eq!(
+            ingress_executor_dial_deadline(Duration::MAX, Duration::MAX),
+            Duration::MAX,
+            "a value too large to add saturates and never panics"
+        );
     }
 }

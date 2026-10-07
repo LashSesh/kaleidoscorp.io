@@ -173,6 +173,25 @@ impl DaemonLock {
     pub fn path(&self) -> &Path {
         &self.path
     }
+
+    /// Keep the lock until the process ends, when the kernel releases it.
+    ///
+    /// This is how `sskd` gives the lock up, in place of dropping it after its
+    /// runtime has been told to stop. `Runtime::shutdown_timeout` returns `()`
+    /// when it times out, and then "spawned work that did not stop in time and
+    /// threads running it are leaked ... the work continues to run": a blocking
+    /// task (name resolution, a ledger open or verification) or the audit
+    /// writer's thread can still write after the call. The lock is the only
+    /// thing that keeps a second daemon away from the one hash-chained ledger,
+    /// so it must not be released while any such thread can exist. Only the end
+    /// of the process ends them all. The cost is that a restart waits for the
+    /// old process to exit, which is what `--lock-wait` is for.
+    ///
+    /// Not a leak in any sense that matters: one open file, for the rest of a
+    /// process that is about to end.
+    pub fn hold_until_exit(self) {
+        std::mem::forget(self);
+    }
 }
 
 /// Acquire the daemon lock at `path`, writing `info` into it on success.
@@ -385,6 +404,23 @@ mod tests {
         let _held = acquire(&path, &info, Duration::ZERO).expect("first acquire");
         let err = acquire(&path, &info, Duration::ZERO)
             .expect_err("a second daemon against one state dir must be refused");
+        assert_eq!(err.code(), "DAEMON_ALREADY_RUNNING", "{err}");
+    }
+
+    #[test]
+    fn the_lock_is_still_held_after_hold_until_exit() {
+        // `hold_until_exit` consumes the lock and never drops it, so a second
+        // acquisition in the same process (a new open file description, which
+        // `flock` and the Windows share mode both arbitrate) is still refused.
+        // The handle stays open until this test process ends.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("sskd.lock");
+        let info = info_for(dir.path());
+        acquire(&path, &info, Duration::ZERO)
+            .expect("first acquire")
+            .hold_until_exit();
+        let err = acquire(&path, &info, Duration::ZERO)
+            .expect_err("a lock held until exit must not be acquirable again");
         assert_eq!(err.code(), "DAEMON_ALREADY_RUNNING", "{err}");
     }
 

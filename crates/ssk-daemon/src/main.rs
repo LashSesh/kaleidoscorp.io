@@ -6,8 +6,9 @@
 //!
 //! `main` returns [`ExitCode`] and every failure path propagates one.
 //! `std::process::exit` runs **no destructors**, which would discard the
-//! non-blocking log worker's buffer and the ordered release of the daemon
-//! lock. The previous `main` called it in three places.
+//! non-blocking log worker's buffer. (The daemon lock is not released by a
+//! destructor: it is held to the end of the process, see `run`.) The previous
+//! `main` called it in three places.
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -17,7 +18,7 @@ use ssk_daemon::cli::Args;
 use ssk_daemon::config_load::load_daemon_config;
 use ssk_daemon::lock::{DaemonLock, LockInfo};
 use ssk_daemon::paths::Layout;
-use ssk_daemon::shutdown::{Shutdown, ShutdownReason};
+use ssk_daemon::shutdown::{Shutdown, ShutdownPlan, ShutdownReason};
 use ssk_daemon::supervisor::Supervisor;
 use ssk_ipc::Endpoint;
 use ssk_netcore::{DataPlane, NetcoreDataPlane, RouteExecutor};
@@ -31,12 +32,6 @@ const EXIT_USAGE: u8 = 2;
 const EXIT_STARTUP: u8 = 1;
 /// The IPC server exited with an error.
 const EXIT_SERVER: u8 = 1;
-
-/// How long in-flight work is given after the shutdown token flips. Bounded
-/// and never blocking: `CTRL_CLOSE_EVENT` grants roughly `HungAppTimeout`
-/// before Windows kills the process, and service shutdown is governed by
-/// `WaitToKillServiceTimeout`, so the OS will not wait for us.
-const DRAIN_DEADLINE: std::time::Duration = std::time::Duration::from_secs(2);
 
 fn main() -> ExitCode {
     let args = match Args::parse(std::env::args_os().skip(1)) {
@@ -156,12 +151,13 @@ fn run(layout: &Layout, args: &Args) -> ExitCode {
         }
     };
 
-    let code = runtime.block_on(serve(layout, endpoint, &lock));
+    let (code, plan) = runtime.block_on(serve(layout, endpoint, &lock));
 
-    // The kernel would release this on process death anyway; dropping it here
-    // makes the ordering explicit and keeps the handle alive for the whole
-    // serving lifetime rather than by accident.
-    drop(lock);
+    // P4 of the shutdown plan, then the lock, in that order and with the lock
+    // kept to the end of the process (`ShutdownPlan::stop_runtime_then_hold_lock`
+    // says why). Dropping the lock here, as this did before, let a successor
+    // start while the runtime was still dropping tasks that write to the ledger.
+    plan.stop_runtime_then_hold_lock(runtime, lock);
     code
 }
 
@@ -241,7 +237,10 @@ fn spawn_kill_switch_poller(
     })
 }
 
-async fn serve(layout: &Layout, endpoint: Endpoint, lock: &DaemonLock) -> ExitCode {
+/// Serve until a shutdown source fires or the IPC server ends. Returns the exit
+/// code and the shutdown plan; `run` carries out P4 and the lock hold, because
+/// both need the runtime this future runs on to be gone.
+async fn serve(layout: &Layout, endpoint: Endpoint, lock: &DaemonLock) -> (ExitCode, ShutdownPlan) {
     let config_path = std::env::var_os("SSK_CONFIG_PATH").map(PathBuf::from);
     let config = load_daemon_config(config_path.as_deref());
     match &config {
@@ -304,30 +303,34 @@ async fn serve(layout: &Layout, endpoint: Endpoint, lock: &DaemonLock) -> ExitCo
         "sskd starting: binding the IPC endpoint"
     );
 
-    let serve_result = tokio::select! {
-        result = run_server(endpoint.clone(), Arc::clone(&supervisor)) => Some(result),
-        reason = watcher.wait() => {
-            tracing::info!(
-                target: "ssk.lifecycle",
-                reason = reason.as_str(),
-                os_deadline = reason.is_os_deadline(),
-                drain_budget_ms = u64::try_from(DRAIN_DEADLINE.as_millis()).unwrap_or(u64::MAX),
-                "sskd stopping"
-            );
-            None
+    let (serve_result, reason) = tokio::select! {
+        // The server ending by itself is not a signal, so no OS timer is
+        // running: the graceful plan, labelled as the server's own end.
+        result = run_server(endpoint.clone(), Arc::clone(&supervisor)) => {
+            (Some(result), ShutdownReason::ServerError)
         }
+        reason = watcher.wait() => (None, reason),
     };
+    let plan = ShutdownPlan::for_reason(reason);
+    if serve_result.is_none() {
+        tracing::info!(
+            target: "ssk.lifecycle",
+            reason = reason.as_str(),
+            os_deadline = reason.is_os_deadline(),
+            runtime_stop_ms = u64::try_from(plan.runtime_stop.as_millis()).unwrap_or(u64::MAX),
+            "sskd stopping"
+        );
+    }
     signals.abort();
     if let Some(handle) = kill_switch_poll {
         handle.abort();
     }
 
-    // Bounded drain. `select!` has already dropped the accept loop, so no new
-    // connection is served; this yields briefly so tasks mid-write can finish.
-    // It is raced against a hard deadline and never awaited unconditionally —
-    // no invariant depends on it completing, and the OS may kill the process
-    // before it even starts.
-    let _ = tokio::time::timeout(DRAIN_DEADLINE, tokio::task::yield_now()).await;
+    // Nothing is drained here. There is no ingress, so P1 and P2 have no work,
+    // and P3 is done: `select!` dropped the accept loop, so no new connection is
+    // served. Connection tasks that are already running go on until `run` stops
+    // the runtime (P4); one that is mid-dial is then settled by
+    // `ActivationScope`, with the lock still held.
 
     if let Endpoint::UnixSocket(path) = &endpoint {
         // A Windows named pipe is a refcounted kernel object and vanishes with
@@ -338,7 +341,7 @@ async fn serve(layout: &Layout, endpoint: Endpoint, lock: &DaemonLock) -> ExitCo
         let _ = std::fs::remove_file(path);
     }
 
-    match serve_result {
+    let code = match serve_result {
         None | Some(Ok(())) => ExitCode::SUCCESS,
         Some(Err(err)) => {
             tracing::error!(
@@ -349,7 +352,8 @@ async fn serve(layout: &Layout, endpoint: Endpoint, lock: &DaemonLock) -> ExitCo
             );
             ExitCode::from(EXIT_SERVER)
         }
-    }
+    };
+    (code, plan)
 }
 
 #[cfg(unix)]

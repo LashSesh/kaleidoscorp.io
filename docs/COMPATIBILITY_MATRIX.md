@@ -262,6 +262,29 @@ not a contract. `ExplainError` also answers `DAEMON_BUSY` and the `NETCORE_*` co
 that `last_error.code` can carry (it said "unknown error code" for them). No request,
 response or DTO shape and no ledger format changed.
 
+## Daemon shutdown and the daemon lock (2026-10-07)
+
+`sskd` now keeps its daemon lock until the process has ended. Before, it released the
+lock as soon as its serve loop returned and only then dropped its async runtime, so a
+second `sskd` could take the lock, and extend the same audit ledger, while the first
+was still dropping tasks. One of those tasks writes: an `ActivateProfile` that is
+mid-dial when the daemon stops gets its terminal `FailClosed` ledger record when the
+runtime drops it. That record is now on disk before the lock can be taken (measured on
+Linux: SIGTERM during a dial to a silent proxy; the successor that took the lock first
+saw only `DispatchPending` before, in 12 of 12 runs).
+
+What an operator or a service manager can see: a new `sskd` started right after the
+old one was signalled, without `--lock-wait`, is refused with `DAEMON_ALREADY_RUNNING`
+until the old process has exited (7 ms measured); `--lock-wait <ms>` covers that, as it
+always did. The old process no longer waits for its runtime's blocking work without a
+bound: the runtime is stopped with `Runtime::shutdown_timeout`, which waits at most 1 s
+after Ctrl-C, Ctrl-Break, SIGTERM, a service stop or an end of the IPC server, and at
+most 200 ms after console close, logoff, system shutdown or service pre-shutdown;
+blocking work (name resolution) still running by then is abandoned with the process. The `sskd stopping` log line carries `runtime_stop_ms` in
+place of `drain_budget_ms` (a fixed 2000, the ceiling on a `yield_now` that returns at
+once). The Windows reasons and times are UNVERIFIED: nothing here has run on Windows.
+No wire, configuration or ledger format and no exit code changed.
+
 ## Host grammar in routing configuration (2026-10-06)
 
 A routing rule `destination`, a rule `domain_suffix` and an adapter `host`
