@@ -478,4 +478,116 @@ mod tests {
             .expect_err("no address to dial");
         assert_eq!(err.code(), "NETCORE_DNS_FAILED");
     }
+
+    /// The device an upstream socket is bound to (`SO_BINDTODEVICE`), as the
+    /// kernel reports it: `None` for a socket nobody bound.
+    #[cfg(target_os = "linux")]
+    fn bound_device(stream: &TcpStream) -> Option<Vec<u8>> {
+        socket2::SockRef::from(stream)
+            .device()
+            .expect("SO_BINDTODEVICE can be read back")
+    }
+
+    /// CO-1 (docs/M2_LOCAL_INGRESS_DESIGN.md 2.3, 24.2.1) read from real
+    /// sockets: a Direct dial applies no interface binding, and its source
+    /// address is the one the kernel gives a plain connection to the same
+    /// listener. Both dial functions are read: the literal one and, behind a
+    /// name, the pinned-address one.
+    ///
+    /// The listener is on the loopback alias 127.0.0.5 while the kernel picks
+    /// 127.0.0.1 as the source, so the source differs from the destination and
+    /// a dial that bound to the destination address would show.
+    ///
+    /// What this does and does not show. `device()` being `None` means no
+    /// `SO_BINDTODEVICE` was applied. The source equality is consistent with
+    /// an unbound socket but cannot tell it from an explicit `bind(127.0.0.1)`,
+    /// which gives the same address, so it is not offered as proof that the OS
+    /// chose the source. That nothing binds is the static scan of
+    /// `ssk-daemon/tests/dial_path_binds_nothing.rs`; that the OS decides is
+    /// the route-flip test (C-CO1b); what the Windows stack does is the manual
+    /// run of ACCEPT-5.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn direct_dial_leaves_device_and_source_to_the_os() {
+        let listener = TcpListener::bind("127.0.0.5:0")
+            .await
+            .expect("127.0.0.5 is a loopback address on Linux");
+        let target = listener.local_addr().expect("addr");
+
+        // Nothing of ours touches the control: its source is what the kernel
+        // chooses for this destination.
+        let control = std::net::TcpStream::connect(target).expect("control connect");
+        let control_source = control.local_addr().expect("control source").ip();
+        assert_ne!(
+            control_source,
+            target.ip(),
+            "the kernel chose the destination as the source: the source check cannot see a bind to it"
+        );
+
+        let literal = connect_tcp("127.0.0.5", target.port(), DIAL_TIMEOUT)
+            .await
+            .expect("the literal dial");
+        assert_eq!(
+            bound_device(&literal),
+            None,
+            "the literal dial binds a device"
+        );
+        assert_eq!(
+            literal.local_addr().expect("local").ip(),
+            control_source,
+            "the literal dial's source is not the kernel's choice"
+        );
+
+        let resolver =
+            BoundedResolver::new().with_resolver(CountingResolver::answering(vec![target]));
+        let (named, resolution) = connect_host("svc.test", target.port(), DIAL_TIMEOUT, &resolver)
+            .await
+            .expect("the dial of a name");
+        assert_eq!(
+            resolution.mode,
+            ResolutionMode::OsResolver,
+            "not the name path"
+        );
+        assert_eq!(bound_device(&named), None, "the name dial binds a device");
+        assert_eq!(
+            named.local_addr().expect("local").ip(),
+            control_source,
+            "the name dial's source is not the kernel's choice"
+        );
+    }
+
+    /// The device check above can fail: on a socket to which the test itself
+    /// applies `SO_BINDTODEVICE`, the same reader reports the device. Without
+    /// this, "no device" could be what a broken reader always says.
+    ///
+    /// Skips, saying why, where the kernel refuses the option for lack of
+    /// permission (CAP_NET_RAW, on kernels that require it).
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn the_device_check_has_teeth() {
+        let listener = TcpListener::bind("127.0.0.5:0")
+            .await
+            .expect("127.0.0.5 is a loopback address on Linux");
+        let target = listener.local_addr().expect("addr");
+
+        let socket = tokio::net::TcpSocket::new_v4().expect("socket");
+        if let Err(err) = socket.bind_device(Some(b"lo")) {
+            assert_eq!(
+                err.kind(),
+                std::io::ErrorKind::PermissionDenied,
+                "binding a socket to lo failed for a reason other than permission: {err}"
+            );
+            eprintln!(
+                "SKIPPED: this process may not set SO_BINDTODEVICE ({err}); the device check was \
+                 not shown to detect a bound socket"
+            );
+            return;
+        }
+        let stream = socket.connect(target).await.expect("the bound dial");
+        assert_eq!(
+            bound_device(&stream),
+            Some(b"lo".to_vec()),
+            "the device check does not see a device that was bound"
+        );
+    }
 }

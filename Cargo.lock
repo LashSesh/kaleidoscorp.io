@@ -1596,6 +1596,7 @@ dependencies = [
  "rustls",
  "rustls-native-certs",
  "rustls-pki-types",
+ "socket2",
  "ssk-netadmin",
  "ssk-types",
  "thiserror",
