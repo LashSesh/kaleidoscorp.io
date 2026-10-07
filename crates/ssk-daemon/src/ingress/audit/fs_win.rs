@@ -28,4 +28,12 @@ impl LedgerFs for WindowsLedgerFs {
     fn is_private_store(&self) -> bool {
         false
     }
+
+    fn read_key_file(&self) -> Result<Option<Vec<u8>>, StoreError> {
+        Err(StoreError::Unsupported)
+    }
+
+    fn create_key_file(&self, _bytes: &[u8]) -> Result<(), StoreError> {
+        Err(StoreError::Unsupported)
+    }
 }

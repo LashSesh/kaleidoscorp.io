@@ -35,7 +35,8 @@ use rustix::io::Errno;
 
 use super::fs::{
     io_code, parse_segment_name, segment_name, ActiveSegment, ActiveStat, LedgerFs, LedgerStore,
-    SegmentReader, Segments, StoreError, UnsafeReason, LEDGER_DIR,
+    SegmentReader, Segments, StoreError, UnsafeReason, KEY_FILE_NAME, KEY_FILE_READ_MAX,
+    LEDGER_DIR,
 };
 
 /// What the checks look at, separated from `Stat` so the table can be tested
@@ -134,8 +135,9 @@ impl UnixLedgerFs {
     }
 }
 
-impl LedgerFs for UnixLedgerFs {
-    fn open_store(&self) -> Result<Box<dyn LedgerStore>, StoreError> {
+impl UnixLedgerFs {
+    /// The state root, opened once and checked (design 6.4.9, item 1).
+    fn open_root(&self) -> Result<(std::os::fd::OwnedFd, u32), StoreError> {
         let euid = rustix::process::geteuid().as_raw();
         // A symlinked root that the operator set up on purpose keeps working: it
         // is resolved once, here, and then only the descriptor is used.
@@ -150,7 +152,13 @@ impl LedgerFs for UnixLedgerFs {
         .map_err(|errno| unsafe_open(errno, StoreError::RootUnsafe(UnsafeReason::NotDirectory)))?;
         let stat = fstat(&root_fd).map_err(io_error)?;
         check_root(Facts::of(&stat), euid).map_err(StoreError::RootUnsafe)?;
+        Ok((root_fd, euid))
+    }
+}
 
+impl LedgerFs for UnixLedgerFs {
+    fn open_store(&self) -> Result<Box<dyn LedgerStore>, StoreError> {
+        let (root_fd, euid) = self.open_root()?;
         let created = match mkdirat(&root_fd, LEDGER_DIR, Mode::RWXU) {
             Ok(()) => true,
             Err(Errno::EXIST) => false,
@@ -181,6 +189,74 @@ impl LedgerFs for UnixLedgerFs {
     fn is_private_store(&self) -> bool {
         true
     }
+
+    fn read_key_file(&self) -> Result<Option<Vec<u8>>, StoreError> {
+        let (root_fd, euid) = self.open_root()?;
+        let fd = match openat(
+            &root_fd,
+            KEY_FILE_NAME,
+            // NONBLOCK: opening a FIFO that someone planted here must not wait for
+            // a writer; the `fstat` below refuses it. It changes nothing for a
+            // regular file.
+            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+            Mode::empty(),
+        ) {
+            Ok(fd) => fd,
+            Err(Errno::NOENT) => return Ok(None),
+            Err(errno) => {
+                return Err(unsafe_open(
+                    errno,
+                    StoreError::FileUnsafe(UnsafeReason::NotRegularFile),
+                ))
+            }
+        };
+        let stat = fstat(&fd).map_err(io_error)?;
+        check_file(Facts::of(&stat), euid).map_err(StoreError::FileUnsafe)?;
+        let mut bytes = Vec::new();
+        File::from(fd)
+            .take(KEY_FILE_READ_MAX)
+            .read_to_end(&mut bytes)
+            .map_err(|error| StoreError::Io(io_code(&error)))?;
+        Ok(Some(bytes))
+    }
+
+    fn create_key_file(&self, bytes: &[u8]) -> Result<(), StoreError> {
+        self.create_key_with(bytes, &mut |file, bytes| file.write_all(bytes))
+    }
+}
+
+impl UnixLedgerFs {
+    /// `create_key_file` with the write as a parameter, so that a write that fails
+    /// half-way can be tested: the production write is `write_all`.
+    fn create_key_with(
+        &self,
+        bytes: &[u8],
+        write: &mut dyn FnMut(&mut File, &[u8]) -> io::Result<()>,
+    ) -> Result<(), StoreError> {
+        let (root_fd, euid) = self.open_root()?;
+        let fd = openat(
+            &root_fd,
+            KEY_FILE_NAME,
+            OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::RUSR | Mode::WUSR,
+        )
+        .map_err(io_error)?;
+        // From here on the name exists and is ours: whatever fails, it is removed
+        // again, so that a half-written key never survives to be read next start.
+        let mut file = File::from(fd);
+        let mut finish = || -> Result<(), StoreError> {
+            let stat = fstat(&file).map_err(io_error)?;
+            check_file(Facts::of(&stat), euid).map_err(StoreError::FileUnsafe)?;
+            write(&mut file, bytes).map_err(|error| StoreError::Io(io_code(&error)))?;
+            file.sync_all()
+                .map_err(|error| StoreError::Io(io_code(&error)))?;
+            // D3: the entry in the state root is durable before the key is used.
+            fsync(&root_fd).map_err(io_error)
+        };
+        finish().inspect_err(|_| {
+            let _ = unlinkat(&root_fd, KEY_FILE_NAME, AtFlags::empty());
+        })
+    }
 }
 
 struct UnixStore {
@@ -196,7 +272,8 @@ impl UnixStore {
         let fd = openat(
             &self.dir_fd,
             name.as_str(),
-            flags | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            // NONBLOCK for the reason given at `read_key_file`.
+            flags | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
             mode,
         )
         .map_err(|errno| {
@@ -674,6 +751,77 @@ mod tests {
             store.segments().err(),
             Some(StoreError::FileUnsafe(UnsafeReason::NotRegularFile))
         );
+    }
+
+    #[test]
+    fn a_fifo_with_a_segments_name_is_refused_and_never_waited_for() {
+        let root = private_root();
+        let store = open(root.path()).expect("opens");
+        let fifo = root.path().join(LEDGER_DIR).join(segment_name(4));
+        rustix::fs::mknodat(CWD, &fifo, FileType::Fifo, Mode::RUSR | Mode::WUSR, 0)
+            .expect("mkfifo");
+        // Run on a thread: a regression would block here for ever, and a hung test
+        // run is worse than a failed one.
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let reader = store.open_reader(4).err();
+            let active = store.open_active(4).err();
+            let listed = store.segments().err();
+            let _ = sender.send((reader, active, listed));
+        });
+        let (reader, active, listed) = receiver
+            .recv_timeout(std::time::Duration::from_secs(20))
+            .expect("opening a FIFO must not block");
+        assert!(matches!(
+            reader,
+            Some(StoreError::FileUnsafe(UnsafeReason::NotRegularFile))
+        ));
+        assert!(matches!(
+            active,
+            Some(StoreError::FileUnsafe(UnsafeReason::NotRegularFile)) | Some(StoreError::Io(_))
+        ));
+        assert_eq!(
+            listed,
+            Some(StoreError::FileUnsafe(UnsafeReason::NotRegularFile))
+        );
+    }
+
+    #[test]
+    fn a_fifo_in_the_place_of_the_key_is_refused_and_never_waited_for() {
+        let root = private_root();
+        let fifo = root.path().join(KEY_FILE_NAME);
+        rustix::fs::mknodat(CWD, &fifo, FileType::Fifo, Mode::RUSR | Mode::WUSR, 0)
+            .expect("mkfifo");
+        let fs = UnixLedgerFs::new(root.path().to_path_buf());
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = sender.send(fs.read_key_file());
+        });
+        let answer = receiver
+            .recv_timeout(std::time::Duration::from_secs(20))
+            .expect("opening a FIFO must not block");
+        assert_eq!(
+            answer,
+            Err(StoreError::FileUnsafe(UnsafeReason::NotRegularFile))
+        );
+    }
+
+    #[test]
+    fn a_key_that_could_not_be_completed_does_not_stay_behind() {
+        let root = private_root();
+        let fs = UnixLedgerFs::new(root.path().to_path_buf());
+        let key = root.path().join(KEY_FILE_NAME);
+        // The write fails after the file exists, having written half of it.
+        let failed = fs.create_key_with(b"0123456789", &mut |file, bytes| {
+            file.write_all(bytes.get(..5).unwrap_or_default())?;
+            Err(io::Error::from(io::ErrorKind::StorageFull))
+        });
+        assert_eq!(failed, Err(StoreError::Io("AUDIT_DISK_FULL")));
+        assert!(!key.exists(), "a half-written key is removed");
+        // And the next attempt works, as it would after the operator freed space.
+        fs.create_key_file(b"0123456789").expect("creates");
+        assert_eq!(std::fs::read(&key).expect("read"), b"0123456789");
+        assert_eq!(mode_of(&key), 0o600);
     }
 
     /// Needs root: another user's directory, file and root.

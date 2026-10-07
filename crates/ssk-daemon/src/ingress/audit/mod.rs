@@ -7,6 +7,7 @@
 // and the crates below it, and from nothing that is built on top of it
 // (`engine`, `flow`, `host`, `shared`): a test scans the sources.
 
+pub mod dest;
 pub mod fs;
 #[cfg(unix)]
 pub mod fs_unix;

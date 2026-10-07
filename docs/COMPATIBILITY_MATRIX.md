@@ -164,8 +164,25 @@ daemon against a ledger written by a newer one. A format version 0 is invalid. A
 field name, order, spelling or hash input, a new `event` kind or a new validation that refuses a
 value written before, needs a new `ledger_format` and an entry here. `record.rs` pins the
 persisted shape of a `started` line (field names, order and hash) and the largest record to the
-byte; the segments, rotation, retention and the destination token function are specified in
-`docs/M2_LOCAL_INGRESS_DESIGN.md` 6.4 and get their own paragraphs when they are written.
+byte; the segments, rotation and retention are specified in
+`docs/M2_LOCAL_INGRESS_DESIGN.md` 6.4 and get their own paragraph when they are written.
+
+**Hashed destinations: the key file and the token function** (`ingress/audit/dest.rs`). With
+`destination_logging: hashed` a destination is recorded as a keyed token, and the key file and
+the function are a persisted contract: a token can only be matched again with the same key and
+the same function. The key is 32 random bytes kept in `<state dir>/ingress-dest.key` as 64
+lowercase hex characters and a line feed (mode 0600, created exclusively, outside the ledger
+directory; a file of any other form is refused, not repaired). `kid` is the first 8 bytes of
+`BLAKE3 derive_key("ssk.ingress.dest.key-id.v1", key)` as 16 hex characters; the token is the
+first 16 bytes of `BLAKE3 keyed_hash(key, message)` as 32 hex characters, where `message` is
+`"ssk.ingress.dest.v1"`, a zero byte, the kind (1 name, 4 IPv4 literal, 6 IPv6 literal), the host
+length as 16 bits big-endian, and the host in its canonical spelling. The port is not part of
+the token. Removing the key file is the operator's way to forget: the next hashed start makes a
+new key with a new `kid`, and tokens of the old key can no longer be matched. Four published
+vectors (key bytes 00 to 1f: `kid` `dcfd61fc2475cfd3`, `example.com` `2c8a3534e4fd1ffbc2665f5baf190592`)
+are pinned by a test and were computed by an independent implementation. A change of the
+context strings, the kind bytes, the length encoding, the truncation or the key file form
+needs a new entry here and a new `kid` namespace.
 
 ## Route executor: no fallback route, bounded dial (2026-10-06)
 

@@ -209,6 +209,17 @@ pub trait LedgerFs: Send + Sync + 'static {
     /// `true` when this implementation makes the checks of 6.4.9; feeds
     /// `Controls.private_audit_store`.
     fn is_private_store(&self) -> bool;
+    /// Reads the destination key file in the state root (design 6.4.10): the file
+    /// is opened `O_NOFOLLOW` and must be a regular file of this user, private,
+    /// with one link. `Ok(None)` when it does not exist. At most
+    /// [`KEY_FILE_READ_MAX`] bytes are returned, so a file of any other length
+    /// reaches the parser as a length it refuses. Blocking.
+    fn read_key_file(&self) -> Result<Option<Vec<u8>>, StoreError>;
+    /// D3: creates the key file exclusively with mode 0600, writes `bytes`,
+    /// `sync_all`, then makes the state root's entry durable. An existing name is
+    /// `Io("AUDIT_ALREADY_EXISTS")`, whatever it holds. A file that was created
+    /// and could not be completed is removed again. Blocking.
+    fn create_key_file(&self, bytes: &[u8]) -> Result<(), StoreError>;
 }
 
 /// What the writer's rotation and prune need from the active segment and the
@@ -235,6 +246,13 @@ pub struct PruneOutcome {
 
 /// The ledger directory below a state root.
 pub const LEDGER_DIR: &str = "ingress-audit";
+
+/// The destination key file, a sibling of the ledger directory.
+pub const KEY_FILE_NAME: &str = "ingress-dest.key";
+
+/// A key file is 65 bytes; one more is read so that a longer file is seen as
+/// longer and never mistaken for a valid one.
+pub const KEY_FILE_READ_MAX: u64 = 66;
 
 #[cfg(test)]
 mod tests {

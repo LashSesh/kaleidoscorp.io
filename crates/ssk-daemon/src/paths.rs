@@ -344,6 +344,17 @@ mod tests {
         );
     }
 
+    /// Same for the key file: the store writes `KEY_FILE_NAME`, and the doctor and
+    /// the CLI look where `Layout` says.
+    #[test]
+    fn the_key_file_name_is_the_one_the_store_uses() {
+        let layout = Layout::at(std::env::temp_dir().join("ssk-layout-key-name"));
+        assert_eq!(
+            layout.dest_key_path(),
+            layout.root().join(crate::ingress::audit::fs::KEY_FILE_NAME)
+        );
+    }
+
     /// The key is a sibling of the ledger directory, not a file in it: a segment
     /// listing must never meet it, and purging the ledger must not remove it.
     #[test]
