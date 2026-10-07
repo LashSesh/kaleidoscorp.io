@@ -1662,14 +1662,16 @@ A failed `ssk activate` probe (`FailClosed`) does not stop the proxy, and a prox
 | not configured | unchanged | disabled | none | Local proxy: off |
 | config invalid | ConfigInvalid | unavailable | none | Local proxy unavailable: configuration invalid |
 | ledger open / verify running, or bind retrying | unchanged | starting | none | Local proxy starting |
-| bound, not armed | unchanged | disarmed | none | Proxy ready, not activated: connections are refused |
+| bound, not armed | unchanged | disarmed | none | Proxy ready, not activated: connections are refused. |
 | armed | unchanged | armed | proxy_clients_only | Proxy active for applications that use it (profile P). Everything else is not covered. |
-| armed, `peer_check` false | unchanged | armed | proxy_clients_only | Proxy active for applications that use it (profile P). Everything else is not covered. Other local accounts may also use it: no peer check is active. |
-| bound, not armed, `peer_check` false | unchanged | disarmed | none | Proxy ready, not activated: connections are refused. If activated, other local accounts could use it: no peer check is active. |
+| armed, `peer_check` false | unchanged | armed | proxy_clients_only | Proxy active for applications that use it (profile P). Everything else is not covered. Other local accounts may also use it: there is no peer check. |
+| bound, not armed, `peer_check` false | unchanged | disarmed | none | Proxy ready, not activated: connections are refused. If activated, other local accounts could use it: there is no peer check. |
 | fault latched | unchanged | tripped | none | Proxy stopped: <code>. Re-arm to recover. |
 | bind/hardening/ledger/fd refused | unchanged | unavailable | none | Proxy unavailable: <code> |
 
 **The headline is a pure function** of the status the daemon sends (`headline(state, controls, armed_profile, code)` in `types.rs`), so the CLI, the doctor and the GUI (which renders its own German sentences of 25.10 from the same inputs) cannot disagree. Draft 2 merged the last two rows into one headline that read "Proxy active ... (profile P)" also for a **disarmed** proxy, which on Windows before `C-WIN2` (the owner's platform, `best_effort`, no peer check) is the default start state. The test `headline_claims_activity_only_when_armed` runs every combination of state, `peer_check`, `exclusive_bind` and `private_audit_store` and asserts: the whole words "active" and "aktiv" (not "activated" or "aktiviert", which the disarmed headline uses), a profile id and the coverage sentence occur only when `state == armed`; a disarmed or unavailable state never says that the proxy is serving; every armed headline carries the coverage sentence; no headline contains the word "Protected". The corrected `Protected` doc comment in `ssk-ipc/src/state.rs` and the adapter health string ("connected at activation; liveness not monitored") were done by `C-S3`.
+
+**Wording corrected at `C-G1`.** Draft 2's two peer-check notes ended in "no peer check is active", which put the whole word "active" into a **disarmed** headline and made the test below fail on the design's own text. The notes now read "there is no peer check"; nothing else in the table changed (the disarmed headlines end in a full stop, as the implementation writes them).
 
 ### 10.3 Status assembly: the fresh-overlay rule
 
@@ -2282,7 +2284,7 @@ Windows runtime behaviour is UNVERIFIED; 15.12 is the register.
 |---|---|---|---|
 | default, `enabled: false` | `disabled`, no socket | Local proxy: off | nobody |
 | `enabled: true`, `hardening: required` (default) | `unavailable`, `INGRESS_HARDENING_UNAVAILABLE`, missing `[exclusive_bind, peer_check, private_audit_store]`, nothing bound | Proxy unavailable: INGRESS_HARDENING_UNAVAILABLE | nobody |
-| `enabled: true`, `hardening: best_effort` (first usable Windows config; exists from `C-WIN0`) | `disarmed` after start, `armed` on request; all three controls false; warnings `PEER_CHECK_INACTIVE`, `EXCLUSIVE_BIND_INACTIVE`, `AUDIT_STORE_NOT_PRIVATE`; every `Pending` and `Denied` record has `peer_verified: false` | disarmed (the default start state): Proxy ready, not activated: connections are refused. If activated, other local accounts could use it: no peer check is active. After an arm: Proxy active for applications that use it (profile P). Everything else is not covered. Other local accounts may also use it: no peer check is active. | 15.3 |
+| `enabled: true`, `hardening: best_effort` (first usable Windows config; exists from `C-WIN0`) | `disarmed` after start, `armed` on request; all three controls false; warnings `PEER_CHECK_INACTIVE`, `EXCLUSIVE_BIND_INACTIVE`, `AUDIT_STORE_NOT_PRIVATE`; every `Pending` and `Denied` record has `peer_verified: false` | disarmed (the default start state): Proxy ready, not activated: connections are refused. If activated, other local accounts could use it: there is no peer check. After an arm: Proxy active for applications that use it (profile P). Everything else is not covered. Other local accounts may also use it: there is no peer check. | 15.3 |
 | after `C-WIN1` only | `exclusive_bind: true`; `required` stays unavailable | | |
 | after all three verified | `required` usable; the pin test of 15.11 is edited in the same commit | warnings gone | other accounts refused (UNVERIFIED) |
 

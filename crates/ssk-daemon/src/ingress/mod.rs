@@ -24,6 +24,7 @@
 )]
 
 pub mod target;
+pub mod types;
 
 /// `Ipv6Addr::to_ipv4()` maps `::1` to 0.0.0.1 and `::` to 0.0.0.0, i.e. it
 /// turns an IPv6 address into a different IPv4 one. Only the strict
