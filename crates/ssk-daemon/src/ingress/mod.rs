@@ -24,6 +24,7 @@
 )]
 
 pub mod budget;
+pub mod guard;
 pub mod limits;
 pub mod path;
 pub mod peer;

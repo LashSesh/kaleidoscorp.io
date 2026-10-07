@@ -36,7 +36,7 @@ pub(crate) const RESOLVER_WAITERS: usize = 32;
 /// retry a refusal, so failing the 17th name at once would lose it for good.
 pub(crate) const RESOLVER_WAIT: Duration = Duration::from_millis(500);
 /// Bound on one `resolve_once`, counted from the call: the wait is inside it.
-pub(crate) const RESOLVE_TIMEOUT: Duration = Duration::from_secs(5);
+pub const RESOLVE_TIMEOUT: Duration = Duration::from_secs(5);
 /// Distinct answers kept from one lookup.
 pub(crate) const MAX_ANSWERS: usize = 32;
 
@@ -240,6 +240,11 @@ impl BoundedResolver {
     pub(crate) fn with_max_concurrent(mut self, lookups: usize) -> Self {
         self.permits = Arc::new(Semaphore::new(lookups.clamp(1, Semaphore::MAX_PERMITS)));
         self
+    }
+
+    /// How long one lookup may take, counted from the call.
+    pub(crate) fn timeout(&self) -> Duration {
+        self.timeout
     }
 
     /// Lookups whose caller stopped waiting while the OS call is still

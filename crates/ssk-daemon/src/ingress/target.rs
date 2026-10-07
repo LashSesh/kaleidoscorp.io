@@ -215,6 +215,15 @@ fn unmap(ip: Ipv6Addr) -> IpAddr {
     }
 }
 
+/// An address in its one spelling for comparison: the strict mapped IPv6 form
+/// becomes IPv4, everything else is unchanged.
+pub(crate) fn unmap_ip(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V6(v6) => unmap(v6),
+        IpAddr::V4(_) => ip,
+    }
+}
+
 fn literal(ip: IpAddr, port: u16, provenance: Provenance) -> Target {
     Target {
         host: ip.to_string(),

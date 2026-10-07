@@ -36,7 +36,9 @@ pub use dns::RecordType;
 pub use error::NetcoreError;
 pub use executor::{AdapterRegistry, RouteExecutor};
 pub use probe::{ProbeReport, ProbeStatus};
-pub use resolve::{is_resolvable_name, NameResolver, OsResolver, MAX_CONCURRENT_LOOKUPS};
+pub use resolve::{
+    is_resolvable_name, NameResolver, OsResolver, MAX_CONCURRENT_LOOKUPS, RESOLVE_TIMEOUT,
+};
 pub use session::{
     DialAttempts, DialResolution, EgressSession, ResolutionMode, SessionResolution, Transport,
 };

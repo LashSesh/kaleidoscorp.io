@@ -670,6 +670,30 @@ pub struct IngressCfgView {
     pub fingerprint: ConfigFingerprint,
 }
 
+#[cfg(test)]
+impl IngressCfgView {
+    /// The defaults of `AppConfig::default()`: enabled, `127.0.0.1:10800`,
+    /// `socks5`, `hardening: required`, `ipv4_only`, one profile `main`.
+    pub(crate) fn for_tests() -> Self {
+        let config = ssk_config::AppConfig::default();
+        let fingerprint = ssk_config::fingerprint::of(&config).expect("fingerprint");
+        Self {
+            enabled: true,
+            listen: SocketAddrV4::new(config.ingress.listen.address, config.ingress.listen.port),
+            protocols: config.ingress.protocols.clone(),
+            hardening: config.ingress.hardening,
+            arm_on_start: config.ingress.arm_on_start,
+            default_profile: Arc::from("main"),
+            profile_ids: vec![Arc::from("main")],
+            families: config.ingress.direct_address_families,
+            destination_logging: config.ingress.audit.destination_logging,
+            limits: config.ingress.limits.clone(),
+            audit: config.ingress.audit.clone(),
+            fingerprint,
+        }
+    }
+}
+
 /// Who connected, as the audit layer records it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PeerStamp {

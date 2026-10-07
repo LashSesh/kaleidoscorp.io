@@ -197,6 +197,25 @@ impl RouteExecutor {
         self.families
     }
 
+    /// The bound on one TCP connect (see [`Self::with_connect_timeout`]). Read
+    /// by the wiring test of the daemon, which asserts what it built.
+    #[must_use]
+    pub fn connect_timeout(&self) -> Duration {
+        self.connect_timeout
+    }
+
+    /// The bound on a whole dial (see [`Self::with_dial_deadline`]).
+    #[must_use]
+    pub fn dial_deadline(&self) -> Duration {
+        self.dial_deadline
+    }
+
+    /// The bound on one name lookup (see [`Self::with_resolve_timeout`]).
+    #[must_use]
+    pub fn resolve_timeout(&self) -> Duration {
+        self.resolver.timeout()
+    }
+
     /// What one dial needs, borrowed from this executor.
     fn dialer(&self) -> Dialer<'_> {
         Dialer {
