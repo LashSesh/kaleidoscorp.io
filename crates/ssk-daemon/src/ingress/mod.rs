@@ -25,6 +25,7 @@
 
 pub mod budget;
 pub mod limits;
+pub mod pump;
 pub mod socks5;
 pub mod target;
 pub mod types;

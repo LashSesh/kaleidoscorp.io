@@ -100,6 +100,9 @@ ssk-desktop-client = { path = "../ssk-desktop-client", version = "0.1.0" }
 tempfile.workspace = true
 serde_yaml.workspace = true
 proptest.workspace = true
+# Paused time for the pump and limiter tests: an idle timeout of 30 s is
+# asserted to the millisecond without waiting 30 s.
+tokio = { version = "1", features = ["test-util"] }
 # `tests/kill_switch_status.rs` drives a REAL `ssk_netd_helper::Broker` behind a
 # real `PrivilegedServer` over an in-memory `FrameTransport` pair. Building that
 # broker needs its actuation manifest and its `(principal, verb)` table.
