@@ -59,7 +59,7 @@ fn main() -> ExitCode {
         return print_lock_holder(&layout);
     }
 
-    if let Err(err) = std::fs::create_dir_all(layout.root()) {
+    if let Err(err) = ssk_daemon::paths::ensure_state_root(layout.root()) {
         eprintln!(
             "failed to create state directory {}: {err}",
             layout.root().display()

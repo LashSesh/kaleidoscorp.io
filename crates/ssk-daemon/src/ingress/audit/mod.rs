@@ -7,6 +7,11 @@
 // and the crates below it, and from nothing that is built on top of it
 // (`engine`, `flow`, `host`, `shared`): a test scans the sources.
 
+pub mod fs;
+#[cfg(unix)]
+pub mod fs_unix;
+#[cfg(windows)]
+pub mod fs_win;
 pub mod record;
 
 /// The ledger is built from `types`, `target`, `limits` and the crates below; it
