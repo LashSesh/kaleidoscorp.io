@@ -20,7 +20,7 @@ use ssk_daemon::paths::Layout;
 use ssk_daemon::shutdown::{Shutdown, ShutdownReason};
 use ssk_daemon::supervisor::Supervisor;
 use ssk_ipc::Endpoint;
-use ssk_netcore::{NetcoreDataPlane, RouteExecutor};
+use ssk_netcore::{DataPlane, NetcoreDataPlane, RouteExecutor};
 
 const BINARY: &str = "sskd";
 const BUILD: &str = env!("CARGO_PKG_VERSION");
@@ -255,15 +255,23 @@ async fn serve(layout: &Layout, endpoint: Endpoint, lock: &DaemonLock) -> ExitCo
         }
     }
 
-    let registry = config
-        .as_ref()
-        .map(|loaded| ssk_daemon::routing::ConfiguredRouting::new(&loaded.config.routing).adapters)
-        .unwrap_or_default();
-    let executor = Arc::new(RouteExecutor::new(registry));
-    let data_plane = Box::new(NetcoreDataPlane::new(executor));
+    // Compiled once. The executor's adapter registry comes from this very
+    // compilation and the supervisor plans with it, so the planner and the
+    // executor cannot disagree about what an adapter id means. A configuration
+    // that failed to load compiles to the empty default, which the supervisor
+    // never reads: it refuses activation first.
+    let routing = Arc::new(ssk_daemon::routing::ConfiguredRouting::new(
+        &config
+            .as_ref()
+            .map(|loaded| loaded.config.routing.clone())
+            .unwrap_or_default(),
+    ));
+    let executor = Arc::new(RouteExecutor::new(routing.adapters.clone()));
+    let data_plane: Arc<dyn DataPlane> = Arc::new(NetcoreDataPlane::new(executor));
     let (kill_switch, kill_switch_refresher) = build_kill_switch_view();
-    let supervisor = Arc::new(Supervisor::new(
+    let supervisor = Arc::new(Supervisor::from_parts(
         layout.audit_path(),
+        routing,
         data_plane,
         kill_switch,
         config,

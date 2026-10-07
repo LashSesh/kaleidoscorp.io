@@ -19,7 +19,7 @@ use tokio::sync::{Mutex, MutexGuard};
 
 use crate::config_load::DaemonConfigError;
 use crate::killswitch::{KillSwitchProvider, KillSwitchView};
-use crate::routing::ConfiguredRouting;
+use crate::routing::{ConfigState, ConfiguredRouting, Decided};
 use crate::state::StateMachine;
 
 type PersistedAuditLedger =
@@ -59,6 +59,19 @@ const ADAPTER_HEALTH_AT_ACTIVATION: &str = "connected at activation; liveness no
 /// `ssk_ipc::CommandHandler` to answer every IPC request.
 pub struct Supervisor {
     inner: Mutex<Inner>,
+    /// Fixed at construction and never written afterwards, so it needs no
+    /// lock: outside `Inner`, readable while an activation holds the mutex.
+    /// `Inner` keeps a second handle on the same allocation for the methods
+    /// that run where only the guard is at hand.
+    config: Arc<ConfigState>,
+    /// The planner, compiled once from that configuration and shared with
+    /// whoever else needs it (the executor's registry comes from the same
+    /// compilation). Outside `Inner` for the same reason as `config`.
+    routing: Arc<ConfiguredRouting>,
+    /// What an activation dials through. Outside `Inner` for the same reason as
+    /// `config`, and because it is read while the mutex is already held by the
+    /// dial it serves.
+    data_plane: Arc<dyn DataPlane>,
     /// Deliberately **outside** `Inner`: reading it must not require the
     /// supervisor's async mutex, and it holds no daemon state of its own — it
     /// is a window onto a different process's authoritative answer.
@@ -118,13 +131,20 @@ struct Inner {
     state: StateMachine,
     active_profile: Option<String>,
     audit: PersistedAuditLedger,
-    config: Result<ssk_config::LoadedConfig, IpcError>,
-    routing: ConfiguredRouting,
+    /// The allocation `Supervisor.config` points at, not a copy. Here because
+    /// `refuse_activation` and `status` are reached from `ActivationScope`'s
+    /// `Drop`, which holds the guard and nothing else.
+    config: Arc<ConfigState>,
     activation_error: Option<IpcError>,
-    data_plane: Box<dyn DataPlane>,
     /// The real, live egress session backing `Active`/`Protected` state.
     /// `None` whenever the daemon is not really holding an open connection —
     /// there is no state in which `Protected` is reported without one.
+    ///
+    /// A status read that cannot get `Inner` because an activation is in flight
+    /// is answered `Activating` without reading this field (`activating_status`).
+    /// An activation that holds `Inner` has cleared it (`clear_egress`) before it
+    /// dials; one still queued has not, so that answer can say less than is held,
+    /// never more (`ActivationsInFlight`).
     active_egress: Option<EgressSession>,
     /// Set from the real session's adapter chain at activation time; never
     /// hardcoded `true`.
@@ -356,6 +376,22 @@ fn activating_status(view: KillSwitchView) -> StatusDto {
     }
 }
 
+/// Startup validation, shared by both constructors. Even a caller that built a
+/// `LoadedConfig` by hand gets it validated, and a failure becomes the
+/// `CONFIG_INVALID` answer the daemon keeps serving diagnosis with.
+fn validated(config: Result<ssk_config::LoadedConfig, DaemonConfigError>) -> ConfigState {
+    config
+        .and_then(|loaded| {
+            loaded.config.validate()?;
+            Ok(loaded)
+        })
+        .map_err(|error| {
+            IpcError::new("Config", "CONFIG_INVALID", error.to_string()).with_next_step(
+                "Fix SSK_CONFIG_PATH and its configuration, then restart the daemon.",
+            )
+        })
+}
+
 impl Supervisor {
     /// `kill_switch` is the injected read-only view of the privileged broker
     /// (roadmap P3). It is a seam for the same reason `data_plane` is: the real
@@ -372,31 +408,66 @@ impl Supervisor {
         kill_switch: Box<dyn KillSwitchProvider>,
         config: Result<ssk_config::LoadedConfig, DaemonConfigError>,
     ) -> Self {
-        // Even callers constructing LoadedConfig directly must validate it.
-        let config = config
-            .and_then(|loaded| {
-                loaded.config.validate()?;
-                Ok(loaded)
-            })
-            .map_err(|error| {
-                IpcError::new("Config", "CONFIG_INVALID", error.to_string()).with_next_step(
-                    "Fix SSK_CONFIG_PATH and its configuration, then restart the daemon.",
-                )
-            });
-        let routing = ConfiguredRouting::new(
+        let config = validated(config);
+        let routing = Arc::new(ConfiguredRouting::new(
             &config
                 .as_ref()
                 .map(|loaded| loaded.config.routing.clone())
                 .unwrap_or_default(),
-        );
-        let mut state = StateMachine::default();
+        ));
+        Self::assemble(
+            audit_path,
+            routing,
+            Arc::from(data_plane),
+            kill_switch,
+            config,
+        )
+    }
+
+    /// Like [`Supervisor::new`], for a caller that compiled the planner itself
+    /// and keeps using it: `routing` is what activations and `TraceRoute` plan
+    /// with and what [`Supervisor::routing`] hands back, and `data_plane` is what
+    /// an activation dials through. The caller compiles `routing` from the same
+    /// validated configuration it passes as `config`; that is how the executor's
+    /// adapter registry and this planner come from one compilation and not two.
+    /// When `config` turns out invalid, `routing` is never consulted: every
+    /// handler that reads it answers the configuration error first.
+    #[must_use]
+    pub fn from_parts(
+        audit_path: PathBuf,
+        routing: Arc<ConfiguredRouting>,
+        data_plane: Arc<dyn DataPlane>,
+        kill_switch: Box<dyn KillSwitchProvider>,
+        config: Result<ssk_config::LoadedConfig, DaemonConfigError>,
+    ) -> Self {
+        Self::assemble(
+            audit_path,
+            routing,
+            data_plane,
+            kill_switch,
+            validated(config),
+        )
+    }
+
+    fn assemble(
+        audit_path: PathBuf,
+        routing: Arc<ConfiguredRouting>,
+        data_plane: Arc<dyn DataPlane>,
+        kill_switch: Box<dyn KillSwitchProvider>,
+        config: ConfigState,
+    ) -> Self {
         let activation_error = config.as_ref().err().cloned();
+        let config = Arc::new(config);
+        let mut state = StateMachine::default();
         if let Some(error) = &activation_error {
             state.transition(DaemonState::ConfigInvalid, &error.message);
         }
         // Taken before the state machine moves into the mutex.
         let events = state.event_sender();
         Self {
+            config: Arc::clone(&config),
+            routing,
+            data_plane,
             kill_switch,
             activation_deadline: ACTIVATE_DIAL_DEADLINE,
             activations: ActivationsInFlight::default(),
@@ -406,14 +477,27 @@ impl Supervisor {
                 active_profile: None,
                 audit: PersistedAuditLedger::persisted(audit_path),
                 config,
-                routing,
                 activation_error,
-                data_plane,
                 active_egress: None,
                 dns_protected: false,
                 pending_activation: None,
             }),
         }
+    }
+
+    /// The planner activations and `TraceRoute` decide with. Shared, not
+    /// copied: whoever holds this handle sees the one compilation of the
+    /// configuration, which is how the ingress will plan with exactly the
+    /// routing the supervisor holds.
+    #[must_use]
+    pub fn routing(&self) -> &Arc<ConfiguredRouting> {
+        &self.routing
+    }
+
+    /// The data plane an activation dials through. Not the ingress's own.
+    #[must_use]
+    pub fn data_plane(&self) -> &Arc<dyn DataPlane> {
+        &self.data_plane
     }
 
     /// Replace the activation dial deadline (default 20 s). Exists so tests can
@@ -688,7 +772,7 @@ impl CommandHandler for Supervisor {
                     // that too is finished before the marker goes.
                     let _in_flight = self.activations.enter();
                     let mut inner = ActivationScope(self.inner.lock().await);
-                    if let Err(error) = &inner.config {
+                    if let Err(error) = &*self.config {
                         let error = error.clone();
                         return inner.refuse_activation(error);
                     }
@@ -712,12 +796,12 @@ impl CommandHandler for Supervisor {
                     // No audit entry is appended for the rejection either, and
                     // that is a decision rather than an omission. The ledger
                     // attests to *enforcement actions*, it is append-only and
-                    // hash-chained, and until the peer-SID check lands any
-                    // local process can drive it: an attacker-controlled
-                    // unbounded append is a disk-exhaustion DoS against the one
-                    // artifact that must survive. The rejection is observable
-                    // as an event and a log line instead.
-                    let profiles = inner.routing.profiles();
+                    // hash-chained, and any process of the same user can drive
+                    // it: an attacker-controlled unbounded append is a
+                    // disk-exhaustion DoS against the one artifact that must
+                    // survive. The rejection is observable as an event and a
+                    // log line instead.
+                    let profiles = self.routing.profiles();
                     if let Err(rejection) = validate_profile_id(&req.profile_id, &profiles) {
                         let (code, message) = match rejection {
                             ProfileRejection::Malformed => (
@@ -798,11 +882,6 @@ impl CommandHandler for Supervisor {
                         ));
                     }
 
-                    let engine = inner
-                        .routing
-                        .engine(&req.profile_id)
-                        .expect("validated profile");
-                    let orchestrator = &inner.routing.orchestrator;
                     let flow = FlowRecord::new(
                         format!("activate:{}", req.profile_id),
                         0,
@@ -814,14 +893,11 @@ impl CommandHandler for Supervisor {
                             RiskLevel::Low,
                         ),
                     );
-                    let planned = engine.evaluate(&flow).and_then(|decision| {
-                        orchestrator
-                            .plan(&flow, &decision)
-                            .map(|candidate| (decision, candidate.route))
-                    });
-
-                    let (decision, route) = match planned {
-                        Ok(plan) => plan,
+                    let (decision, route) = match self.routing.decide(&req.profile_id, &flow) {
+                        Ok(Decided {
+                            decision,
+                            candidate,
+                        }) => (decision, candidate.route),
                         Err(err) => {
                             inner.active_profile = None;
                             inner.state.transition(
@@ -832,7 +908,7 @@ impl CommandHandler for Supervisor {
                         }
                     };
 
-                    let admission = match inner.routing.orchestrator.admit(&flow, &decision) {
+                    let admission = match self.routing.orchestrator.admit(&flow, &decision) {
                         Ok(admission) => admission,
                         Err(error) => {
                             if let Err(audit_error) =
@@ -858,7 +934,7 @@ impl CommandHandler for Supervisor {
                     let deadline = self.activation_deadline;
                     let connected = match tokio::time::timeout(
                         deadline,
-                        inner.data_plane.connect_route(admission),
+                        self.data_plane.connect_route(admission),
                     )
                     .await
                     {
@@ -931,7 +1007,7 @@ impl CommandHandler for Supervisor {
                     }
                     inner.active_profile = None;
                     inner.dns_protected = false;
-                    let state = if inner.config.is_err() {
+                    let state = if self.config.is_err() {
                         DaemonState::ConfigInvalid
                     } else {
                         DaemonState::Inactive
@@ -947,9 +1023,13 @@ impl CommandHandler for Supervisor {
                     Response::Status(inner.status(self.kill_switch.view()))
                 }
                 Request::ListProfiles => {
-                    let inner = self.inner.lock().await;
-                    match &inner.config {
-                        Ok(_) => Response::Profiles(inner.routing.profiles()),
+                    // Still queued behind `Inner` exactly as before the
+                    // configuration and the routing left it. Answering without
+                    // the wait changes what a caller can observe during an
+                    // activation dial, which this refactor does not do.
+                    let _queued = self.inner.lock().await;
+                    match &*self.config {
+                        Ok(_) => Response::Profiles(self.routing.profiles()),
                         Err(error) => Response::Err(error.clone()),
                     }
                 }
@@ -960,18 +1040,18 @@ impl CommandHandler for Supervisor {
                 )),
                 Request::TraceRoute(req) => {
                     let inner = self.inner.lock().await;
-                    if let Err(error) = &inner.config {
+                    if let Err(error) = &*self.config {
                         return Response::Err(error.clone());
                     }
+                    // The held session's profile, else the default. An
+                    // activation plans with the profile it was asked for and a
+                    // different flow, and goes on to admit and dial; what the two
+                    // share is `decide`, not their inputs, so a trace answers
+                    // for the inputs it was given and no more.
                     let profile = inner
                         .active_profile
-                        .as_ref()
-                        .unwrap_or(&inner.routing.default_profile);
-                    let engine = inner
-                        .routing
-                        .engine(profile)
-                        .expect("validated default/active profile");
-                    let orchestrator = &inner.routing.orchestrator;
+                        .as_deref()
+                        .unwrap_or(&self.routing.default_profile);
                     let flow = FlowRecord::new(
                         "trace",
                         0,
@@ -983,13 +1063,8 @@ impl CommandHandler for Supervisor {
                             parse_risk(&req.risk),
                         ),
                     );
-                    let result = engine.evaluate(&flow).and_then(|decision| {
-                        orchestrator
-                            .plan(&flow, &decision)
-                            .map(|candidate| (decision, candidate))
-                    });
-                    match result {
-                        Ok((_, candidate)) => {
+                    match self.routing.decide(profile, &flow) {
+                        Ok(Decided { candidate, .. }) => {
                             let hops = match &candidate.route {
                                 ssk_netadmin::RouteKind::SingleHop(h) => vec![h.adapter_id.clone()],
                                 ssk_netadmin::RouteKind::MultiHop(hops) => {
@@ -1050,9 +1125,10 @@ impl CommandHandler for Supervisor {
                     }
                 }
                 Request::RunDoctor => {
-                    let inner = self.inner.lock().await;
+                    // Still queued behind `Inner`; see `ListProfiles`.
+                    let _queued = self.inner.lock().await;
                     let mut checks = run_doctor_checks();
-                    let (ok, detail, next_step) = match &inner.config {
+                    let (ok, detail, next_step) = match &*self.config {
                         Ok(loaded) => (
                             true,
                             format!(
@@ -1073,7 +1149,7 @@ impl CommandHandler for Supervisor {
                         detail,
                         next_step,
                     });
-                    if let Ok(loaded) = &inner.config {
+                    if let Ok(loaded) = &*self.config {
                         for adapter in &loaded.config.routing.adapters {
                             if matches!(
                                 adapter.transport,
@@ -1837,10 +1913,7 @@ mod tests {
             Response::Profiles(p) => {
                 let ids: Vec<_> = p.iter().map(|x| x.id.clone()).collect();
                 let known: Vec<_> = sup
-                    .inner
-                    .lock()
-                    .await
-                    .routing
+                    .routing()
                     .profiles()
                     .iter()
                     .map(|x| x.id.clone())
@@ -1848,6 +1921,157 @@ mod tests {
                 assert_eq!(ids, known);
             }
             other => panic!("unexpected response: {other:?}"),
+        }
+    }
+
+    /// The whole point of `from_parts`: the planner the caller compiled once is
+    /// the planner the supervisor uses, and the data plane it was given is the
+    /// one an activation dials through. Neither is rebuilt or copied.
+    #[tokio::test]
+    async fn from_parts_shares_the_routing_and_data_plane_it_is_given() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = loopback_config();
+        let routing = Arc::new(ConfiguredRouting::new(&config.config.routing));
+        let data_plane: Arc<dyn DataPlane> = Arc::from(real_data_plane());
+        let sup = Supervisor::from_parts(
+            dir.path().join("audit.json"),
+            Arc::clone(&routing),
+            Arc::clone(&data_plane),
+            Box::new(crate::killswitch::NoProvider),
+            Ok(config),
+        );
+        assert!(Arc::ptr_eq(sup.routing(), &routing));
+        assert!(Arc::ptr_eq(sup.data_plane(), &data_plane));
+    }
+
+    /// A routing that does not match the supervisor's own configuration is not
+    /// something a caller should build, but it is the one way to make the
+    /// planner fail with a validated config, and it shows which routing an
+    /// activation really consults: the supervisor's own would plan `Direct` for
+    /// this destination and connect.
+    fn redirecting_loopback_to(adapter: &str, registered: bool) -> Arc<ConfiguredRouting> {
+        use ssk_config::routing::{AdapterTransport, RoutingAction, RoutingAdapter};
+        let mut routing = loopback_config().config.routing;
+        routing.profiles[0].rules[0].action = RoutingAction::Adapter {
+            adapter_id: adapter.into(),
+        };
+        if registered {
+            routing.adapters.push(RoutingAdapter {
+                id: adapter.into(),
+                transport: AdapterTransport::Socks5 {
+                    host: "127.0.0.1".into(),
+                    port: 9,
+                },
+            });
+        }
+        Arc::new(ConfiguredRouting::new(&routing))
+    }
+
+    fn supervisor_over(routing: Arc<ConfiguredRouting>) -> (Supervisor, tempfile::TempDir) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sup = Supervisor::from_parts(
+            dir.path().join("audit.json"),
+            routing,
+            Arc::from(real_data_plane()),
+            Box::new(crate::killswitch::NoProvider),
+            Ok(loopback_config()),
+        );
+        (sup, dir)
+    }
+
+    #[tokio::test]
+    async fn an_activation_that_cannot_be_planned_fails_closed_before_it_records_or_dials() {
+        let (sup, _dir) = supervisor_over(redirecting_loopback_to("absent", false));
+        let mut events = sup.subscribe_events().await;
+        let (listener, host, port) = reachable_dest().await;
+        let resp = call(
+            &sup,
+            Request::ActivateProfile(ssk_ipc::ActivateProfileRequest {
+                profile_id: "default".into(),
+                dest_host: Some(host),
+                dest_port: Some(port),
+            }),
+        )
+        .await;
+        match resp {
+            Response::Err(err) => assert_eq!(err.code, "UNKNOWN_ADAPTER"),
+            other => panic!("an unplannable route must be refused, got: {other:?}"),
+        }
+        assert_eq!(sup.current_state().await, DaemonState::FailClosed);
+        assert_eq!(
+            audit_entry_count(&sup).await,
+            0,
+            "planning fails before any intent is written"
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), listener.accept())
+                .await
+                .is_err(),
+            "nothing may be dialled for a route that could not be planned"
+        );
+        let mut reason = None;
+        while let Ok(event) = events.try_recv() {
+            if let ssk_ipc::Event::StateChanged {
+                to: DaemonState::FailClosed,
+                reason: why,
+                ..
+            } = event
+            {
+                reason = Some(why);
+            }
+        }
+        assert_eq!(
+            reason.as_deref(),
+            Some("route planning failed: control plane: unknown adapter `absent`")
+        );
+    }
+
+    #[tokio::test]
+    async fn trace_route_plans_with_the_routing_the_supervisor_was_given() {
+        let (sup, _dir) = supervisor_over(redirecting_loopback_to("given-exit", true));
+        let resp = call(
+            &sup,
+            Request::TraceRoute(ssk_ipc::RouteTraceRequest {
+                app_id: None,
+                dest_host: "127.0.0.1".into(),
+                dest_port: 443,
+                protocol: "tcp".into(),
+                risk: "low".into(),
+            }),
+        )
+        .await;
+        match resp {
+            Response::RouteTrace(trace) => {
+                assert_eq!(trace.hops, ["given-exit"]);
+                assert!(matches!(trace.route, RouteKind::SingleHop(_)));
+            }
+            other => panic!("unexpected response: {other:?}"),
+        }
+    }
+
+    /// `TraceRoute` takes its profile from `active_profile`, which the
+    /// activation arm only ever sets to a validated id, so a profile the
+    /// registry does not know is not reachable through the wire. Should it ever
+    /// be reached anyway, the answer is an error, never a panic in a handler
+    /// that holds the supervisor lock.
+    #[tokio::test]
+    async fn trace_route_with_an_unconfigured_active_profile_is_an_error_not_a_panic() {
+        let (sup, _dir) = supervisor_with(real_data_plane());
+        sup.inner.lock().await.active_profile = Some("ghost".into());
+        let resp = call(
+            &sup,
+            Request::TraceRoute(ssk_ipc::RouteTraceRequest {
+                app_id: None,
+                dest_host: "127.0.0.1".into(),
+                dest_port: 443,
+                protocol: "tcp".into(),
+                risk: "low".into(),
+            }),
+        )
+        .await;
+        match resp {
+            Response::Err(err) => assert_eq!(err.code, "UNKNOWN_PROFILE"),
+            other => panic!("an unknown profile must be an error, got: {other:?}"),
         }
     }
 
