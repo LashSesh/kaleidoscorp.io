@@ -1539,6 +1539,91 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn the_guard_sees_the_normalised_answers_not_the_mapped_ones() {
+        // A guard matches on IPv4 addresses. An answer `::ffff:127.0.0.1` that
+        // reached it unmapped would be a different IpAddr, pass, and be dialled
+        // as the IPv4 loopback address after all: normalising (design step 4)
+        // has to come before the guard (step 5). The duplicate proves the guard
+        // is asked once per distinct address and the counts are the normalised
+        // ones.
+        let public = v4(7);
+        let mapped_loopback = addr("[::ffff:127.0.0.1]:443");
+        let loopback = addr("127.0.0.1:443");
+        let guard = Arc::new(RecordingGuard::default().refusing("127.0.0.1", "loopback"));
+        let connector = Arc::new(ScriptedConnector::new(Script::NOW));
+        let mut rig = Rig::new(
+            answering(&[public, mapped_loopback, mapped_loopback]),
+            connector.clone(),
+        );
+        rig.guard = Some(guard.clone());
+
+        let err = rig
+            .dial("svc.test", 443)
+            .await
+            .err()
+            .expect("the mapped loopback answer is the IPv4 loopback address");
+        assert!(
+            matches!(
+                err,
+                NetcoreError::AddressRefused {
+                    code: "loopback",
+                    refused: 1,
+                    answers: 2
+                }
+            ),
+            "{err:?}"
+        );
+        assert_eq!(connector.started(), [], "a socket was opened");
+        assert_eq!(
+            guard.asked(),
+            [
+                (DialPurpose::Target, public.ip(), 443),
+                (DialPurpose::Target, loopback.ip(), 443),
+            ],
+            "the guard was asked about the IPv4 form, once, never the mapped one"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn every_answer_is_guarded_not_only_the_candidates_that_would_be_dialled() {
+        // Twenty answers survive normalisation (the cap is 32) but a dial only
+        // ever walks eight. The twentieth is one that no attempt would reach,
+        // and it still refuses the whole answer: a guard pass that stopped at
+        // the candidate limit would let a mixed answer through.
+        let answers: Vec<SocketAddr> = (1..=20).map(v4).collect();
+        let guard = Arc::new(RecordingGuard::default().refusing("192.0.2.20", "private"));
+        let connector = Arc::new(ScriptedConnector::new(Script::NOW));
+        let mut rig = Rig::new(answering(&answers), connector.clone());
+        rig.guard = Some(guard.clone());
+
+        let err = rig
+            .dial("svc.test", 443)
+            .await
+            .err()
+            .expect("the twentieth answer is refused");
+        assert!(
+            matches!(
+                err,
+                NetcoreError::AddressRefused {
+                    code: "private",
+                    refused: 1,
+                    answers: 20
+                }
+            ),
+            "{err:?}"
+        );
+        assert_eq!(connector.started(), [], "a socket was opened");
+        assert_eq!(
+            guard.asked(),
+            answers
+                .iter()
+                .map(|answer| (DialPurpose::Target, answer.ip(), 443))
+                .collect::<Vec<_>>(),
+            "the guard saw every answer, in answer order"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn guard_runs_before_the_family_filter() {
         // Without the order, the filter would drop the IPv6 loopback answer
         // silently and the IPv4 one would be dialled: the mixed answer that
