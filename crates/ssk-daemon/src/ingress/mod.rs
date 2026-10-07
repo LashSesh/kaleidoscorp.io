@@ -25,6 +25,7 @@
 
 pub mod budget;
 pub mod limits;
+pub mod path;
 pub mod peer;
 pub mod pump;
 pub mod socks5;
@@ -116,5 +117,112 @@ mod source_scan {
         }
         // A needle at the very end of the text, with nothing after it, offends.
         assert!(offends(LOSSY));
+    }
+}
+
+/// Design 10.6, item 3: Kaleidoscorp never classifies an interface by name,
+/// type, vendor or driver. A string literal of `path.rs` (and, once it exists,
+/// of the snapshot builder) must not contain the words that would be the
+/// beginning of such a guess.
+#[cfg(test)]
+mod vocabulary_scan {
+    use std::path::Path;
+
+    /// The quoted words of 10.6, matched case-insensitively inside literals.
+    const GUESSES: [&str; 7] = [
+        "vpn",
+        "nord",
+        "tun",
+        "tap",
+        "wintun",
+        "wireguard",
+        "openvpn",
+    ];
+
+    /// The contents of every string literal in `source`, comments skipped. Handles
+    /// escapes; does not handle raw strings or `'"'` (neither occurs in the files
+    /// it is pointed at, and `finds_every_literal` pins the cases it does handle).
+    fn string_literals(source: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut chars = source.chars().peekable();
+        while let Some(c) = chars.next() {
+            match c {
+                '/' if chars.peek() == Some(&'/') => {
+                    for skipped in chars.by_ref() {
+                        if skipped == '\n' {
+                            break;
+                        }
+                    }
+                }
+                '"' => {
+                    let mut literal = String::new();
+                    while let Some(inner) = chars.next() {
+                        match inner {
+                            '\\' => {
+                                literal.push(inner);
+                                if let Some(escaped) = chars.next() {
+                                    literal.push(escaped);
+                                }
+                            }
+                            '"' => break,
+                            other => literal.push(other),
+                        }
+                    }
+                    out.push(literal);
+                }
+                _ => {}
+            }
+        }
+        out
+    }
+
+    fn offenders(source: &str) -> Vec<(String, &'static str)> {
+        string_literals(source)
+            .into_iter()
+            .flat_map(|literal| {
+                let lowered = literal.to_lowercase();
+                GUESSES
+                    .iter()
+                    .filter(move |word| lowered.contains(**word))
+                    .map(move |word| (literal.clone(), *word))
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn path_rs_contains_no_guess_about_what_an_interface_is() {
+        let file = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/ingress/path.rs");
+        let source = std::fs::read_to_string(&file).expect("read path.rs");
+        assert!(
+            string_literals(&source).len() > 20,
+            "the scan must see the literals of path.rs"
+        );
+        assert_eq!(offenders(&source), Vec::<(String, &str)>::new());
+    }
+
+    #[test]
+    fn finds_every_literal_and_skips_comments() {
+        let source =
+            "let a = \"first\"; // a \"comment\" here\nlet b = \"se\\\"cond\"; let c = \"\";";
+        assert_eq!(string_literals(source), vec!["first", "se\\\"cond", ""]);
+        // A `//` inside a literal is part of it.
+        assert_eq!(
+            string_literals("let u = \"a//b\"; let v = \"c\";"),
+            vec!["a//b", "c"]
+        );
+    }
+
+    #[test]
+    fn the_scan_would_notice_each_word() {
+        for word in GUESSES {
+            for text in [word.to_owned(), word.to_uppercase(), format!("x {word}y")] {
+                let source = format!("let s = \"{text}\";");
+                // "wintun" and "openvpn" contain a shorter word as well.
+                assert!(!offenders(&source).is_empty(), "{text}");
+            }
+        }
+        // Words in a comment or in code are not literals.
+        assert!(offenders("// vpn\nlet vpn = 1;").is_empty());
     }
 }
