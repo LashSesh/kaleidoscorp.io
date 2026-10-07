@@ -330,7 +330,9 @@ async fn serve(layout: &Layout, endpoint: Endpoint, lock: &DaemonLock) -> (ExitC
     // and P3 is done: `select!` dropped the accept loop, so no new connection is
     // served. Connection tasks that are already running go on until `run` stops
     // the runtime (P4); one that is mid-dial is then settled by
-    // `ActivationScope`, with the lock still held.
+    // `ActivationScope`, with the lock still held, if that fits the P4 bound:
+    // a settlement still writing when it ends is cut off by the process exit
+    // (`ShutdownPlan::runtime_stop`).
 
     if let Endpoint::UnixSocket(path) = &endpoint {
         // A Windows named pipe is a refcounted kernel object and vanishes with

@@ -107,6 +107,8 @@ impl std::fmt::Display for ShutdownReason {
 /// * P3 stops the IPC accept loop, which `serve`'s `select!` already did by the
 ///   time the plan is chosen;
 /// * P4 ([`runtime_stop`](Self::runtime_stop)) drops every task still alive.
+///   Its bound covers everything the stop does, what a task does while it is
+///   dropped included, see the field.
 ///
 /// P0 to P2 belong to the ingress host, which does not exist yet: the daemon
 /// executes P3 and P4 only, and `total` is therefore an upper bound for it, not
@@ -135,17 +137,41 @@ impl std::fmt::Display for ShutdownReason {
 /// send SIGTERM wait longer by default (`docker stop` 10 s, systemd
 /// `TimeoutStopSec` 90 s; upstream defaults, not checked here). The log flush at
 /// the end of `main` runs after the plan and is in neither total.
+///
+/// What P4's share has to be big enough for is the one thing the daemon does
+/// with it today: the terminal `FailClosed` ledger record of an activation that
+/// was mid-dial. That write verifies the whole ledger, then rewrites it through
+/// a temp file, `fsync` and rename, so its time grows with the ledger and with a
+/// slow or busy disk. It was timed only on a fast local disk with a ledger of
+/// one entry before it (under 10 ms from SIGTERM to exit,
+/// `tests/daemon_shutdown.rs`); against 1000 ms that is a wide margin, against
+/// the 200 ms of the OS-deadline plan it is an assumption that nothing here has
+/// measured on a large ledger, a slow disk or Windows. An accepted risk, not a
+/// solved one: see [`runtime_stop`](Self::runtime_stop) for what a write that
+/// does not fit leaves behind.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ShutdownPlan {
     /// P1: flows end by themselves, then `abort_all`.
     pub flows: Duration,
     /// P2: the audit queue drains, a last sync, the writer thread is joined.
     pub audit: Duration,
-    /// P4: `Runtime::shutdown_timeout`. Tasks are dropped first, and what a
-    /// task does while it is dropped (an abandoned activation writes its ledger
-    /// record) is not part of the bound; work on the blocking pool (name
-    /// resolution, a ledger open) is then waited for this long and abandoned,
-    /// still running.
+    /// P4: `Runtime::shutdown_timeout`, which waits for the runtime's blocking
+    /// pool for at most this long. That one bound covers everything the stop
+    /// does, drop-time work included: the multi-thread scheduler drops its tasks
+    /// on its worker threads, and those are threads of the blocking pool
+    /// (`tokio` 1.53.1, `runtime/scheduler/multi_thread/worker.rs`), so what
+    /// a task does while it is dropped (an abandoned activation writing its
+    /// terminal `FailClosed` ledger record) is waited for no longer than blocking
+    /// work (name resolution, a ledger open) is.
+    ///
+    /// What is still running when the bound ends is not stopped. `run` returns,
+    /// the process exits and ends it where it stands. For a ledger write that
+    /// leaves the file as it was, whole (the new entry list goes to a temp file,
+    /// is synced and renamed over it), without the record: the activation's
+    /// `DispatchPending` then has no terminal record, the state the settlement
+    /// exists to prevent. The lock is held through all of this
+    /// ([`DaemonLock::hold_until_exit`]), so no second daemon appends in between;
+    /// it does not make the record appear.
     pub runtime_stop: Duration,
 }
 
@@ -191,11 +217,16 @@ impl ShutdownPlan {
     /// dropped mid-dial still writes: `ActivationScope` gives an abandoned
     /// activation its terminal ledger record while it is dropped. Releasing the
     /// lock first let a second daemon start, and extend the same hash chain,
-    /// while the old runtime was still writing to it. Work on the blocking pool
-    /// that outlives the bound is leaked, not stopped (`Runtime::drop` would wait
-    /// for it without end, which is why `shutdown_timeout` is used), so the lock
-    /// is not released by dropping it after this call either: see
-    /// [`DaemonLock::hold_until_exit`].
+    /// while the old runtime was still writing to it. Work that outlives the
+    /// bound, blocking work or a task's drop-time write alike, is leaked, not
+    /// stopped (`Runtime::drop` would wait for it without end, which is why
+    /// `shutdown_timeout` is used), so the lock is not released by dropping it
+    /// after this call either: see [`DaemonLock::hold_until_exit`].
+    ///
+    /// The bound is also the limit of the guarantee. A drop-time write that
+    /// finishes within it is on disk when this returns; one that does not is cut
+    /// off by the process exit that follows, and its record is lost (see
+    /// [`runtime_stop`](Self::runtime_stop)).
     pub fn stop_runtime_then_hold_lock(self, runtime: tokio::runtime::Runtime, lock: DaemonLock) {
         runtime.shutdown_timeout(self.runtime_stop);
         lock.hold_until_exit();
@@ -624,6 +655,145 @@ mod tests {
             matches!(err.code(), "DAEMON_ALREADY_RUNNING" | "LOCK_CONTENDED"),
             "{err}"
         );
+    }
+
+    /// A task whose drop takes `work`, standing for what `ActivationScope` does
+    /// when the runtime drops an abandoned activation: verify the ledger, rewrite
+    /// it to a temp file, fsync, rename. `done` is set when that work has ended,
+    /// and the channel wakes whoever waits for it.
+    struct SlowDrop {
+        work: Duration,
+        done: Arc<std::sync::atomic::AtomicBool>,
+        finished: std::sync::mpsc::Sender<()>,
+    }
+
+    impl Drop for SlowDrop {
+        fn drop(&mut self) {
+            std::thread::sleep(self.work);
+            self.done.store(true, std::sync::atomic::Ordering::SeqCst);
+            let _ = self.finished.send(());
+        }
+    }
+
+    /// What `stop_a_runtime_whose_task_drops_slowly` saw.
+    struct SlowDropStop {
+        elapsed: Duration,
+        /// Whether the task's drop had ended by the time the stop returned.
+        done_at_return: bool,
+        /// Whether a second acquisition of the daemon lock was refused afterwards.
+        lock_refused: bool,
+        /// The drop's own end, which the stop does not wait for past its bound.
+        finished: std::sync::mpsc::Receiver<()>,
+    }
+
+    /// Stop a runtime under `plan`, as `run` does, while its one task takes
+    /// `work` to drop. The drop runs on a worker thread, which is a thread of the
+    /// runtime's blocking pool, and that pool is what `shutdown_timeout` waits on.
+    fn stop_a_runtime_whose_task_drops_slowly(plan: ShutdownPlan, work: Duration) -> SlowDropStop {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("sskd.lock");
+        let info = lock_info(dir.path());
+        let lock = crate::lock::acquire(&path, &info, Duration::ZERO).expect("acquire");
+
+        let runtime = multi_thread_runtime();
+        let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (finished_tx, finished) = std::sync::mpsc::channel::<()>();
+        let slow = SlowDrop {
+            work,
+            done: Arc::clone(&done),
+            finished: finished_tx,
+        };
+        // Parked for ever, like an activation whose dial is silent: only the
+        // runtime dropping it ends it.
+        runtime.spawn(async move {
+            let _slow = slow;
+            std::future::pending::<()>().await;
+        });
+
+        let stopper = std::thread::spawn(move || {
+            let began = std::time::Instant::now();
+            plan.stop_runtime_then_hold_lock(runtime, lock);
+            let elapsed = began.elapsed();
+            // Read in the thread that stopped, at once: a later read would see a
+            // drop that ended in the meantime.
+            (elapsed, done.load(std::sync::atomic::Ordering::SeqCst))
+        });
+        let (elapsed, done_at_return) = stopper.join().expect("stopper thread");
+
+        let lock_refused = matches!(
+            crate::lock::acquire(&path, &lock_info(dir.path()), Duration::ZERO),
+            Err(err) if matches!(err.code(), "DAEMON_ALREADY_RUNNING" | "LOCK_CONTENDED")
+        );
+        SlowDropStop {
+            elapsed,
+            done_at_return,
+            lock_refused,
+            finished,
+        }
+    }
+
+    #[test]
+    fn a_task_whose_drop_fits_the_stop_bound_has_finished_when_the_stop_returns() {
+        // The case the compatibility paragraph relies on: the abandoned
+        // activation's ledger record is on disk before the stop returns, so
+        // before the process ends.
+        let bound = Duration::from_secs(5);
+        let plan = ShutdownPlan {
+            runtime_stop: bound,
+            ..ShutdownPlan::GRACEFUL
+        };
+        let stop = stop_a_runtime_whose_task_drops_slowly(plan, Duration::from_millis(50));
+        assert!(
+            stop.done_at_return,
+            "the stop returned before a drop that fits its bound had finished"
+        );
+        // A generous bound is a ceiling, not a delay: the stop ends when the
+        // runtime has.
+        assert!(
+            stop.elapsed < bound,
+            "the stop waited out its bound ({:?}) with nothing left to wait for",
+            stop.elapsed
+        );
+        assert!(
+            stop.lock_refused,
+            "the daemon lock was released by the stop"
+        );
+    }
+
+    #[test]
+    fn a_task_whose_drop_outlasts_the_stop_bound_is_still_running_when_the_stop_returns() {
+        // Pins the outcome the documentation states, not one anybody wants: the
+        // drop-time work of a task is inside the bound, and what is not finished
+        // when the bound ends is cut off by the process ending, with nothing
+        // stopping it before. The ledger record an abandoned activation writes
+        // while dropped is lost that way, which is why the bound is a figure to
+        // size against the slowest ledger write and not only against blocking
+        // work.
+        let work = Duration::from_millis(1500);
+        let plan = ShutdownPlan {
+            runtime_stop: Duration::from_millis(300),
+            ..ShutdownPlan::GRACEFUL
+        };
+        let stop = stop_a_runtime_whose_task_drops_slowly(plan, work);
+        assert!(
+            !stop.done_at_return,
+            "the stop waited for a drop that outlasts its bound"
+        );
+        assert!(
+            stop.elapsed < work,
+            "the stop took {:?}, as long as the drop it was to cut off",
+            stop.elapsed
+        );
+        // The lock outlives the bound and the work it cannot stop.
+        assert!(
+            stop.lock_refused,
+            "the daemon lock was released while a task's drop could still write"
+        );
+        // Cut off is not stopped: only the process ending ends it, so the work
+        // goes on past the stop and the test has to wait for it to end its thread.
+        stop.finished
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the slow drop never ended");
     }
 
     #[tokio::test]

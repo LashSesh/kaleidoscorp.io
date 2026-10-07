@@ -269,21 +269,35 @@ lock as soon as its serve loop returned and only then dropped its async runtime,
 second `sskd` could take the lock, and extend the same audit ledger, while the first
 was still dropping tasks. One of those tasks writes: an `ActivateProfile` that is
 mid-dial when the daemon stops gets its terminal `FailClosed` ledger record when the
-runtime drops it. That record is now on disk before the lock can be taken (measured on
-Linux: SIGTERM during a dial to a silent proxy; the successor that took the lock first
-saw only `DispatchPending` before, in 12 of 12 runs).
+runtime drops it. That record is now written before the lock can be taken, when the
+write finishes within the runtime stop bound described below (measured on Linux:
+SIGTERM during a dial to a silent proxy; the successor that took the lock first saw
+only `DispatchPending` before, in 12 of 12 runs).
 
 What an operator or a service manager can see: a new `sskd` started right after the
 old one was signalled, without `--lock-wait`, is refused with `DAEMON_ALREADY_RUNNING`
-until the old process has exited (7 ms measured); `--lock-wait <ms>` covers that, as it
-always did. The old process no longer waits for its runtime's blocking work without a
-bound: the runtime is stopped with `Runtime::shutdown_timeout`, which waits at most 1 s
+until the old process has exited (under 10 ms measured); `--lock-wait <ms>` covers that,
+as it always did. The old process no longer waits for its runtime's blocking work without
+a bound: the runtime is stopped with `Runtime::shutdown_timeout`, which waits at most 1 s
 after Ctrl-C, Ctrl-Break, SIGTERM, a service stop or an end of the IPC server, and at
 most 200 ms after console close, logoff, system shutdown or service pre-shutdown;
-blocking work (name resolution) still running by then is abandoned with the process. The `sskd stopping` log line carries `runtime_stop_ms` in
-place of `drain_budget_ms` (a fixed 2000, the ceiling on a `yield_now` that returns at
-once). The Windows reasons and times are UNVERIFIED: nothing here has run on Windows.
-No wire, configuration or ledger format and no exit code changed.
+blocking work (name resolution) still running by then is abandoned with the process. The
+`sskd stopping` log line carries `runtime_stop_ms` in place of `drain_budget_ms` (a fixed
+2000, the ceiling on a `yield_now` that returns at once).
+
+That bound also covers the `FailClosed` write above: the runtime drops its tasks on
+threads the bound waits for, so a write that takes longer than the bound is cut off
+where it stands when the process exits. The ledger file stays whole (it is rewritten
+through a temp file and a rename) but lacks the record, so the activation's
+`DispatchPending` has no result, as after a crash. The write verifies and rewrites the
+whole ledger, so its time grows with the ledger and with a slow or busy disk. On a fast
+local disk with a one-entry ledger the whole stop took under 10 ms; nothing has measured
+it against the 200 ms on a large ledger, a slow disk or Windows, and that is an accepted
+risk, not a verified margin. The lock is held in that case too, so no second daemon
+appends in between.
+
+The Windows reasons and times are UNVERIFIED: nothing here has run on Windows. No wire,
+configuration or ledger format and no exit code changed.
 
 ## Host grammar in routing configuration (2026-10-06)
 
