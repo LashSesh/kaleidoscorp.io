@@ -130,6 +130,43 @@ fingerprint is decided; a new key in any other section changes no digest. `of`
 returns a `Result` (`FingerprintError`): serialising a view cannot fail today, and a
 fingerprint must not fall back to an invented value if it ever does.
 
+## Local proxy flow ledger, record format (2026-10-07)
+
+`ssk-daemon`'s local proxy (`ingress`) will keep its own append-only ledger, separate from
+the activation ledger above, which it never touches. This build defines the **record format**
+(`ingress/audit/record.rs`, `ledger_format` 1) and nothing writes it yet: no file is created,
+and no wire message carries it. It is recorded here because the files, once written, are a
+persisted format that an auditor and a later build must keep reading.
+
+One record per line: `<64 lowercase hex> <body>` and a line feed (0x0A). The body is compact
+JSON (`serde_json`, which never emits a raw line feed, so no string can carry a second record
+into a line), at most 64 KiB; a reader accepts a line of at most 65 + 64 KiB and treats a longer
+one as corrupt. The hash is `blake3(previous_hash_hex ++ body_bytes)` over the stored bytes, the
+first record of a chain following the literal `genesis`. The body has `seq` (authoritative),
+`ts_ms` (an untrusted wall clock), `flow_id` (absent for records that belong to no flow) and an
+`event` tag, one of `started`, `recovered`, `armed`, `disarmed`, `tripped`, `denied`,
+`pending`, `result`, `closed`, `summary`, `continue`, each with the fields of
+`FlowAuditEvent`. `started` carries `ledger_format`, the configuration fingerprint above, the
+destination-logging mode and the number of flows left unresolved by earlier runs. A destination
+is `{mode: plain, host, port}` or `{mode: hashed, kid, kind, token, port}`; a `denied` record is
+always plain.
+
+Only validated values are written: every string is printable ASCII of at most 512 characters, a
+plain host is in the canonical alphabet, a resolved address is in its one spelling (never the
+IPv4-mapped IPv6 form), and a record whose body would exceed the limit is refused, not cut. The
+ledger says what Kaleidoscorp decided and did and never asserts a property of the network path;
+it proves a PREFIX of history: removing the newest records, or truncating at a record boundary,
+verifies, and the status will publish `(entries, head)` for an out-of-band checkpoint.
+
+This is a **one-way** format. A `started` record whose `ledger_format` is greater than the
+build's own makes the build refuse to read the ledger and append nothing; do not downgrade a
+daemon against a ledger written by a newer one. A format version 0 is invalid. A change of any
+field name, order, spelling or hash input, a new `event` kind or a new validation that refuses a
+value written before, needs a new `ledger_format` and an entry here. `record.rs` pins the
+persisted shape of a `started` line (field names, order and hash) and the largest record to the
+byte; the segments, rotation, retention and the destination token function are specified in
+`docs/M2_LOCAL_INGRESS_DESIGN.md` 6.4 and get their own paragraphs when they are written.
+
 ## Route executor: no fallback route, bounded dial (2026-10-06)
 
 `RouteExecutor::connect` and `probe` refuse `RouteKind::Fallback` with

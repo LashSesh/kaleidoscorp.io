@@ -47,6 +47,10 @@ ssk-netd-helper = { path = "../ssk-netd-helper", version = "0.1.0" }
 ssk-diag = { path = "../ssk-diag", version = "0.1.0" }
 serde.workspace = true
 serde_json.workspace = true
+# The hash chain of the ingress flow ledger (`ingress/audit/record.rs`): the same
+# crate and major `ssk-types` and `ssk-netadmin` already use for the activation
+# ledger, so the workspace gains no hashing dependency.
+blake3.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 tokio = { version = "1", features = [
