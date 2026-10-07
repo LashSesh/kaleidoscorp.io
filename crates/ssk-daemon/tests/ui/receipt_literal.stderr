@@ -1,0 +1,9 @@
+error[E0451]: fields `seq` and `entry_hash` of struct `Receipt` are private
+ --> tests/ui/receipt_literal.rs:7:9
+  |
+6 |     let _ = Receipt {
+  |             ------- in this type
+7 |         seq: 1,
+  |         ^^^ private field
+8 |         entry_hash: String::new(),
+  |         ^^^^^^^^^^ private field

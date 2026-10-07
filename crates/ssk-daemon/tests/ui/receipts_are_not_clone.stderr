@@ -1,0 +1,35 @@
+error[E0277]: the trait bound `PendingReceipt: Clone` is not satisfied
+ --> tests/ui/receipts_are_not_clone.rs:8:19
+  |
+8 |     needs_clone::<PendingReceipt>();
+  |                   ^^^^^^^^^^^^^^ the trait `Clone` is not implemented for `PendingReceipt`
+  |
+note: required by a bound in `needs_clone`
+ --> tests/ui/receipts_are_not_clone.rs:5:19
+  |
+5 | fn needs_clone<T: Clone>() {}
+  |                   ^^^^^ required by this bound in `needs_clone`
+
+error[E0277]: the trait bound `ResultReceipt: Clone` is not satisfied
+ --> tests/ui/receipts_are_not_clone.rs:9:19
+  |
+9 |     needs_clone::<ResultReceipt>();
+  |                   ^^^^^^^^^^^^^ the trait `Clone` is not implemented for `ResultReceipt`
+  |
+note: required by a bound in `needs_clone`
+ --> tests/ui/receipts_are_not_clone.rs:5:19
+  |
+5 | fn needs_clone<T: Clone>() {}
+  |                   ^^^^^ required by this bound in `needs_clone`
+
+error[E0277]: the trait bound `ArmReceipt: Clone` is not satisfied
+  --> tests/ui/receipts_are_not_clone.rs:10:19
+   |
+10 |     needs_clone::<ArmReceipt>();
+   |                   ^^^^^^^^^^ the trait `Clone` is not implemented for `ArmReceipt`
+   |
+note: required by a bound in `needs_clone`
+  --> tests/ui/receipts_are_not_clone.rs:5:19
+   |
+ 5 | fn needs_clone<T: Clone>() {}
+   |                   ^^^^^ required by this bound in `needs_clone`

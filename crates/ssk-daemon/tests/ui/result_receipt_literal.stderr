@@ -1,0 +1,11 @@
+error: cannot construct `ResultReceipt` with struct literal syntax due to private fields
+ --> tests/ui/result_receipt_literal.rs:6:13
+  |
+6 |     let _ = ResultReceipt {
+  |             ^^^^^^^^^^^^^
+7 |         seq: 1,
+  |         ------ private field
+8 |         entry_hash: String::new(),
+  |         ------------------------- private field
+  |
+  = note: ...and other private fields that were not provided

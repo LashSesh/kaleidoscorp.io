@@ -1387,6 +1387,7 @@ dependencies = [
  "thiserror",
  "tokio",
  "tracing",
+ "trybuild",
 ]
 
 [[package]]

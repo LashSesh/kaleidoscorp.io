@@ -110,6 +110,10 @@ proptest.workspace = true
 # Paused time for the pump and limiter tests: an idle timeout of 30 s is
 # asserted to the millisecond without waiting 30 s.
 tokio = { version = "1", features = ["test-util"] }
+# `tests/ui_receipts.rs`: the receipts of the flow ledger cannot be made, cloned or
+# imitated from outside the module that issues them. A compile-fail snapshot pins
+# the exact error; a `compile_fail` doctest would pass for any compile error.
+trybuild = "1"
 # `tests/kill_switch_status.rs` drives a REAL `ssk_netd_helper::Broker` behind a
 # real `PrivilegedServer` over an in-memory `FrameTransport` pair. Building that
 # broker needs its actuation manifest and its `(principal, verb)` table.

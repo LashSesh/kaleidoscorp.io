@@ -180,7 +180,7 @@ pub struct PendingInput<'a> {
 }
 
 /// The tunnel is established.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Clone, Default, PartialEq, Eq)]
 pub struct ConnectedEvent {
     /// `AdapterKind` names through an exhaustive match, never `{:?}`.
     pub chain_kinds: Vec<&'static str>,
@@ -191,13 +191,37 @@ pub struct ConnectedEvent {
 }
 
 /// A dial was started and failed.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct FailedEvent {
     pub error_code: &'static str,
     pub refusal: Option<&'static str>,
     pub attempted: Vec<SocketAddr>,
     pub answers: Option<u8>,
     pub observations: Vec<Observation>,
+}
+
+// `Debug` without the addresses: these hold plain `SocketAddr`s that a `hashed`
+// ledger must never show, and a `{:?}` in a log line is how they would escape.
+impl std::fmt::Debug for ConnectedEvent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ConnectedEvent")
+            .field("chain_kinds", &self.chain_kinds)
+            .field("dialed", &self.dialed.map(|_| "<address>"))
+            .field("attempted", &self.attempted.len())
+            .field("answers", &self.answers)
+            .finish_non_exhaustive()
+    }
+}
+
+impl std::fmt::Debug for FailedEvent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FailedEvent")
+            .field("error_code", &self.error_code)
+            .field("refusal", &self.refusal)
+            .field("attempted", &self.attempted.len())
+            .field("answers", &self.answers)
+            .finish_non_exhaustive()
+    }
 }
 
 impl FailedEvent {
@@ -300,6 +324,33 @@ mod tests {
         }
     }
 
+    /// A match with no wildcard: a new `NetcoreError` variant stops compiling here
+    /// until it is added to the sample below (and so to the closed list, or
+    /// deliberately left to the generic code).
+    fn every_variant_is_sampled(error: &ssk_netcore::NetcoreError) {
+        use ssk_netcore::NetcoreError as E;
+        match error {
+            E::OpenVpnNotReady(_)
+            | E::Timeout(..)
+            | E::ConnectionRefused(..)
+            | E::DnsResolutionFailed(..)
+            | E::TlsHandshakeFailed(..)
+            | E::ProxyRejected(..)
+            | E::Unsupported(_)
+            | E::PolicyDenied(_)
+            | E::NoRoute(_)
+            | E::UnknownAdapter(_)
+            | E::Io(..)
+            | E::ProtocolError(..)
+            | E::InvalidTarget(_)
+            | E::ResolverBusy
+            | E::AddressRefused { .. }
+            | E::FamilyDisabled
+            // Reports the code of the error it wraps.
+            | E::DialFailed { .. } => {}
+        }
+    }
+
     #[test]
     fn every_netcore_error_code_is_in_the_closed_list() {
         use ssk_netcore::NetcoreError as E;
@@ -330,6 +381,7 @@ mod tests {
         ];
         let mut seen = std::collections::BTreeSet::new();
         for error in samples {
+            every_variant_is_sampled(&error);
             let code = error.code();
             assert!(seen.insert(code), "{code} twice");
             assert_eq!(
@@ -338,7 +390,17 @@ mod tests {
                 "{code}"
             );
         }
-        // The sample is the whole enum: sixteen variants, sixteen codes.
+        // The wrapper reports the code of the error inside it.
+        let wrapped = E::DialFailed {
+            source: Box::new(E::Timeout(String::new(), std::time::Duration::ZERO)),
+            attempts: ssk_netcore::DialAttempts {
+                answers: 0,
+                attempted: Vec::new(),
+            },
+        };
+        every_variant_is_sampled(&wrapped);
+        assert_eq!(wrapped.code(), "NETCORE_TIMEOUT");
+        // The sample is every other variant: sixteen variants, sixteen codes.
         assert_eq!(seen.len(), 16);
     }
 

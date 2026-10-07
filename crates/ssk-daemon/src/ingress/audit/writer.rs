@@ -26,6 +26,7 @@
 //! Rotation, retention and the refusal quota are `C-A7`; this module appends to
 //! the active segment it is given.
 
+use std::collections::VecDeque;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -278,8 +279,9 @@ struct Shared {
     entries: AtomicU64,
     bytes: AtomicU64,
     head: Mutex<String>,
-    /// Milliseconds since `base` plus one while a sync is running, 0 otherwise.
-    sync_started: AtomicU64,
+    /// Milliseconds since `base` plus one while the disk part of a batch is
+    /// running, 0 otherwise.
+    io_started: AtomicU64,
     sync_last_ms: AtomicU64,
     sync_max_ms: AtomicU64,
     queued: AtomicUsize,
@@ -297,7 +299,7 @@ impl Shared {
             entries: AtomicU64::new(replayed.entries),
             bytes: AtomicU64::new(replayed.bytes),
             head: Mutex::new(replayed.head.clone()),
-            sync_started: AtomicU64::new(0),
+            io_started: AtomicU64::new(0),
             sync_last_ms: AtomicU64::new(0),
             sync_max_ms: AtomicU64::new(0),
             queued: AtomicUsize::new(0),
@@ -384,10 +386,17 @@ fn deliver_fn<R: Delivered>(
     })
 }
 
+/// What a caller wants done if its future is dropped while its job is still queued:
+/// the job is then cancelled and will never be written, so whatever the caller had
+/// already promised on the strength of it has to be undone. Runs inside a `Drop`,
+/// so it only touches atomics and the unbounded side channel.
+type OnCancel = Box<dyn FnOnce() + Send>;
+
 /// Cancels or abandons a job when its caller is dropped before it has an answer.
 struct ClaimGuard {
     state: Arc<AtomicU8>,
     armed: bool,
+    on_cancel: Option<OnCancel>,
 }
 
 impl Drop for ClaimGuard {
@@ -400,7 +409,14 @@ impl Drop for ClaimGuard {
                 .compare_exchange(from, to, Ordering::AcqRel, Ordering::Acquire)
                 .is_ok()
         };
-        if !swap(QUEUED, CANCELLED) {
+        if swap(QUEUED, CANCELLED) {
+            // Never written. Undo the promise made on its behalf.
+            if let Some(on_cancel) = self.on_cancel.take() {
+                on_cancel();
+            }
+        } else {
+            // Claimed: the record will land, and its receipt (dropped by the
+            // writer, the caller being gone) closes its own story.
             let _ = swap(CLAIMED, ABANDONED);
         }
     }
@@ -443,6 +459,19 @@ impl Inner {
         waits: Waits,
         make: impl FnOnce(Written, Arc<Self>) -> R + Send + 'static,
     ) -> Result<R, AuditError> {
+        self.submit_with(flow_id, event, waits, None, make).await
+    }
+
+    /// [`Inner::submit`] with `on_cancel`: run if this future is dropped while the
+    /// job is still queued (and so never written).
+    async fn submit_with<R: Delivered>(
+        self: &Arc<Self>,
+        flow_id: String,
+        event: FlowAuditEvent,
+        waits: Waits,
+        on_cancel: Option<OnCancel>,
+        make: impl FnOnce(Written, Arc<Self>) -> R + Send + 'static,
+    ) -> Result<R, AuditError> {
         if self.closing.load(Ordering::Acquire) {
             return Err(AuditError::Closing);
         }
@@ -472,6 +501,7 @@ impl Inner {
         let mut guard = ClaimGuard {
             state: Arc::clone(&state),
             armed: true,
+            on_cancel,
         };
         let swap = |from, to| {
             state
@@ -514,12 +544,7 @@ impl Inner {
 // ---------------------------------------------------------------------------
 
 /// Any durable record that authorises nothing. Its fields are private: nothing
-/// outside this module can make one.
-///
-/// ```compile_fail,E0451
-/// use ssk_daemon::ingress::audit::writer::Receipt;
-/// let _ = Receipt { seq: 1, entry_hash: String::new() };
-/// ```
+/// outside this module can make one (`tests/ui_receipts.rs` pins the error).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Receipt {
     seq: u64,
@@ -585,12 +610,8 @@ fn binding_of(kind: TargetKind, host: &str, port: u16, route: &str) -> Binding {
 /// `Result` that closes the story.
 ///
 /// Its fields are private: nothing outside this module can make one, so a dial
-/// cannot be started without the record that says it may.
-///
-/// ```compile_fail,E0451
-/// use ssk_daemon::ingress::audit::writer::PendingReceipt;
-/// let _ = PendingReceipt { seq: 1, entry_hash: String::new() };
-/// ```
+/// cannot be started without the record that says it may. Not `Clone`
+/// (`tests/ui_receipts.rs` pins both).
 pub struct PendingReceipt {
     core: Arc<Inner>,
     flow_id: String,
@@ -598,11 +619,40 @@ pub struct PendingReceipt {
     entry_hash: String,
     kind: TargetKind,
     binding: Binding,
+    /// Shared with the guard of a result that is being submitted, which has to be
+    /// able to undo the submission if its future is dropped while still queued.
+    flags: Arc<PendingFlags>,
+    abandoned: bool,
+}
+
+/// What a `PendingReceipt` knows about its own story.
+#[derive(Default)]
+struct PendingFlags {
     dial_started: AtomicBool,
+    /// Set when a result is SUBMITTED, not when it is durable: a result that timed
+    /// out may still land, and a second one for the same `Pending` would break the
+    /// one-result rule.
     result_submitted: AtomicBool,
     result_failed: AtomicBool,
     explicit_code: Mutex<Option<&'static str>>,
-    abandoned: bool,
+}
+
+impl PendingFlags {
+    fn begin_result(&self) -> Result<(), AuditError> {
+        if self.result_submitted.swap(true, Ordering::AcqRel) {
+            return Err(AuditError::Invalid("result already submitted"));
+        }
+        Ok(())
+    }
+
+    /// The result was not recorded and will not be: the drop compensates.
+    fn result_not_recorded(&self, code: Option<&'static str>) {
+        self.result_failed.store(true, Ordering::Release);
+        if let Some(code) = code {
+            *lock_unpoisoned(&self.explicit_code) = Some(code);
+        }
+        self.result_submitted.store(false, Ordering::Release);
+    }
 }
 
 impl PendingReceipt {
@@ -633,23 +683,7 @@ impl PendingReceipt {
     /// Called by the dial immediately before the first connect. From now on a
     /// drop without a result means `Aborted`, not `NotDialed`.
     pub fn mark_dial_started(&self) {
-        self.dial_started.store(true, Ordering::Release);
-    }
-
-    fn begin_result(&self) -> Result<(), AuditError> {
-        if self.result_submitted.swap(true, Ordering::AcqRel) {
-            return Err(AuditError::Invalid("result already submitted"));
-        }
-        Ok(())
-    }
-
-    /// The result was not recorded and will not be: the drop compensates.
-    fn result_not_recorded(&self, code: Option<&'static str>) {
-        self.result_failed.store(true, Ordering::Release);
-        if let Some(code) = code {
-            *lock_unpoisoned(&self.explicit_code) = Some(code);
-        }
-        self.result_submitted.store(false, Ordering::Release);
+        self.flags.dial_started.store(true, Ordering::Release);
     }
 }
 
@@ -661,18 +695,18 @@ impl Delivered for PendingReceipt {
 
 impl Drop for PendingReceipt {
     fn drop(&mut self) {
-        if self.result_submitted.load(Ordering::Acquire) {
+        if self.flags.result_submitted.load(Ordering::Acquire) {
             return;
         }
-        let (outcome, code) = if self.dial_started.load(Ordering::Acquire) {
-            let code = if self.result_failed.load(Ordering::Acquire) {
+        let (outcome, code) = if self.flags.dial_started.load(Ordering::Acquire) {
+            let code = if self.flags.result_failed.load(Ordering::Acquire) {
                 "RESULT_NOT_RECORDED"
             } else {
                 "DIAL_NOT_COMPLETED"
             };
             (ResultOutcome::Aborted, code)
         } else {
-            let explicit = *lock_unpoisoned(&self.explicit_code);
+            let explicit = *lock_unpoisoned(&self.flags.explicit_code);
             let code = explicit.unwrap_or(if self.abandoned {
                 "AUDIT_ABANDONED"
             } else {
@@ -700,18 +734,9 @@ impl Drop for PendingReceipt {
 /// client may be told so. The only value that authorises a success reply or a
 /// byte.
 ///
-/// Nobody outside this crate can make one, or make a second kind of proof:
-///
-/// ```compile_fail,E0451
-/// use ssk_daemon::ingress::audit::writer::ResultReceipt;
-/// let _ = ResultReceipt { seq: 1, entry_hash: String::new() };
-/// ```
-///
-/// ```compile_fail,E0603
-/// use ssk_daemon::ingress::types::sealed::Sealed;
-/// struct Mine;
-/// impl Sealed for Mine {}
-/// ```
+/// Nobody outside this crate can make one, copy one, or make a second kind of
+/// proof: the fields are private, it is not `Clone`, and `ResultProof` is sealed by
+/// a marker that cannot be named from outside (`tests/ui_receipts.rs` pins each).
 pub struct ResultReceipt {
     core: Arc<Inner>,
     flow_id: String,
@@ -753,13 +778,28 @@ impl ResultReceipt {
     /// writes them if this could not).
     pub async fn closed(mut self, ev: ClosedEvent, bounded: Duration) {
         let event = self.closed_event(ev.bytes_up, ev.bytes_down, ev.reason);
+        // If this future is dropped while the `Closed` is still queued (a flow task
+        // aborted at shutdown, a client that disconnected inside a `select!`) the
+        // job is cancelled and never written, and the receipt below has already
+        // been marked resolved: the callback writes the `Closed` instead, with the
+        // real byte counts and the honest reason. If the job was already claimed it
+        // will land by itself and nothing more is needed.
+        let fallback = self.closed_event(ev.bytes_up, ev.bytes_down, CloseReason::AuditAbandoned);
+        let on_cancel: OnCancel = {
+            let core = Arc::clone(&self.core);
+            let flow_id = self.flow_id.clone();
+            Box::new(move || {
+                core.send_comp(flow_id, fallback);
+            })
+        };
         self.resolved = true;
         let result = self
             .core
-            .submit(
+            .submit_with(
                 self.flow_id.clone(),
                 event,
                 Waits::both(bounded),
+                Some(on_cancel),
                 |written, _| Receipt::new(written),
             )
             .await;
@@ -804,11 +844,6 @@ impl Drop for ResultReceipt {
 /// or [`ArmReceipt::not_applied`]; dropped unresolved it writes
 /// `Disarmed{arm_abandoned}`, so a durable `Armed` is never left without the
 /// record that says what became of it.
-///
-/// ```compile_fail,E0451
-/// use ssk_daemon::ingress::audit::writer::ArmReceipt;
-/// let _ = ArmReceipt { seq: 1, entry_hash: String::new() };
-/// ```
 pub struct ArmReceipt {
     core: Arc<Inner>,
     epoch: u64,
@@ -880,14 +915,6 @@ struct Item {
     deliver: Option<Deliver>,
 }
 
-impl Item {
-    fn fail(self, error: AuditError) {
-        if let Some(deliver) = self.deliver {
-            deliver(Err(error));
-        }
-    }
-}
-
 struct Core {
     io: Box<dyn LedgerIo>,
     head: String,
@@ -908,37 +935,86 @@ fn encode_error(error: &EncodeError) -> AuditError {
     }
 }
 
+/// Marks the writer down and calls `on_trip`, once. The callback runs on the
+/// calling thread and must not block.
+fn trip_once(shared: &Shared, on_trip: &TripFn) {
+    if !shared.down.swap(true, Ordering::AcqRel) {
+        let on_trip = Arc::clone(on_trip);
+        let _ = catch_unwind(AssertUnwindSafe(|| on_trip(TripReason::AuditWriteFailed)));
+    }
+}
+
+/// Trips when the batch in progress is abandoned by a panic. Declared after the
+/// values that hold the callers' reply channels, so that it drops before them:
+/// unwinding closes those channels (which tells the callers), and the trip has to
+/// come first.
+struct PanicTrip {
+    shared: Arc<Shared>,
+    on_trip: TripFn,
+}
+
+impl Drop for PanicTrip {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            trip_once(&self.shared, &self.on_trip);
+        }
+    }
+}
+
+/// The answers a batch owes: the callers of the records that were written, and of
+/// those that were refused for want of a sequence number.
+type Written2 = (Option<Deliver>, Written);
+
 impl Core {
     fn trip(&self) {
-        if !self.shared.down.swap(true, Ordering::AcqRel) {
-            let on_trip = Arc::clone(&self.on_trip);
-            let _ = catch_unwind(AssertUnwindSafe(|| on_trip(TripReason::AuditWriteFailed)));
+        trip_once(&self.shared, &self.on_trip);
+    }
+
+    /// Answers a caller, or counts a compensation that nobody was waiting for.
+    fn answer(&self, deliver: Option<Deliver>, outcome: Result<Written, AuditError>) {
+        match deliver {
+            Some(deliver) => deliver(outcome),
+            None => {
+                if outcome.is_err() {
+                    bump(&self.shared.compensations_lost);
+                }
+            }
         }
     }
 
     /// A write fault: trips first, then answers, so that whoever sees the error
-    /// also sees a tripped gate. `on_trip` runs on this thread and must not block.
-    fn fail_batch(&self, written: Vec<(Option<Deliver>, Written)>, error: AuditError) {
+    /// also sees a tripped gate.
+    fn fail_batch(&self, written: Vec<Written2>, refused: Vec<Option<Deliver>>, error: AuditError) {
         self.trip();
         for (deliver, _) in written {
-            if let Some(deliver) = deliver {
-                deliver(Err(error));
-            }
+            self.answer(deliver, Err(error));
+        }
+        for deliver in refused {
+            self.answer(deliver, Err(AuditError::SeqExhausted));
         }
     }
 
     /// Writes `items` as one batch: encode, check the file, append, sync, answer.
     /// `false` when the writer must stop.
-    fn commit(&mut self, items: Vec<Item>) -> bool {
+    fn commit(&mut self, mut items: VecDeque<Item>) -> bool {
         let mut head = self.head.clone();
         let mut next = self.next_seq;
         let mut bytes: Vec<u8> = Vec::new();
-        let mut written: Vec<(Option<Deliver>, Written)> = Vec::new();
-        let mut exhausted = false;
-        for item in items {
+        let mut written: Vec<Written2> = Vec::new();
+        let mut refused: Vec<Option<Deliver>> = Vec::new();
+        // After everything that holds a reply channel (see `PanicTrip`).
+        let _panic_trip = PanicTrip {
+            shared: Arc::clone(&self.shared),
+            on_trip: Arc::clone(&self.on_trip),
+        };
+        while !items.is_empty() {
+            // Read before the item is taken: the clock is somebody else's code.
+            let ts_ms = (self.clock)();
+            let Some(item) = items.pop_front() else {
+                break;
+            };
             let Some(seq) = next else {
-                exhausted = true;
-                item.fail(AuditError::SeqExhausted);
+                refused.push(item.deliver);
                 continue;
             };
             let Item {
@@ -948,7 +1024,7 @@ impl Core {
             } = item;
             let record = FlowAuditRecord {
                 seq,
-                ts_ms: (self.clock)(),
+                ts_ms,
                 flow_id,
                 event,
             };
@@ -965,63 +1041,35 @@ impl Core {
                         },
                     ));
                 }
-                Err(error) => {
-                    if let Some(deliver) = deliver {
-                        deliver(Err(encode_error(&error)));
-                    } else {
-                        bump(&self.shared.compensations_lost);
-                    }
-                }
+                Err(error) => self.answer(deliver, Err(encode_error(&error))),
             }
         }
+        let exhausted = !refused.is_empty();
         if written.is_empty() {
             if exhausted {
-                self.trip();
+                self.fail_batch(Vec::new(), refused, AuditError::SeqExhausted);
                 return false;
             }
             return true;
         }
 
-        // Nobody may have touched the file since the last batch: an unlinked
-        // segment or an appended byte means the chain on disk is not the chain in
-        // memory.
-        match self.io.active_stat() {
-            Ok(stat) if stat.nlink != 0 && stat.len == self.expected_len => {}
-            Ok(_) => {
-                self.fail_batch(written, AuditError::Io("AUDIT_EXTERNAL_MODIFICATION"));
-                return false;
-            }
+        let took = {
+            let _mark = IoMark::start(Arc::clone(&self.shared), self.base);
+            self.write_batch(&bytes)
+        };
+        let took = match took {
+            Ok(took) => took,
             Err(error) => {
-                self.fail_batch(written, AuditError::Io(io_code(&error)));
+                self.fail_batch(written, refused, error);
                 return false;
             }
-        }
-
-        let before = self.expected_len;
-        if let Err(error) = self.io.append(&bytes) {
-            let _ = self.io.truncate_active(before);
-            self.fail_batch(written, AuditError::Io(io_code(&error)));
-            return false;
-        }
-        let began = Instant::now();
-        let started_ms = u64::try_from(self.base.elapsed().as_millis()).unwrap_or(u64::MAX);
-        self.shared
-            .sync_started
-            .store(started_ms.saturating_add(1), Ordering::Release);
-        let synced = self.io.sync_data();
-        self.shared.sync_started.store(0, Ordering::Release);
-        if let Err(error) = synced {
-            let _ = self.io.truncate_active(before);
-            self.fail_batch(written, AuditError::Io(io_code(&error)));
-            return false;
-        }
-        let took = u64::try_from(began.elapsed().as_millis()).unwrap_or(u64::MAX);
+        };
 
         // Durable. Move the state first, then answer, so that a caller that sees
         // its receipt also sees the status that includes it.
         let added = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
         let count = u64::try_from(written.len()).unwrap_or(u64::MAX);
-        self.expected_len = before.saturating_add(added);
+        self.expected_len = self.expected_len.saturating_add(added);
         self.head = head;
         self.next_seq = next;
         self.shared.entries.fetch_add(count, Ordering::AcqRel);
@@ -1030,15 +1078,63 @@ impl Core {
         self.shared.sync_last_ms.store(took, Ordering::Release);
         self.shared.sync_max_ms.fetch_max(took, Ordering::AcqRel);
         for (deliver, written) in written {
-            if let Some(deliver) = deliver {
-                deliver(Ok(written));
-            }
+            self.answer(deliver, Ok(written));
         }
         if exhausted {
-            self.trip();
+            // The numbers ran out inside this batch: what fitted is durable and
+            // answered; the rest are refused, after the trip.
+            self.fail_batch(Vec::new(), refused, AuditError::SeqExhausted);
             return false;
         }
         true
+    }
+
+    /// The disk part of a batch: check the file, append, sync. On a failure the file
+    /// is cut back to what it held, and the error says why. Returns the time the
+    /// sync took, in milliseconds.
+    fn write_batch(&mut self, bytes: &[u8]) -> Result<u64, AuditError> {
+        // Nobody may have touched the file since the last batch: an unlinked
+        // segment or an appended byte means the chain on disk is not the chain in
+        // memory.
+        match self.io.active_stat() {
+            Ok(stat) if stat.nlink != 0 && stat.len == self.expected_len => {}
+            Ok(_) => return Err(AuditError::Io("AUDIT_EXTERNAL_MODIFICATION")),
+            Err(error) => return Err(AuditError::Io(io_code(&error))),
+        }
+        let before = self.expected_len;
+        if let Err(error) = self.io.append(bytes) {
+            let _ = self.io.truncate_active(before);
+            return Err(AuditError::Io(io_code(&error)));
+        }
+        let began = Instant::now();
+        if let Err(error) = self.io.sync_data() {
+            let _ = self.io.truncate_active(before);
+            return Err(AuditError::Io(io_code(&error)));
+        }
+        Ok(u64::try_from(began.elapsed().as_millis()).unwrap_or(u64::MAX))
+    }
+}
+
+/// While alive, the disk part of a batch is marked as running, for the host's
+/// stall watchdog: a stuck `append` or `fstat` stalls the ledger as surely as a
+/// stuck `sync_data`.
+struct IoMark {
+    shared: Arc<Shared>,
+}
+
+impl IoMark {
+    fn start(shared: Arc<Shared>, base: Instant) -> Self {
+        let now = u64::try_from(base.elapsed().as_millis()).unwrap_or(u64::MAX);
+        shared
+            .io_started
+            .store(now.saturating_add(1), Ordering::Release);
+        Self { shared }
+    }
+}
+
+impl Drop for IoMark {
+    fn drop(&mut self) {
+        self.shared.io_started.store(0, Ordering::Release);
     }
 }
 
@@ -1051,9 +1147,8 @@ struct ExitGuard {
 
 impl Drop for ExitGuard {
     fn drop(&mut self) {
-        if !self.clean && !self.shared.down.swap(true, Ordering::AcqRel) {
-            let on_trip = Arc::clone(&self.on_trip);
-            let _ = catch_unwind(AssertUnwindSafe(|| on_trip(TripReason::AuditWriteFailed)));
+        if !self.clean {
+            trip_once(&self.shared, &self.on_trip);
         }
     }
 }
@@ -1070,8 +1165,18 @@ fn thread_main(mut core: Core, mut rx: mpsc::UnboundedReceiver<Job>) {
             match rx.try_recv() {
                 Ok(job) => job,
                 Err(_) => {
-                    exit.clean = true;
-                    return;
+                    // Nothing is queued. Close the channel so that nothing can
+                    // slip in after this look (a later `send` fails and is
+                    // counted); whatever got in before the close is seen by the
+                    // second look.
+                    rx.close();
+                    match rx.try_recv() {
+                        Ok(job) => job,
+                        Err(_) => {
+                            exit.clean = true;
+                            return;
+                        }
+                    }
                 }
             }
         } else {
@@ -1118,7 +1223,7 @@ fn thread_main(mut core: Core, mut rx: mpsc::UnboundedReceiver<Job>) {
                 Job::Shutdown => stopping = true,
             }
         }
-        let alive = core.commit(items);
+        let alive = core.commit(VecDeque::from(items));
         for flush in flushes {
             let _ = flush.send(alive);
         }
@@ -1160,7 +1265,11 @@ impl FlowAuditWriter {
     ///
     /// # Errors
     /// [`AuditOpenError`].
-    pub fn open_with(
+    // Crate-internal on purpose: a writer over a disk of one's own choosing can
+    // issue receipts. `open_dir` (`C-A7`) is the entry point; this is its body and
+    // the seam of the tests.
+    #[allow(dead_code)]
+    pub(crate) fn open_with(
         io: impl LedgerIo,
         replayed: Replayed,
         cfg: &AuditOpenCfg,
@@ -1219,7 +1328,7 @@ impl FlowAuditWriter {
                 *lock_unpoisoned(&slot) = Some(result);
             })),
         });
-        if !core.commit(items) {
+        if !core.commit(VecDeque::from(items)) {
             let code = match lock_unpoisoned(&outcome).take() {
                 Some(Err(AuditError::Io(code))) => code,
                 Some(Err(AuditError::SeqExhausted)) => return Err(AuditOpenError::SeqExhausted),
@@ -1317,10 +1426,7 @@ impl FlowAuditWriter {
                 entry_hash: written.hash,
                 kind,
                 binding,
-                dial_started: AtomicBool::new(false),
-                result_submitted: AtomicBool::new(false),
-                result_failed: AtomicBool::new(false),
-                explicit_code: Mutex::new(None),
+                flags: Arc::new(PendingFlags::default()),
                 abandoned: false,
             })
             .await
@@ -1360,7 +1466,7 @@ impl FlowAuditWriter {
         counts: Arc<ByteCounts>,
         waits: Waits,
     ) -> Result<ResultReceipt, AuditError> {
-        pending.begin_result()?;
+        pending.flags.begin_result()?;
         let record = (|| -> Result<FlowAuditEvent, AuditError> {
             Ok(FlowAuditEvent::Result {
                 outcome: ResultOutcome::Connected,
@@ -1388,7 +1494,7 @@ impl FlowAuditWriter {
         let record = match record {
             Ok(record) => record,
             Err(error) => {
-                pending.result_not_recorded(None);
+                pending.flags.result_not_recorded(None);
                 return Err(error);
             }
         };
@@ -1396,24 +1502,45 @@ impl FlowAuditWriter {
         let id = flow_id.clone();
         let result = self
             .core
-            .submit(flow_id, record, waits, move |written, core| ResultReceipt {
-                core,
-                flow_id: id,
-                seq: written.seq,
-                entry_hash: written.hash,
-                counts,
-                started: Instant::now(),
-                resolved: false,
-                abandoned: false,
-                final_bytes: None,
-            })
+            .submit_with(
+                flow_id,
+                record,
+                waits,
+                Some(Self::undo_submission(&pending.flags, None)),
+                move |written, core| ResultReceipt {
+                    core,
+                    flow_id: id,
+                    seq: written.seq,
+                    entry_hash: written.hash,
+                    counts,
+                    started: Instant::now(),
+                    resolved: false,
+                    abandoned: false,
+                    final_bytes: None,
+                },
+            )
             .await;
-        if let Err(error) = &result {
+        Self::settle(&pending.flags, &result, None);
+        result
+    }
+
+    /// What a dropped result future does when its job was still queued (and so is
+    /// never written): the `Pending` goes back to having no result, and its own
+    /// drop writes the honest one.
+    fn undo_submission(flags: &Arc<PendingFlags>, code: Option<&'static str>) -> OnCancel {
+        let flags = Arc::clone(flags);
+        Box::new(move || flags.result_not_recorded(code))
+    }
+
+    /// After a result append came back with an error: unless it was a `Timeout`
+    /// (the record may still land, and a second one would break the one-result
+    /// rule) the result was not recorded and the `Pending` goes back to having none.
+    fn settle<T>(flags: &PendingFlags, result: &Result<T, AuditError>, code: Option<&'static str>) {
+        if let Err(error) = result {
             if *error != AuditError::Timeout {
-                pending.result_not_recorded(None);
+                flags.result_not_recorded(code);
             }
         }
-        result
     }
 
     /// `Result{Failed}`: a dial was started and failed.
@@ -1426,7 +1553,7 @@ impl FlowAuditWriter {
         event: FailedEvent,
         waits: Waits,
     ) -> Result<Receipt, AuditError> {
-        pending.begin_result()?;
+        pending.flags.begin_result()?;
         let (error_code, unknown_code) = closed(event.error_code, &RESULT_ERROR_CODES);
         let (refusal, unknown_refusal) = match event.refusal {
             Some(label) => {
@@ -1439,7 +1566,7 @@ impl FlowAuditWriter {
         let attempted = match self.seal_addresses(&event.attempted) {
             Ok(attempted) => attempted,
             Err(error) => {
-                pending.result_not_recorded(None);
+                pending.flags.result_not_recorded(None);
                 return Err(error);
             }
         };
@@ -1466,7 +1593,7 @@ impl FlowAuditWriter {
         code: &'static str,
         bounded: Duration,
     ) -> Result<Receipt, AuditError> {
-        pending.begin_result()?;
+        pending.flags.begin_result()?;
         let (code, unknown) = closed(code, &RESULT_ERROR_CODES);
         self.note_unknown(unknown);
         let record = FlowAuditEvent::Result {
@@ -1481,18 +1608,15 @@ impl FlowAuditWriter {
         };
         let result = self
             .core
-            .submit(
+            .submit_with(
                 pending.flow_id.clone(),
                 record,
                 Waits::both(bounded),
+                Some(Self::undo_submission(&pending.flags, Some(code))),
                 |written, _| Receipt::new(written),
             )
             .await;
-        if let Err(error) = &result {
-            if *error != AuditError::Timeout {
-                pending.result_not_recorded(Some(code));
-            }
-        }
+        Self::settle(&pending.flags, &result, Some(code));
         result
     }
 
@@ -1504,15 +1628,15 @@ impl FlowAuditWriter {
     ) -> Result<Receipt, AuditError> {
         let result = self
             .core
-            .submit(pending.flow_id.clone(), record, waits, |written, _| {
-                Receipt::new(written)
-            })
+            .submit_with(
+                pending.flow_id.clone(),
+                record,
+                waits,
+                Some(Self::undo_submission(&pending.flags, None)),
+                |written, _| Receipt::new(written),
+            )
             .await;
-        if let Err(error) = &result {
-            if *error != AuditError::Timeout {
-                pending.result_not_recorded(None);
-            }
-        }
+        Self::settle(&pending.flags, &result, None);
         result
     }
 
@@ -1586,12 +1710,17 @@ impl FlowAuditWriter {
             cause: event.cause.as_str().to_owned(),
             epoch: event.epoch,
         };
-        let _ = self
+        let result = self
             .core
             .submit(String::new(), record, Waits::both(bounded), |written, _| {
                 Receipt::new(written)
             })
             .await;
+        // Never fails the caller, never silent: a `Disarmed` that was not written is
+        // counted with the other records that close a story.
+        if result.is_err_and(|error| error != AuditError::Timeout) {
+            bump(&self.core.shared.compensations_lost);
+        }
     }
 
     /// `Tripped`: synchronous, never blocks, rides the compensation channel. For
@@ -1640,11 +1769,12 @@ impl FlowAuditWriter {
         }
     }
 
-    /// How long the sync that is running now has been running, if one is: for the
-    /// host's stall watchdog.
+    /// How long the disk part of the batch that is running now (the check of the
+    /// file, the append, the sync) has been running, if one is: for the host's
+    /// stall watchdog.
     #[must_use]
-    pub fn sync_in_progress_for(&self) -> Option<Duration> {
-        let started = self.core.shared.sync_started.load(Ordering::Acquire);
+    pub fn io_in_progress_for(&self) -> Option<Duration> {
+        let started = self.core.shared.io_started.load(Ordering::Acquire);
         let started = started.checked_sub(1)?;
         Some(Duration::from_millis(
             self.core.now_ms().saturating_sub(started),
@@ -1739,6 +1869,8 @@ mod tests {
         fail_sync_at: Option<usize>,
         block_sync: bool,
         in_sync: bool,
+        block_append: bool,
+        in_append: bool,
         unlinked: bool,
         stat_fails: bool,
         panic_on_append: bool,
@@ -1769,7 +1901,10 @@ mod tests {
         }
 
         fn release(&self) {
-            self.with(|d| d.block_sync = false);
+            self.with(|d| {
+                d.block_sync = false;
+                d.block_append = false;
+            });
             self.0.changed.notify_all();
         }
 
@@ -1803,6 +1938,16 @@ mod tests {
     impl LedgerIo for FakeIo {
         fn append(&mut self, bytes: &[u8]) -> io::Result<()> {
             let mut disk = lock_unpoisoned(&self.0.disk);
+            disk.in_append = true;
+            self.0.changed.notify_all();
+            while disk.block_append {
+                disk = self
+                    .0
+                    .changed
+                    .wait(disk)
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+            }
+            disk.in_append = false;
             disk.calls.push(Call::Append(bytes.len()));
             disk.appends += 1;
             if disk.panic_on_append {
@@ -3456,7 +3601,7 @@ mod tests {
     async fn a_running_sync_is_visible_to_the_watchdog_and_clears_afterwards() {
         let io = FakeIo::new();
         let (writer, _) = open_plain(&io);
-        assert_eq!(writer.sync_in_progress_for(), None);
+        assert_eq!(writer.io_in_progress_for(), None);
         io.block();
         let blocker = {
             let writer = Arc::clone(&writer);
@@ -3464,11 +3609,11 @@ mod tests {
         };
         eventually("in sync", || io.with(|d| d.in_sync)).await;
         tokio::time::sleep(Duration::from_millis(60)).await;
-        let stuck = writer.sync_in_progress_for().expect("a sync is running");
+        let stuck = writer.io_in_progress_for().expect("a sync is running");
         assert!(stuck >= Duration::from_millis(40), "{stuck:?}");
         io.release();
         assert!(blocker.await.expect("joined").is_ok());
-        assert_eq!(writer.sync_in_progress_for(), None);
+        assert_eq!(writer.io_in_progress_for(), None);
         assert!(writer.status().sync_max_ms >= 40);
     }
 
@@ -4367,6 +4512,468 @@ mod tests {
         }
     }
 
+    // -- the findings of the independent review ------------------------------------------------
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_result_future_dropped_while_queued_leaves_the_pending_to_write_its_own_result() {
+        for case in ["connected", "failed", "not_dialed"] {
+            let io = FakeIo::new();
+            let (writer, _) = open_plain(&io);
+            let pending = pend(&writer, "example.com", 443, LONG)
+                .await
+                .expect("pending");
+            pending.mark_dial_started();
+            let pending = Arc::new(pending);
+            io.block();
+            let blocker = {
+                let writer = Arc::clone(&writer);
+                tokio::spawn(async move { deny(&writer, LONG).await })
+            };
+            eventually("in sync", || io.with(|d| d.in_sync)).await;
+            let task = {
+                let writer = Arc::clone(&writer);
+                let pending = Arc::clone(&pending);
+                tokio::spawn(async move {
+                    match case {
+                        "connected" => {
+                            let _ = writer
+                                .append_connected(
+                                    &pending,
+                                    ConnectedEvent::default(),
+                                    Arc::new(ByteCounts::default()),
+                                    LONG,
+                                )
+                                .await;
+                        }
+                        "failed" => {
+                            let _ = writer
+                                .append_failed(&pending, FailedEvent::code("NETCORE_TIMEOUT"), LONG)
+                                .await;
+                        }
+                        _ => {
+                            let _ = writer
+                                .append_not_dialed(&pending, "GATE_CLOSED", Duration::from_secs(20))
+                                .await;
+                        }
+                    }
+                })
+            };
+            eventually("the result is queued", || writer.status().queue_depth == 1).await;
+            // The flow task is aborted (a shutdown, a client that went away).
+            task.abort();
+            let _ = task.await;
+            io.release();
+            assert!(blocker.await.expect("joined").is_ok());
+            drop(Arc::into_inner(pending).expect("the last reference"));
+            writer
+                .flush(Duration::from_secs(10))
+                .await
+                .expect("flushed");
+            // Exactly one Result for the Pending, written by its drop: the dial had
+            // started and the result was never recorded -- or, for the explicit
+            // `NotDialed`, the code the flow had chosen.
+            let got = results(&io);
+            // The dial had started, so the Pending's drop says `Aborted`, whichever
+            // result was in flight.
+            let expected = (
+                ResultOutcome::Aborted,
+                Some("RESULT_NOT_RECORDED".to_owned()),
+            );
+            assert_eq!(got, [expected], "{case}");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_unrecorded_not_dialed_keeps_the_code_the_flow_chose() {
+        let io = FakeIo::new();
+        let (writer, _) = open_plain(&io);
+        let pending = Arc::new(
+            pend(&writer, "example.com", 443, LONG)
+                .await
+                .expect("pending"),
+        );
+        io.block();
+        let blocker = {
+            let writer = Arc::clone(&writer);
+            tokio::spawn(async move { deny(&writer, LONG).await })
+        };
+        eventually("in sync", || io.with(|d| d.in_sync)).await;
+        let task = {
+            let writer = Arc::clone(&writer);
+            let pending = Arc::clone(&pending);
+            tokio::spawn(async move {
+                let _ = writer
+                    .append_not_dialed(&pending, "GATE_CLOSED", Duration::from_secs(20))
+                    .await;
+            })
+        };
+        eventually("queued", || writer.status().queue_depth == 1).await;
+        task.abort();
+        let _ = task.await;
+        io.release();
+        assert!(blocker.await.expect("joined").is_ok());
+        drop(Arc::into_inner(pending).expect("the last reference"));
+        writer
+            .flush(Duration::from_secs(10))
+            .await
+            .expect("flushed");
+        assert_eq!(
+            results(&io),
+            [(ResultOutcome::NotDialed, Some("GATE_CLOSED".to_owned()))]
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_result_future_dropped_after_the_claim_does_not_get_a_second_result() {
+        let io = FakeIo::new();
+        let (writer, _) = open_plain(&io);
+        let pending = Arc::new(
+            pend(&writer, "example.com", 443, LONG)
+                .await
+                .expect("pending"),
+        );
+        pending.mark_dial_started();
+        io.block();
+        let task = {
+            let writer = Arc::clone(&writer);
+            let pending = Arc::clone(&pending);
+            tokio::spawn(async move {
+                let _ = writer
+                    .append_failed(&pending, FailedEvent::code("NETCORE_TIMEOUT"), LONG)
+                    .await;
+            })
+        };
+        // The writer claims it at once and is stuck in the sync.
+        eventually("claimed and syncing", || io.with(|d| d.in_sync)).await;
+        task.abort();
+        let _ = task.await;
+        io.release();
+        drop(Arc::into_inner(pending).expect("the last reference"));
+        writer
+            .flush(Duration::from_secs(10))
+            .await
+            .expect("flushed");
+        // The Failed result lands by itself; the Pending adds nothing.
+        assert_eq!(
+            results(&io),
+            [(ResultOutcome::Failed, Some("NETCORE_TIMEOUT".to_owned()))]
+        );
+    }
+
+    fn closed_records(io: &FakeIo) -> Vec<(u64, u64, String)> {
+        io.records()
+            .into_iter()
+            .filter_map(|r| match r.event {
+                FlowAuditEvent::Closed {
+                    bytes_up,
+                    bytes_down,
+                    reason,
+                    ..
+                } => Some((bytes_up, bytes_down, reason)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    async fn connected(writer: &FlowAuditWriter) -> (PendingReceipt, ResultReceipt) {
+        let pending = pend(writer, "example.com", 443, LONG)
+            .await
+            .expect("pending");
+        pending.mark_dial_started();
+        let result = writer
+            .append_connected(
+                &pending,
+                ConnectedEvent::default(),
+                Arc::new(ByteCounts::with_counts(1, 2)),
+                LONG,
+            )
+            .await
+            .expect("connected");
+        (pending, result)
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_closed_future_dropped_while_queued_still_leaves_a_closed_record() {
+        let io = FakeIo::new();
+        let (writer, _) = open_plain(&io);
+        let (pending, result) = connected(&writer).await;
+        io.block();
+        let blocker = {
+            let writer = Arc::clone(&writer);
+            tokio::spawn(async move { deny(&writer, LONG).await })
+        };
+        eventually("in sync", || io.with(|d| d.in_sync)).await;
+        let task = tokio::spawn(async move {
+            result
+                .closed(
+                    ClosedEvent {
+                        bytes_up: 40,
+                        bytes_down: 50,
+                        reason: CloseReason::Eof,
+                    },
+                    Duration::from_secs(20),
+                )
+                .await;
+        });
+        eventually("queued", || writer.status().queue_depth == 1).await;
+        task.abort();
+        let _ = task.await;
+        io.release();
+        assert!(blocker.await.expect("joined").is_ok());
+        writer
+            .flush(Duration::from_secs(10))
+            .await
+            .expect("flushed");
+        // The real counts, and the honest reason: the tunnel ended, the normal
+        // record was never written.
+        assert_eq!(
+            closed_records(&io),
+            [(40, 50, "audit_abandoned".to_owned())]
+        );
+        drop(pending);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_closed_future_dropped_after_the_claim_lands_once_with_its_own_reason() {
+        let io = FakeIo::new();
+        let (writer, _) = open_plain(&io);
+        let (pending, result) = connected(&writer).await;
+        io.block();
+        let task = tokio::spawn(async move {
+            result
+                .closed(
+                    ClosedEvent {
+                        bytes_up: 40,
+                        bytes_down: 50,
+                        reason: CloseReason::ClientError,
+                    },
+                    Duration::from_secs(20),
+                )
+                .await;
+        });
+        eventually("claimed and syncing", || io.with(|d| d.in_sync)).await;
+        task.abort();
+        let _ = task.await;
+        io.release();
+        writer
+            .flush(Duration::from_secs(10))
+            .await
+            .expect("flushed");
+        assert_eq!(closed_records(&io), [(40, 50, "client_error".to_owned())]);
+        drop(pending);
+    }
+
+    type Gate = Arc<(Mutex<bool>, Condvar)>;
+
+    /// A trip callback that blocks until the test lets it go, for the tests of
+    /// "tripped before anyone is told".
+    fn blocking_trip() -> (TripFn, Arc<AtomicBool>, Gate) {
+        let entered = Arc::new(AtomicBool::new(false));
+        let proceed = Arc::new((Mutex::new(false), Condvar::new()));
+        let on_trip: TripFn = {
+            let entered = Arc::clone(&entered);
+            let proceed = Arc::clone(&proceed);
+            Arc::new(move |_reason| {
+                entered.store(true, Ordering::Release);
+                let (lock, cv) = &*proceed;
+                let mut open = lock_unpoisoned(lock);
+                while !*open {
+                    open = cv
+                        .wait(open)
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                }
+            })
+        };
+        (on_trip, entered, proceed)
+    }
+
+    fn let_go(proceed: &Gate) {
+        let (lock, cv) = &**proceed;
+        *lock_unpoisoned(lock) = true;
+        cv.notify_all();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_writer_that_panics_trips_before_any_caller_is_told() {
+        let io = FakeIo::new();
+        let (on_trip, entered, proceed) = blocking_trip();
+        let writer = Arc::new(
+            FlowAuditWriter::open_with(
+                io.clone(),
+                Replayed::fresh(),
+                &cfg(DestinationLogging::Plain, 8),
+                DestSealer::Plain,
+                on_trip,
+            )
+            .expect("opens"),
+        );
+        io.with(|d| d.panic_on_append = true);
+        let task = {
+            let writer = Arc::clone(&writer);
+            tokio::spawn(async move { deny(&writer, LONG).await })
+        };
+        eventually("the trip callback is running", || {
+            entered.load(Ordering::Acquire)
+        })
+        .await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            !task.is_finished(),
+            "the caller was told before the trip finished"
+        );
+        let_go(&proceed);
+        assert_eq!(
+            task.await.expect("joined").err(),
+            Some(AuditError::WriterDown)
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_batch_that_runs_out_of_numbers_trips_before_the_refused_are_told() {
+        let io = FakeIo::new();
+        let (on_trip, entered, proceed) = blocking_trip();
+        // Started takes u64::MAX - 1; one number remains.
+        let replayed = Replayed {
+            last_seq: Some(u64::MAX - 2),
+            ..Replayed::fresh()
+        };
+        let writer = Arc::new(
+            FlowAuditWriter::open_with(
+                io.clone(),
+                replayed,
+                &cfg(DestinationLogging::Plain, 8),
+                DestSealer::Plain,
+                on_trip,
+            )
+            .expect("opens"),
+        );
+        io.block();
+        let mut tasks = Vec::new();
+        {
+            let writer = Arc::clone(&writer);
+            tasks.push(tokio::spawn(async move { deny(&writer, LONG).await }));
+        }
+        eventually("in sync", || io.with(|d| d.in_sync)).await;
+        // The first job took the last number; these two have none.
+        for _ in 0..2 {
+            let writer = Arc::clone(&writer);
+            tasks.push(tokio::spawn(async move { deny(&writer, LONG).await }));
+        }
+        eventually("two queued", || writer.status().queue_depth == 2).await;
+        io.release();
+        eventually("the trip callback is running", || {
+            entered.load(Ordering::Acquire)
+        })
+        .await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let mut finished = 0;
+        for task in &tasks {
+            finished += usize::from(task.is_finished());
+        }
+        // Only the first, whose record is durable, may have been answered.
+        assert!(
+            finished <= 1,
+            "{finished} callers were told before the trip finished"
+        );
+        let_go(&proceed);
+        let mut refused = 0;
+        for task in tasks {
+            if task.await.expect("joined") == Err(AuditError::SeqExhausted) {
+                refused += 1;
+            }
+        }
+        assert_eq!(refused, 2);
+    }
+
+    #[tokio::test]
+    async fn compensations_dropped_with_a_failed_batch_are_counted() {
+        let io = FakeIo::new();
+        let (writer, _) = open_plain(&io);
+        let pending = pend(&writer, "example.com", 443, LONG)
+            .await
+            .expect("pending");
+        io.with(|d| d.fail_append_at = Some(d.appends + 1));
+        // Its Result is the only job in the batch that fails.
+        drop(pending);
+        eventually("the writer went down", || {
+            writer.status().state == WriterState::Down
+        })
+        .await;
+        assert_eq!(writer.status().compensations_lost, 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_stuck_append_is_visible_to_the_watchdog_as_well() {
+        let io = FakeIo::new();
+        let (writer, _) = open_plain(&io);
+        assert_eq!(writer.io_in_progress_for(), None);
+        io.with(|d| d.block_append = true);
+        let task = {
+            let writer = Arc::clone(&writer);
+            tokio::spawn(async move { deny(&writer, LONG).await })
+        };
+        eventually("in append", || io.with(|d| d.in_append)).await;
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        let stuck = writer
+            .io_in_progress_for()
+            .expect("the disk part is running");
+        assert!(stuck >= Duration::from_millis(40), "{stuck:?}");
+        io.release();
+        assert!(task.await.expect("joined").is_ok());
+        assert_eq!(writer.io_in_progress_for(), None);
+    }
+
+    #[tokio::test]
+    async fn a_disarmed_that_cannot_be_written_is_counted() {
+        let io = FakeIo::new();
+        let (writer, _) = open_plain(&io);
+        writer.close(Duration::from_secs(10)).await;
+        let before = writer.status().compensations_lost;
+        writer
+            .append_disarmed(
+                DisarmedEvent {
+                    cause: DisarmCause::Shutdown,
+                    epoch: 3,
+                },
+                Duration::from_secs(1),
+            )
+            .await;
+        assert_eq!(writer.status().compensations_lost, before + 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_record_queued_behind_the_shutdown_marker_is_still_written() {
+        let io = FakeIo::new();
+        let (writer, _) = open_plain(&io);
+        io.block();
+        let blocker = {
+            let writer = Arc::clone(&writer);
+            tokio::spawn(async move { deny(&writer, LONG).await })
+        };
+        eventually("in sync", || io.with(|d| d.in_sync)).await;
+        // The marker and a record both reach the channel before the writer looks.
+        writer.core.closing.store(true, Ordering::Release);
+        assert!(writer.core.tx.send(Job::Shutdown).is_ok());
+        assert!(writer.try_enqueue_tripped(TrippedEvent {
+            reason: TripReason::AcceptFatal,
+            epoch: 2
+        }));
+        io.release();
+        assert!(blocker.await.expect("joined").is_ok());
+        let handle = lock_unpoisoned(&writer.core.thread).take().expect("thread");
+        tokio::task::spawn_blocking(move || handle.join())
+            .await
+            .expect("joined")
+            .expect("clean exit");
+        let kinds: Vec<&str> = events(&io).iter().map(|(_, k)| *k).collect();
+        assert_eq!(kinds, ["started", "denied", "tripped"]);
+        // And the thread is gone: a record sent now is refused and counted.
+        assert!(!writer.try_enqueue_tripped(TrippedEvent {
+            reason: TripReason::AcceptFatal,
+            epoch: 3
+        }));
+    }
+
     // -- the proof is sealed ---------------------------------------------------------------------------
 
     /// `ResultReceipt` is the only implementor of the sealed marker outside test
@@ -4390,8 +4997,16 @@ mod tests {
         let mut impls = Vec::new();
         for file in files {
             let text = std::fs::read_to_string(&file).expect("read");
-            // Everything before the file's test module.
-            let production = text.split("\nmod tests {").next().unwrap_or_default();
+            // Everything except the file's test module (from `mod tests {` at the
+            // start of a line to the closing brace at the start of a line).
+            let production = match text.find("\nmod tests {") {
+                Some(start) => {
+                    let after = text.get(start + 1..).unwrap_or_default();
+                    let end = after.find("\n}\n").map_or(after.len(), |at| at + 3);
+                    format!("{}{}", &text[..start], after.get(end..).unwrap_or_default())
+                }
+                None => text.clone(),
+            };
             for line in production.lines() {
                 let trimmed = line.trim_start();
                 if trimmed.starts_with("//") {
