@@ -6,10 +6,14 @@ use std::time::{Duration, Instant};
 
 use ssk_netadmin::adapter::{AdapterDescriptor, AdapterKind};
 use ssk_netadmin::route::{HopSpec, RouteKind};
-use tokio::sync::OnceCell;
+use tokio::sync::{OnceCell, Semaphore};
 use tokio::time::timeout;
 
 use crate::authority::authority;
+use crate::connector::{OsConnector, TcpConnector};
+use crate::direct::{
+    AddressFamilies, DialPurpose, Dialer, DirectAddrGuard, ATTEMPT_DELAY, DIAL_EXTRA_PERMITS,
+};
 use crate::dns::{self, RecordType};
 use crate::error::NetcoreError;
 use crate::probe::ProbeReport;
@@ -61,6 +65,11 @@ pub struct RouteExecutor {
     dial_deadline: Duration,
     tls_config: OnceCell<Arc<rustls::ClientConfig>>,
     resolver: BoundedResolver,
+    connector: Arc<dyn TcpConnector>,
+    guard: Option<Arc<dyn DirectAddrGuard>>,
+    families: AddressFamilies,
+    attempt_delay: Duration,
+    extra_attempts: Arc<Semaphore>,
 }
 
 impl RouteExecutor {
@@ -72,6 +81,11 @@ impl RouteExecutor {
             dial_deadline: DEFAULT_DIAL_DEADLINE,
             tls_config: OnceCell::new(),
             resolver: BoundedResolver::new(),
+            connector: Arc::new(OsConnector),
+            guard: None,
+            families: AddressFamilies::Any,
+            attempt_delay: ATTEMPT_DELAY,
+            extra_attempts: Arc::new(Semaphore::new(DIAL_EXTRA_PERMITS)),
         }
     }
 
@@ -121,6 +135,79 @@ impl RouteExecutor {
     pub fn with_max_concurrent_lookups(mut self, lookups: usize) -> Self {
         self.resolver = self.resolver.with_max_concurrent(lookups);
         self
+    }
+
+    /// Checks every address a host name resolved to with `guard` before any
+    /// socket is opened, and the first hop of a proxy chain when that is an IP
+    /// literal. One refused address refuses the whole answer
+    /// ([`NetcoreError::AddressRefused`]): a mixed answer is what DNS rebinding
+    /// looks like. The default is no guard, which is how the activation path
+    /// has always dialled. See [`DirectAddrGuard`].
+    #[must_use]
+    pub fn with_direct_guard(mut self, guard: Arc<dyn DirectAddrGuard>) -> Self {
+        self.guard = Some(guard);
+        self
+    }
+
+    /// Which address families a dial may use. The default is `Any`, so the
+    /// activation path behaves as before.
+    #[must_use]
+    pub fn with_address_families(mut self, families: AddressFamilies) -> Self {
+        self.families = families;
+        self
+    }
+
+    /// How long an attempt of a name's dial runs alone before the next
+    /// candidate starts. Default 250 ms.
+    #[must_use]
+    pub fn with_attempt_delay(mut self, delay: Duration) -> Self {
+        self.attempt_delay = delay;
+        self
+    }
+
+    /// Replaces what opens the sockets of a dial. The default is the OS stack;
+    /// a test passes a scripted connector. Whatever is passed is handed
+    /// destination addresses and nothing else.
+    #[must_use]
+    pub fn with_connector(mut self, connector: Arc<dyn TcpConnector>) -> Self {
+        self.connector = connector;
+        self
+    }
+
+    /// How many connects beyond the first of a dial may be in flight at once
+    /// across all dials of this executor. Default [`DIAL_EXTRA_PERMITS`]; the
+    /// daemon's descriptor budget counts exactly that many, so a larger value
+    /// is not a free tuning knob. A dial with nothing in flight never waits
+    /// for one. Set it before the first dial.
+    #[must_use]
+    pub fn with_max_extra_attempts(mut self, attempts: usize) -> Self {
+        self.extra_attempts = Arc::new(Semaphore::new(attempts.min(Semaphore::MAX_PERMITS)));
+        self
+    }
+
+    /// Whether a guard is installed (see [`Self::with_direct_guard`]).
+    #[must_use]
+    pub fn has_direct_guard(&self) -> bool {
+        self.guard.is_some()
+    }
+
+    /// The address families a dial may use.
+    #[must_use]
+    pub fn address_families(&self) -> AddressFamilies {
+        self.families
+    }
+
+    /// What one dial needs, borrowed from this executor.
+    fn dialer(&self) -> Dialer<'_> {
+        Dialer {
+            resolver: &self.resolver,
+            connector: &self.connector,
+            guard: self.guard.as_ref(),
+            families: self.families,
+            attempt_delay: self.attempt_delay,
+            extra_attempts: &self.extra_attempts,
+            connect_timeout: self.connect_timeout,
+        }
     }
 
     /// Name lookups that a caller stopped waiting for (the resolver deadline
@@ -234,10 +321,10 @@ impl RouteExecutor {
     }
 
     async fn connect_direct(&self, target: (&str, u16)) -> Result<EgressSession, NetcoreError> {
-        let (stream, resolution) =
-            direct::connect_host(target.0, target.1, self.connect_timeout, &self.resolver).await?;
+        let (transport, resolution) =
+            direct::connect_host(target.0, target.1, DialPurpose::Target, &self.dialer()).await?;
         Ok(EgressSession::new(
-            Box::new(stream),
+            transport,
             vec![AdapterKind::Direct],
             (target.0.to_string(), target.1),
             SessionResolution {
@@ -268,14 +355,13 @@ impl RouteExecutor {
         }
 
         let first = &hops[0];
-        let (first_stream, first_hop) = direct::connect_host(
+        let (mut transport, first_hop) = direct::connect_host(
             &first.address,
             first.port,
-            self.connect_timeout,
-            &self.resolver,
+            DialPurpose::FirstHop,
+            &self.dialer(),
         )
         .await?;
-        let mut transport: BoxedTransport = Box::new(first_stream);
 
         let mut chain_kinds = Vec::with_capacity(hops.len());
         for (i, hop) in hops.iter().enumerate() {
@@ -380,6 +466,8 @@ mod tests {
     use tokio::net::TcpListener;
 
     use super::*;
+    use crate::connector::fakes::{scripted_local_addr, Script, ScriptedConnector};
+    use crate::direct::fakes::RecordingGuard;
     use crate::resolve::fakes::{
         addr, settle, until, CountingResolver, Gate, GatedResolver, ReleaseOnDrop,
     };
@@ -666,5 +754,337 @@ mod tests {
                 if label == "stuck-own-timeout.test:443" && *d == Duration::from_millis(250)),
             "{err:?}"
         );
+    }
+
+    // ---- C-N4: the executor's dial seams -----------------------------------
+
+    #[test]
+    fn the_executor_defaults_leave_the_activation_path_as_it_was() {
+        let executor = RouteExecutor::new(AdapterRegistry::new());
+        assert!(!executor.has_direct_guard(), "a guard by default");
+        assert_eq!(executor.address_families(), AddressFamilies::Any);
+        assert_eq!(executor.attempt_delay, Duration::from_millis(250));
+        assert_eq!(
+            executor.extra_attempts.available_permits(),
+            DIAL_EXTRA_PERMITS
+        );
+    }
+
+    #[test]
+    fn the_builders_report_what_was_built() {
+        let executor = RouteExecutor::new(AdapterRegistry::new())
+            .with_direct_guard(Arc::new(RecordingGuard::default()))
+            .with_address_families(AddressFamilies::Ipv4Only)
+            .with_attempt_delay(Duration::from_millis(40));
+        assert!(executor.has_direct_guard());
+        assert_eq!(executor.address_families(), AddressFamilies::Ipv4Only);
+        assert_eq!(executor.attempt_delay, Duration::from_millis(40));
+    }
+
+    #[test]
+    fn the_extra_attempt_pool_allows_none_and_is_clamped_to_what_a_semaphore_holds() {
+        let sequential = RouteExecutor::new(AdapterRegistry::new()).with_max_extra_attempts(0);
+        assert_eq!(sequential.extra_attempts.available_permits(), 0);
+        let huge = RouteExecutor::new(AdapterRegistry::new()).with_max_extra_attempts(usize::MAX);
+        assert_eq!(
+            huge.extra_attempts.available_permits(),
+            Semaphore::MAX_PERMITS
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn executor_hands_the_connector_only_destinations() {
+        // The connector is the only thing that opens a socket, and its single
+        // parameter is an address: a name never reaches it, and neither does
+        // the target of a proxied route.
+        let connector = Arc::new(ScriptedConnector::new(Script::NOW));
+        let fake = CountingResolver::answering(vec![
+            addr("[2001:db8::5]:443"),
+            addr("192.0.2.5:443"),
+            addr("192.0.2.6:443"),
+        ]);
+        let executor = RouteExecutor::new(socks5_registry("192.0.2.9", 1080))
+            .with_resolver(fake.clone())
+            .with_connector(connector.clone());
+
+        executor
+            .connect(&RouteKind::Direct, ("svc.test", 443))
+            .await
+            .expect("a name dials its first pinned candidate");
+        executor
+            .connect(&RouteKind::Direct, ("192.0.2.7", 8443))
+            .await
+            .expect("a literal dials itself");
+        // The scripted peer hangs up, so the handshake fails: only the dial counts.
+        let route = RouteKind::SingleHop(HopSpec::new("socks", "192.0.2.9", 1080));
+        let _ = executor.connect(&route, ("upstream.internal", 443)).await;
+
+        assert_eq!(
+            connector.started(),
+            [addr("192.0.2.5:443"), addr("192.0.2.7:8443"), addr("192.0.2.9:1080")],
+            "the connector was handed something other than the pinned candidate, the literal and the first hop"
+        );
+        assert_eq!(fake.calls(), vec![("svc.test".to_owned(), 443)]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_executors_attempt_delay_is_the_stagger_of_its_dials() {
+        let (first, second) = (addr("192.0.2.1:443"), addr("192.0.2.2:443"));
+        let connector = Arc::new(ScriptedConnector::new(Script::Hang).script(second, Script::NOW));
+        let executor = RouteExecutor::new(AdapterRegistry::new())
+            .with_resolver(CountingResolver::answering(vec![first, second]))
+            .with_connector(connector.clone())
+            .with_attempt_delay(Duration::from_millis(40));
+        let t0 = tokio::time::Instant::now();
+        executor
+            .connect(&RouteKind::Direct, ("svc.test", 443))
+            .await
+            .expect("the second address connects");
+        let starts = connector.started_after(t0);
+        assert_eq!(
+            starts.iter().map(|(addr, _)| *addr).collect::<Vec<_>>(),
+            [first, second]
+        );
+        let delay = starts[1].1;
+        assert!(
+            delay >= Duration::from_millis(40) && delay < Duration::from_millis(50),
+            "the second attempt started {delay:?} after the first, not after 40 ms"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_executors_connect_timeout_is_the_one_budget_of_a_name_dial() {
+        let connector = Arc::new(ScriptedConnector::new(Script::Hang));
+        let executor = RouteExecutor::new(AdapterRegistry::new())
+            .with_resolver(CountingResolver::answering(vec![
+                addr("192.0.2.1:443"),
+                addr("192.0.2.2:443"),
+            ]))
+            .with_connector(connector)
+            .with_connect_timeout(Duration::from_secs(1));
+        let t0 = tokio::time::Instant::now();
+        let err = executor
+            .connect(&RouteKind::Direct, ("svc.test", 443))
+            .await
+            .expect_err("every address hangs");
+        let elapsed = t0.elapsed();
+        assert!(
+            elapsed >= Duration::from_secs(1) && elapsed < Duration::from_secs(2),
+            "the budget is 1 s, the dial took {elapsed:?}"
+        );
+        assert!(
+            matches!(&err, NetcoreError::DialFailed { source, .. }
+                if matches!(&**source, NetcoreError::Timeout(_, d) if *d == Duration::from_secs(1))),
+            "{err:?}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn session_records_mode_answers_dialed_and_local_addr() {
+        let (first, second) = (addr("192.0.2.1:443"), addr("192.0.2.2:443"));
+        let connector = Arc::new(ScriptedConnector::new(Script::Hang).script(second, Script::NOW));
+        // The duplicate of the first answer is one address.
+        let executor = RouteExecutor::new(AdapterRegistry::new())
+            .with_resolver(CountingResolver::answering(vec![first, second, first]))
+            .with_connector(connector);
+        let session = executor
+            .connect(&RouteKind::Direct, ("svc.test", 443))
+            .await
+            .expect("the second address connects");
+        assert_eq!(
+            session.resolution().target,
+            DialResolution {
+                mode: ResolutionMode::OsResolver,
+                dialed: Some(second),
+                attempted: vec![first, second],
+                answers: 2,
+                local_addr: Some(scripted_local_addr()),
+            }
+        );
+        assert_eq!(session.resolution().first_hop, None);
+    }
+
+    #[tokio::test]
+    async fn a_name_the_guard_refuses_opens_no_socket() {
+        // A real listener at the address the name resolves to: it must see no
+        // connection at all, and the executor says why in a typed error.
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let executor = RouteExecutor::new(AdapterRegistry::new())
+            .with_resolver(CountingResolver::answering(vec![
+                addr("192.0.2.1:9"),
+                addr(&format!("127.0.0.1:{port}")),
+            ]))
+            .with_direct_guard(Arc::new(
+                RecordingGuard::default().refusing("127.0.0.1", "loopback"),
+            ));
+        let err = executor
+            .connect(&RouteKind::Direct, ("rebind.test", port))
+            .await
+            .expect_err("one answer is loopback");
+        assert!(
+            matches!(
+                err,
+                NetcoreError::AddressRefused {
+                    code: "loopback",
+                    refused: 1,
+                    answers: 2
+                }
+            ),
+            "{err:?}"
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), listener.accept())
+                .await
+                .is_err(),
+            "a connection reached the listener although the whole answer was refused"
+        );
+    }
+
+    #[tokio::test]
+    async fn first_hop_name_resolving_to_the_listener_is_refused_but_loopback_first_hop_is_allowed()
+    {
+        let (proxy_port, proxy) = socks5_proxy_noting_its_peer().await;
+        // Stands for the ingress listener: a real socket that must see nothing.
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let listener_port = listener.local_addr().expect("addr").port();
+        let fake = CountingResolver::new(move |name, _| match name {
+            "loop.test" => Ok(vec![addr(&format!("127.0.0.1:{listener_port}"))]),
+            "proxy.test" | "target.test" => Ok(vec![addr(&format!("127.0.0.1:{proxy_port}"))]),
+            _ => Err(std::io::Error::from(std::io::ErrorKind::NotFound)),
+        });
+        let guard = Arc::new(
+            RecordingGuard::default()
+                // What the daemon's guard answers: a first hop is refused only
+                // when it is the listener; a target is refused when special-use.
+                .refusing_where(
+                    Some(DialPurpose::FirstHop),
+                    "127.0.0.1",
+                    Some(listener_port),
+                    "listener",
+                )
+                .refusing_where(Some(DialPurpose::Target), "127.0.0.1", None, "loopback"),
+        );
+        let executor = |host: &str, port: u16| {
+            RouteExecutor::new(socks5_registry(host, port))
+                .with_resolver(fake.clone())
+                .with_direct_guard(guard.clone())
+        };
+
+        let route = RouteKind::SingleHop(HopSpec::new("socks", "loop.test", listener_port));
+        let err = executor("loop.test", listener_port)
+            .connect(&route, ("upstream.internal", 443))
+            .await
+            .expect_err("the first hop resolves to the listener");
+        assert!(
+            matches!(
+                err,
+                NetcoreError::AddressRefused {
+                    code: "listener",
+                    refused: 1,
+                    answers: 1
+                }
+            ),
+            "{err:?}"
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), listener.accept())
+                .await
+                .is_err(),
+            "the listener was dialled as a first hop"
+        );
+
+        // The same loopback address is a legitimate first hop on another port...
+        let route = RouteKind::SingleHop(HopSpec::new("socks", "proxy.test", proxy_port));
+        let session = executor("proxy.test", proxy_port)
+            .connect(&route, ("upstream.internal", 443))
+            .await
+            .expect("a local proxy is a legitimate first hop");
+        let seen_as = proxy.await.expect("join");
+        assert_eq!(
+            session
+                .resolution()
+                .first_hop
+                .as_ref()
+                .and_then(|hop| hop.local_addr),
+            Some(seen_as)
+        );
+
+        // ...and the same name as a Direct TARGET is refused as loopback.
+        let err = executor("proxy.test", proxy_port)
+            .connect(&RouteKind::Direct, ("target.test", proxy_port))
+            .await
+            .expect_err("a Direct target on loopback");
+        assert!(
+            matches!(
+                err,
+                NetcoreError::AddressRefused {
+                    code: "loopback",
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_ipv6_first_hop_literal_is_refused_under_ipv4_only_before_any_socket() {
+        let connector = Arc::new(ScriptedConnector::new(Script::NOW));
+        let executor = RouteExecutor::new(socks5_registry("2001:db8::9", 1080))
+            .with_connector(connector.clone())
+            .with_address_families(AddressFamilies::Ipv4Only);
+        let route = RouteKind::SingleHop(HopSpec::new("socks", "2001:db8::9", 1080));
+        let err = executor
+            .connect(&route, ("upstream.internal", 443))
+            .await
+            .expect_err("an IPv6 first hop under ipv4_only");
+        assert!(matches!(err, NetcoreError::FamilyDisabled), "{err:?}");
+        assert_eq!(connector.started(), []);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn extra_attempts_never_exceed_the_shared_permit_pool() {
+        const DIALS: usize = 4;
+        // (pool, the most connects that may be in flight at once). Each dial has
+        // eight hanging candidates and a 3 s budget, so every attempt that can
+        // start does: one first attempt per dial, plus whatever the pool allows.
+        for (pool, expected) in [(0, DIALS), (3, DIALS + 3), (DIAL_EXTRA_PERMITS, DIALS * 8)] {
+            let answers: Vec<SocketAddr> = (1..=8u8)
+                .map(|n| SocketAddr::from(([192, 0, 2, n], 443)))
+                .collect();
+            let connector = Arc::new(ScriptedConnector::new(Script::Hang));
+            let executor = Arc::new(
+                RouteExecutor::new(AdapterRegistry::new())
+                    .with_resolver(CountingResolver::answering(answers))
+                    .with_connector(connector.clone())
+                    .with_max_extra_attempts(pool)
+                    .with_connect_timeout(Duration::from_secs(3)),
+            );
+            let dials: Vec<_> = (0..DIALS)
+                .map(|i| {
+                    let executor = Arc::clone(&executor);
+                    tokio::spawn(async move {
+                        let host = format!("name-{i}.test");
+                        executor
+                            .connect(&RouteKind::Direct, (host.as_str(), 443))
+                            .await
+                            .map(|_| ())
+                    })
+                })
+                .collect();
+            for dial in dials {
+                let err = dial.await.expect("join").expect_err("every address hangs");
+                assert_eq!(err.code(), "NETCORE_TIMEOUT", "pool {pool}: {err:?}");
+            }
+            assert_eq!(
+                connector.max_live(),
+                expected,
+                "pool {pool}: connects in flight at once across {DIALS} dials"
+            );
+            until("the sockets closing and the permits coming back", || {
+                connector.live() == 0 && executor.extra_attempts.available_permits() == pool
+            })
+            .await;
+        }
     }
 }

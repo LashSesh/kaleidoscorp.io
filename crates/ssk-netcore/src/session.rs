@@ -76,6 +76,17 @@ pub struct SessionResolution {
     pub first_hop: Option<DialResolution>,
 }
 
+/// What a failed dial had tried when it failed, for the ledger: which
+/// addresses a connect was started for. Carried by
+/// [`crate::NetcoreError::DialFailed`] around the real error.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DialAttempts {
+    /// How many distinct addresses the resolver gave (after normalisation).
+    pub answers: u8,
+    /// Every address a connect was started for, in start order.
+    pub attempted: Vec<SocketAddr>,
+}
+
 /// A live egress connection produced by [`crate::RouteExecutor`]: the boxed
 /// real transport plus a truthful record of every adapter it actually
 /// traversed, in traversal order. This `chain` is the evidence a caller

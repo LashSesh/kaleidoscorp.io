@@ -16,6 +16,7 @@
 //! reflects a real attempt that really happened on the wire.
 
 mod authority;
+mod connector;
 mod data_plane;
 mod direct;
 mod dns;
@@ -28,13 +29,17 @@ mod session;
 mod socks5;
 mod tls;
 
+pub use connector::{Connected, OsConnector, TcpConnector};
 pub use data_plane::{BoxFuture, DataPlane, NetcoreDataPlane};
+pub use direct::{AddrRefusal, AddressFamilies, DialPurpose, DirectAddrGuard, DIAL_EXTRA_PERMITS};
 pub use dns::RecordType;
 pub use error::NetcoreError;
 pub use executor::{AdapterRegistry, RouteExecutor};
 pub use probe::{ProbeReport, ProbeStatus};
 pub use resolve::{is_resolvable_name, NameResolver, OsResolver};
-pub use session::{DialResolution, EgressSession, ResolutionMode, SessionResolution, Transport};
+pub use session::{
+    DialAttempts, DialResolution, EgressSession, ResolutionMode, SessionResolution, Transport,
+};
 
 #[cfg(test)]
 mod tests {
@@ -81,6 +86,44 @@ mod tests {
             .expect("a Direct route must really connect");
         assert_eq!(session.chain(), &[AdapterKind::Direct]);
         accept.await.expect("join").expect("accept");
+    }
+
+    #[test]
+    fn data_plane_reports_whether_direct_names_are_guarded() {
+        use crate::direct::fakes::RecordingGuard;
+
+        let plain = NetcoreDataPlane::new(std::sync::Arc::new(RouteExecutor::new(
+            AdapterRegistry::new(),
+        )));
+        assert!(
+            !plain.guards_direct_names(),
+            "an executor with no guard says it guards names"
+        );
+        let guarded = NetcoreDataPlane::new(std::sync::Arc::new(
+            RouteExecutor::new(AdapterRegistry::new())
+                .with_direct_guard(std::sync::Arc::new(RecordingGuard::default())),
+        ));
+        assert!(guarded.guards_direct_names());
+
+        // A data plane that does not say, says no.
+        struct Silent;
+        impl DataPlane for Silent {
+            fn probe_route<'a>(
+                &'a self,
+                _route: &'a RouteKind,
+                _target: (&'a str, u16),
+            ) -> BoxFuture<'a, ProbeReport> {
+                Box::pin(async { ProbeReport::down("never probed") })
+            }
+
+            fn connect_route<'a>(
+                &'a self,
+                _admission: ssk_netadmin::admission::AdmissionToken,
+            ) -> BoxFuture<'a, Result<EgressSession, NetcoreError>> {
+                Box::pin(async { Err(NetcoreError::NoRoute("never dialled".into())) })
+            }
+        }
+        assert!(!Silent.guards_direct_names());
     }
 
     #[tokio::test]

@@ -481,7 +481,7 @@ sskd (ssk-daemon)
 
 | Adapter | Protocol | Real execution |
 |---------|---------|---------|
-| `DirectAdapter` | Raw TCP | `ssk-netcore::direct` — real `TcpStream::connect` |
+| `DirectAdapter` | Raw TCP | `ssk-netcore::direct`, through `ssk-netcore::connector` — real `TcpStream::connect` |
 | `Socks5Adapter` | SOCKS5 | `ssk-netcore::socks5` — real RFC 1928/1929 client handshake |
 | `HttpConnectAdapter` | HTTP CONNECT tunnel | `ssk-netcore::http_connect` — real request/response handshake |
 | `TlsTunnelAdapter` | TLS-wrapped tunnel with SNI override | `ssk-netcore::tls` — real `rustls` handshake, OS-native trust store; mTLS client-cert wiring exists but has no config source yet |

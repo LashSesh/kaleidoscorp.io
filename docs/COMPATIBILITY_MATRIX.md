@@ -222,3 +222,36 @@ connect limit and tried the answers in turn. What a user can now see:
 `EgressSession::resolution()` (library API of `ssk-netcore`, not a wire type) says how
 each dial got its address. No wire, ledger or configuration format changed: the codes
 above are values of the existing `code` string of the activation error.
+
+## Dial order for Direct names (2026-10-07)
+
+When `sskd` dials a host NAME itself, the destination of a `Direct` route
+(`ssk activate --dest name:port`) or the `host` of an adapter that is a name, it no
+longer tries the addresses of the answer one after another in the resolver's order. It
+now starts with an IPv4 address and alternates the families (IPv4, IPv6, IPv4, ...,
+keeping each family's order), starts the next address 250 ms after the previous one
+started, or at once when the previous one failed, and keeps the first connection that is
+established; the others are closed. The name is still looked up exactly once. What a user
+can now see:
+
+* A name with several addresses can connect through a later one while an earlier one is
+  silent. Earlier builds spent the whole 10 s connect limit on a blackholed first address
+  and never tried the rest. The limit is now one budget for all attempts of the dial,
+  measured from the first attempt; `NETCORE_TIMEOUT` still means that budget ended.
+* On a host with both families the connection now usually goes to an IPv4 address even
+  where the resolver lists IPv6 first. An address that is only reachable over IPv6 is
+  still tried (the activation path does not filter families).
+* At most 8 addresses are tried (the first 32 were kept before); at most 64 attempts
+  beyond the first of a dial can be in flight at once across all dials of the daemon, so
+  a dial that finds none free starts its next address when an earlier one has failed.
+  `NETCORE_CONNECTION_REFUSED` is still reported only when every address tried refused.
+* `ssk-netcore` (a library, not a wire type) gains the seams the local proxy will use: an
+  address guard that can refuse a whole answer, an address-family filter, and a connector
+  through which every dial opens its socket. The activation path installs neither guard
+  nor filter, so the two new `NetcoreError` variants that belong to them,
+  `NETCORE_ADDR_REFUSED` and `NETCORE_FAMILY_DISABLED`, cannot occur there; a third,
+  `DialFailed`, wraps the real error of a name dial that started a connect and reports its
+  `code` and text unchanged. A Rust caller that matches `NetcoreError` exhaustively has to
+  handle the new variants.
+
+No wire, ledger or configuration format changed.

@@ -17,8 +17,9 @@
 //! # What these tests prove, and what they do not
 //!
 //! They read source and the resolved dependency graph. They prove that the
-//! code which dials, `ssk-netcore`'s `direct.rs` and the executor that calls
-//! it, contains no call that could bind or steer a socket, and that no
+//! code which dials, `ssk-netcore`'s `direct.rs`, the `connector.rs` that
+//! creates the only socket of a dial and the executor that calls them,
+//! contains no call that could bind or steer a socket, and that no
 //! dependency or `unsafe` could add one behind its back. They do NOT show what
 //! the operating system then did with a socket: that is the route-flip test of
 //! C-CO1b on Linux, and on Windows only the manual run of ACCEPT-5 (24.2).
@@ -144,7 +145,7 @@ fn dial_path_files() -> Vec<PathBuf> {
         .into_iter()
         .filter(|path| path.file_name().is_some_and(|n| n != "dns.rs"))
         .collect();
-    for required in ["direct.rs", "executor.rs"] {
+    for required in ["direct.rs", "connector.rs", "executor.rs"] {
         assert!(
             files.contains(&src.join(required)),
             "{} is not among the files this test scans; the dial path moved",
@@ -497,9 +498,11 @@ fn first_hop_and_direct_share_one_dial_function() {
     let executor = non_test_text(&executor);
 
     // The destination of a Direct route and the first hop of a chain are the
-    // only two dials the executor makes. After C-N3 both go through the
-    // function that takes a host that may be a name; the literal-only one is
-    // reached through it.
+    // only two dials the executor makes. Both go through the function that
+    // takes a host that may be a name (C-N3); since C-N4 the literal-only
+    // `connect_tcp` is gone, because a literal is dialled through the same
+    // connector as a pinned answer. Both needles stay, so that bringing a
+    // second dial function back is still seen.
     let mut calls = occurrences(executor, "connect_host(");
     calls.extend(occurrences(executor, "connect_tcp("));
     calls.sort();
@@ -529,23 +532,25 @@ fn first_hop_and_direct_share_one_dial_function() {
         }
     }
     assert_eq!(
-        defined, 2,
-        "connect_tcp and connect_host are each declared once, in direct.rs"
+        defined, 1,
+        "connect_host is declared once, in direct.rs, and connect_tcp is gone: a second dial \
+         function would be a second way to reach a socket that the connector seam does not see"
     );
     dials.sort();
     assert_eq!(
         dials,
         [
-            "direct.rs: connect_host calls connect_tcp(",
             "executor.rs: connect_chain calls connect_host(",
             "executor.rs: connect_direct calls connect_host(",
         ],
-        "both of the executor's dials must go through connect_host (connect_tcp alone would hand a \
-         name to the OS resolver with no bound), and nothing else may call either function"
+        "both of the executor's dials must go through connect_host (a name handed to the OS \
+         resolver with no bound, or a socket made outside the connector, is what this forbids), \
+         and nothing else may call it"
     );
 
-    // The sockets themselves: the literal path and the pinned-address path of
-    // direct.rs. `dns.rs` belongs to the DnsOverride resolver nothing calls.
+    // The sockets themselves: one call, in the connector. Literals and pinned
+    // answers both reach it through `TcpConnector`. `dns.rs` belongs to the
+    // DnsOverride resolver nothing calls.
     let mut sockets = Vec::new();
     for path in rust_files(&src, &[]) {
         let file = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
@@ -563,10 +568,143 @@ fn first_hop_and_direct_share_one_dial_function() {
     sockets.sort();
     assert_eq!(
         sockets,
-        [
-            "direct.rs: connect_in_order uses TcpStream::connect(",
-            "direct.rs: connect_tcp uses TcpStream::connect(",
-        ],
-        "a socket is created somewhere other than the two functions of direct.rs"
+        ["connector.rs: open uses TcpStream::connect("],
+        "a socket is created somewhere other than OsConnector::open in connector.rs"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The connector: the type-level layer of CO-1.
+// ---------------------------------------------------------------------------
+
+/// What `connector.rs` must look like for "a dial can ask for a destination and
+/// nothing else" to be true. Empty means it does.
+///
+/// `TcpConnector::connect` takes a `SocketAddr`: there is no parameter through
+/// which the executor could ask for an interface or a source address. What is
+/// left to check is that the one implementation that makes sockets, the OS
+/// connector, does nothing with the socket but connect it, and that no other
+/// call in the file creates one.
+fn connector_violations(source: &str) -> Vec<String> {
+    const SIGNATURE: &str =
+        "fn connect<'a>(&'a self, addr: SocketAddr) -> BoxFuture<'a, io::Result<Connected>>;";
+    // Each of these makes, adopts or configures a socket in some other way.
+    const OTHER_SOCKETS: &[&str] = &[
+        "TcpSocket",
+        "TcpListener",
+        "UdpSocket",
+        "socket2",
+        "from_std",
+        "from_raw",
+        "std::net::TcpStream",
+        "std::net::TcpListener",
+    ];
+    let text = non_test_text(source);
+    let mut found = Vec::new();
+
+    let connects = occurrences(text, "TcpStream::connect(");
+    if connects != ["open"] {
+        found.push(format!(
+            "TcpStream::connect( is used by {connects:?}; expected exactly the function `open`"
+        ));
+    }
+    for needle in OTHER_SOCKETS {
+        if !occurrences(text, needle).is_empty() {
+            found.push(format!("`{needle}` appears in the connector"));
+        }
+    }
+    if !text.contains(SIGNATURE) {
+        found.push(format!(
+            "the trait method is no longer exactly `{SIGNATURE}`: a dial must be able to ask for a \
+             destination and nothing else"
+        ));
+    }
+
+    // The body of `open` is the connect call and nothing else.
+    let mut body = Vec::new();
+    let mut inside = false;
+    for line in text.lines() {
+        if inside {
+            if line == "    }" {
+                break;
+            }
+            let code = line.trim();
+            if !code.is_empty() && !code.starts_with("//") {
+                body.push(code.to_owned());
+            }
+        } else if declared_fn(line) == Some("open") {
+            inside = true;
+        }
+    }
+    if body != ["TcpStream::connect(addr).await"] {
+        found.push(format!(
+            "the body of `open` is {body:?}; it must be exactly `TcpStream::connect(addr).await`"
+        ));
+    }
+    found
+}
+
+#[test]
+fn os_connector_body_is_only_tcpstream_connect() {
+    // A scan that cannot fail proves nothing: this shape passes, and each edit
+    // of it that the design forbids is reported.
+    let good = "\
+pub trait TcpConnector: Send + Sync + 'static {
+    fn connect<'a>(&'a self, addr: SocketAddr) -> BoxFuture<'a, io::Result<Connected>>;
+}
+
+impl OsConnector {
+    pub(crate) async fn open(addr: SocketAddr) -> io::Result<TcpStream> {
+        TcpStream::connect(addr).await
+    }
+}
+";
+    assert_eq!(connector_violations(good), Vec::<String>::new());
+    let edits: &[(&str, &str)] = &[
+        (
+            "TcpStream::connect(addr).await",
+            "let socket = TcpSocket::new_v4()?;\n        socket.connect(addr).await",
+        ),
+        (
+            "TcpStream::connect(addr).await",
+            "let first = TcpStream::connect(addr).await?;\n        drop(first);\n        TcpStream::connect(addr).await",
+        ),
+        (
+            "TcpStream::connect(addr).await",
+            "TcpStream::connect((addr.ip(), addr.port())).await",
+        ),
+        (
+            "TcpStream::connect(addr).await",
+            "let stream = TcpStream::connect(addr).await?;\n        stream.set_nodelay(true)?;\n        Ok(stream)",
+        ),
+        (
+            "fn connect<'a>(&'a self, addr: SocketAddr)",
+            "fn connect<'a>(&'a self, addr: SocketAddr, device: &str)",
+        ),
+        (
+            "pub(crate) async fn open(",
+            "pub(crate) async fn dial(",
+        ),
+    ];
+    for (from, to) in edits {
+        assert!(good.contains(from), "the sample lost {from:?}");
+        let bad = good.replacen(from, to, 1);
+        assert!(
+            !connector_violations(&bad).is_empty(),
+            "the scan accepts the connector after {from:?} became {to:?}"
+        );
+    }
+    let adopted = format!("{good}\nfn adopt(s: std::net::TcpStream) {{}}\n");
+    assert!(!connector_violations(&adopted).is_empty());
+
+    // And on the real file.
+    let src = netcore_src().join("connector.rs");
+    let violations = connector_violations(&read(&src));
+    assert!(
+        violations.is_empty(),
+        "{} must only hand destinations to the OS and nothing else (CO-1, \
+         docs/M2_LOCAL_INGRESS_DESIGN.md 24.2.1):\n  {}",
+        shown(&src),
+        violations.join("\n  ")
     );
 }
