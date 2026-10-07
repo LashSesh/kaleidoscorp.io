@@ -54,6 +54,9 @@ async fn bundled_webview_requests_status_through_the_real_native_command() {
             audit_head: None,
             version: "desktop-smoke-peer".into(),
             last_error: None,
+            // The fields a newer daemon adds are not what this smoke peer is
+            // about; `Default` is a daemon that reports none of them.
+            ..Default::default()
         });
         ssk_ipc::framing::write_frame(&mut server, &response)
             .await

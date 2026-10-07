@@ -9,9 +9,13 @@ use serde::{Deserialize, Serialize};
 /// Defined here rather than in `ssk-daemon` so both `ssk-cli` and a future
 /// `ssk-tauri-bridge` can share this wire type without depending on the
 /// daemon binary crate (`ssk-daemon` depends on `ssk-ipc`, never the reverse).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// `Default` is `Inactive`, the state of a daemon that has done nothing; it lets
+/// `StatusDto` derive `Default`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DaemonState {
     /// Protection off, daemon idle.
+    #[default]
     Inactive,
     /// Bringing protection up.
     Activating,

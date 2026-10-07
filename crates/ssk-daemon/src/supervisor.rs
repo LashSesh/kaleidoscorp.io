@@ -8,8 +8,8 @@ use std::time::Duration;
 use ssk_ipc::server::{BoxFuture, CommandHandler, Request, Response};
 use ssk_ipc::{
     AdapterHealthSummaryDto, AuditEntryDto, DaemonState, DoctorCheckDto, DoctorReportDto,
-    ExplainResponse, IpcError, PeerIdentity, ProfileSummaryDto, RouteTraceDto, StatusDto,
-    VerifyAuditChainResponse,
+    ExplainResponse, IngressStatusDto, IpcError, PeerIdentity, ProfileSummaryDto, RouteTraceDto,
+    StatusDto, VerifyAuditChainResponse, IPC_PROTOCOL_VERSION,
 };
 use ssk_netadmin::audit::AuditOutcome;
 use ssk_netadmin::{FlowDescriptor, FlowRecord, ForensicEntry, ProtocolKind, RiskLevel, RouteKind};
@@ -53,6 +53,19 @@ const STATUS_LOCK_WAIT: Duration = Duration::from_millis(100);
 /// instead of queueing it: it needs the state an activation dial holds, or two
 /// mutating requests are already in flight. Retriable by definition.
 const DAEMON_BUSY: &str = "DAEMON_BUSY";
+
+/// Machine code for a request about the local proxy (arm, disarm, read its
+/// ledger) that this daemon cannot serve because there is no proxy: the answer
+/// of every `SetIngress` and `GetIngressAudit` until the listener exists.
+/// Nothing was changed.
+const INGRESS_DISABLED: &str = "INGRESS_DISABLED";
+
+/// What the `notice` of an ingress status says, word for word (design 6.1.1): the
+/// coverage of the proxy and what it leaves out. It makes no claim of
+/// protection, and a test keeps the words the product never uses out of it.
+/// `ingress/types.rs` takes this definition over together with the rest of the
+/// vocabulary, and this copy goes when the stub below does.
+const INGRESS_COVERAGE_NOTICE: &str = "Covers only applications that are configured to use this proxy. Everything else is not covered. Names an application resolves itself are not covered. Names this proxy resolves for direct routes are resolved by the operating system.";
 
 /// How many requests that change the daemon's state (`ActivateProfile`,
 /// `Deactivate`) may be in flight at once: the one that holds the mutex, and
@@ -331,6 +344,8 @@ impl Inner {
             audit_head,
             version: env!("CARGO_PKG_VERSION").to_string(),
             last_error,
+            protocol: IPC_PROTOCOL_VERSION,
+            ingress: Some(disabled_ingress_status()),
         }
     }
 }
@@ -406,7 +421,45 @@ fn activating_status(view: KillSwitchView) -> StatusDto {
         audit_head: None,
         version: env!("CARGO_PKG_VERSION").to_string(),
         last_error,
+        protocol: IPC_PROTOCOL_VERSION,
+        // Built here, now, like the rest of this answer: the proxy's block never
+        // needs the mutex an activation holds, and a copy kept from before the
+        // dial could say `armed` about a proxy that has since been disarmed.
+        ingress: Some(disabled_ingress_status()),
     }
+}
+
+/// The local proxy's block while there is no proxy: the daemon opens no listener
+/// yet, whatever the configuration says. A daemon of protocol 1 never answers
+/// `ingress: None` (that would say "predates the proxy"), so a proxy that is off
+/// is this block, and everything it does not know stays at the unknown default.
+/// It claims no coverage and no activity, and nothing in it names a VPN or
+/// anything else that is not this daemon's own fact.
+///
+/// Both literals of [`StatusDto`] call it; `status_answer` swaps it for the real
+/// snapshot when the proxy exists.
+fn disabled_ingress_status() -> IngressStatusDto {
+    IngressStatusDto {
+        state: "disabled".into(),
+        coverage: "none".into(),
+        system_wide: false,
+        notice: INGRESS_COVERAGE_NOTICE.into(),
+        ..IngressStatusDto::default()
+    }
+}
+
+/// The refusal of a request about a proxy that does not exist. Not retriable:
+/// asking again does not create it, so the one next step offered is to read the
+/// status.
+fn ingress_disabled() -> IpcError {
+    IpcError::new(
+        "Config",
+        INGRESS_DISABLED,
+        "the local proxy is off in this daemon; nothing was changed",
+    )
+    .with_next_step(
+        "`ssk status` reports the proxy under `ingress`; `disabled` means no listener exists.",
+    )
 }
 
 /// A request turned away because an activation is in flight and the state it
@@ -1180,14 +1233,20 @@ impl CommandHandler for Supervisor {
                             return Response::Err(busy_during_activation());
                         }
                     };
+                    let profile_source = if held_profile.is_some() {
+                        "active_session"
+                    } else {
+                        "default_profile"
+                    };
                     let profile = held_profile
                         .as_deref()
                         .unwrap_or(&self.routing.default_profile);
+                    let app_id = req.app_id.as_deref().unwrap_or("unknown-app");
                     let flow = FlowRecord::new(
                         "trace",
                         0,
                         FlowDescriptor::new(
-                            req.app_id.as_deref().unwrap_or("unknown-app"),
+                            app_id,
                             &req.dest_host,
                             req.dest_port,
                             parse_protocol(&req.protocol),
@@ -1204,10 +1263,21 @@ impl CommandHandler for Supervisor {
                                 RouteKind::OpenVpn { adapter_id, .. } => vec![adapter_id.clone()],
                                 _ => vec![],
                             };
+                            // Which inputs this preview used, so that a client
+                            // can tell it from the one it asked for. The only
+                            // evaluation is the activation's, and `profile_id`
+                            // of the request is not acted on yet: the answer
+                            // says which profile it did use.
                             Response::RouteTrace(RouteTraceDto {
                                 route: candidate.route,
                                 hops,
                                 requires_attestation: candidate.requires_attestation,
+                                profile_used: Some(profile.to_string()),
+                                profile_source: Some(profile_source.to_string()),
+                                evaluated_as: Some("legacy_activation".to_string()),
+                                app_id_used: Some(app_id.to_string()),
+                                refusal: None,
+                                guards_skipped: Vec::new(),
                             })
                         }
                         Err(err) => Response::Err(err.into()),
@@ -1316,6 +1386,14 @@ impl CommandHandler for Supervisor {
                     // acknowledges the subscription request.
                     Response::Ack
                 }
+                // The proxy does not exist yet, so there is nothing to arm, to
+                // disarm or to read. Both directions are refused, the disarm
+                // too: no client sends the request before the proxy is wired,
+                // and the real handler answers a disarm of a disabled proxy
+                // with the status. Neither touches `Inner`, so neither waits
+                // for an activation.
+                Request::SetIngress(_req) => Response::Err(ingress_disabled()),
+                Request::GetIngressAudit { .. } => Response::Err(ingress_disabled()),
             }
         })
     }
@@ -1421,6 +1499,22 @@ fn explain_code(code: &str) -> ExplainResponse {
             vec![
                 "Retry the request once the activation has finished; a dial is bounded by the daemon's activation deadline.",
                 "Use `ssk status` to see whether an activation is in progress.",
+            ],
+        ),
+        INGRESS_DISABLED => (
+            "The local proxy is off.",
+            "The request was about the local proxy (arming it, disarming it or reading its ledger) and this daemon has no proxy: its configuration section is off, and a build that has no listener yet treats every configuration as off. Nothing was changed, and no listener, record or session was created.",
+            vec![
+                "Read `ingress.state` in `ssk status`: `disabled` means there is no listener.",
+                "Enabling the proxy needs a daemon build that includes it and `ingress.enabled: true` in the configuration, then a restart.",
+            ],
+        ),
+        "DAEMON_TOO_OLD" => (
+            "The running daemon is older than this client.",
+            "A client that needs a feature checks the IPC protocol the daemon announces in its status before it sends the request. A running sskd keeps executing the binary it was started from, so a daemon that was started before the client was installed still speaks the older protocol. Nothing was sent and nothing was changed.",
+            vec![
+                "Restart sskd so that it runs the installed binary.",
+                "Use `ssk status` to see which protocol the running daemon reports.",
             ],
         ),
         "NETCORE_TIMEOUT" => (
@@ -1932,6 +2026,190 @@ mod tests {
         }
     }
 
+    /// Every status says which IPC protocol this daemon speaks and carries an
+    /// ingress block. While no listener exists the block says so, and it is
+    /// still present: `None` would mean "a daemon that predates the proxy", which
+    /// is the one thing this build is not. Nothing in it claims coverage.
+    #[tokio::test]
+    async fn status_reports_protocol_and_a_disabled_ingress_block() {
+        fn assert_disabled(status: &StatusDto, what: &str) {
+            assert_eq!(status.protocol, ssk_ipc::IPC_PROTOCOL_VERSION, "{what}");
+            let ingress = status
+                .ingress
+                .as_ref()
+                .unwrap_or_else(|| panic!("{what}: a daemon of this build never answers None"));
+            assert_eq!(ingress.state, "disabled", "{what}");
+            assert_eq!(ingress.coverage, "none", "{what}");
+            assert!(!ingress.system_wide, "{what}");
+            assert!(
+                ingress.listen.is_none() && ingress.armed_profile.is_none(),
+                "{what}"
+            );
+            assert_eq!(
+                ingress.counters.admitted + ingress.counters.denied,
+                0,
+                "{what}"
+            );
+            assert!(ingress.last_error.is_none(), "{what}");
+            // The notice is the one fixed sentence, and it is none of the
+            // claims the proxy must never make (design 10.7).
+            assert_eq!(ingress.notice, INGRESS_COVERAGE_NOTICE, "{what}");
+            let notice = ingress.notice.to_lowercase();
+            for word in [
+                "protected",
+                "protection",
+                "secure",
+                "system-wide",
+                "system wide",
+                "all traffic",
+                "vpn",
+                "tunnel",
+                "anonym",
+            ] {
+                assert!(!notice.contains(word), "{what}: the notice says `{word}`");
+            }
+        }
+
+        let (sup, _dir) = supervisor_with(real_data_plane());
+        match call(&sup, Request::GetStatus).await {
+            Response::Status(status) => assert_disabled(&status, "idle"),
+            other => panic!("unexpected response: {other:?}"),
+        }
+
+        // A daemon whose configuration is invalid still answers the block: the
+        // proxy is as off there as anywhere.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let invalid = Supervisor::new(
+            dir.path().join("audit.json"),
+            real_data_plane(),
+            Box::new(crate::killswitch::NoProvider),
+            Err(DaemonConfigError::UnknownFormat("daemon.ini".into())),
+        );
+        match call(&invalid, Request::GetStatus).await {
+            Response::Status(status) => {
+                assert_eq!(status.state, DaemonState::ConfigInvalid);
+                assert_disabled(&status, "config invalid");
+            }
+            other => panic!("unexpected response: {other:?}"),
+        }
+
+        // And so does the answer built around an activation dial, which is a
+        // different literal.
+        assert_disabled(&activating_status(KillSwitchView::NotEngaged), "activating");
+        assert_eq!(
+            activating_status(KillSwitchView::NotEngaged).state,
+            DaemonState::Activating
+        );
+    }
+
+    /// The request that would arm or disarm the proxy, and the one that would
+    /// read its ledger, are refused while there is no proxy: with a code that
+    /// says so, no change, no ledger entry and no state change.
+    #[tokio::test]
+    async fn set_ingress_is_refused_while_the_section_is_off() {
+        let (sup, _dir) = supervisor_with(real_data_plane());
+        let before = audit_entry_count(&sup).await;
+
+        for armed in [true, false] {
+            let request = Request::SetIngress(ssk_ipc::SetIngressRequest {
+                armed,
+                profile_id: None,
+                client: Some("cli".into()),
+                expect_profile: None,
+                expect_routing_digest: None,
+            });
+            match call(&sup, request).await {
+                Response::Err(error) => {
+                    assert_eq!(error.code, INGRESS_DISABLED, "armed = {armed}");
+                    assert_eq!(error.class, "Config");
+                    assert!(!error.retriable, "the proxy does not appear by retrying");
+                    assert!(
+                        error.message.contains("nothing was changed"),
+                        "{}",
+                        error.message
+                    );
+                }
+                other => panic!("armed = {armed}: a refusal was expected, got {other:?}"),
+            }
+        }
+        match call(
+            &sup,
+            Request::GetIngressAudit {
+                limit: 10,
+                before_seq: None,
+                verify: false,
+            },
+        )
+        .await
+        {
+            Response::Err(error) => assert_eq!(error.code, INGRESS_DISABLED),
+            other => panic!("there is no ingress ledger to read: {other:?}"),
+        }
+
+        // Nothing moved: the same state, the same block, no new ledger entry.
+        assert_eq!(sup.current_state().await, DaemonState::Inactive);
+        assert_eq!(audit_entry_count(&sup).await, before);
+        match call(&sup, Request::GetStatus).await {
+            Response::Status(status) => {
+                assert_eq!(status.ingress.expect("a block").state, "disabled");
+            }
+            other => panic!("unexpected response: {other:?}"),
+        }
+    }
+
+    /// A code this daemon puts on the wire is one `ssk explain` can say
+    /// something about, and a client that learns `DAEMON_TOO_OLD` can look it up
+    /// in a daemon that is new enough to know it.
+    #[test]
+    fn the_codes_of_the_wire_additions_are_explainable() {
+        for code in [INGRESS_DISABLED, "DAEMON_TOO_OLD"] {
+            let explained = explain_code(code);
+            assert!(
+                !explained.summary.starts_with("Unknown error code"),
+                "{code} has no explanation: {explained:?}"
+            );
+            assert!(!explained.next_steps.is_empty(), "{code}");
+        }
+    }
+
+    /// The preview names the profile and the flow context it was computed for
+    /// (design 11.7). Only the legacy evaluation exists, so that is what it says.
+    #[tokio::test]
+    async fn trace_route_reports_the_profile_it_used_and_how_it_chose_it() {
+        let trace = |app_id: Option<&str>| {
+            Request::TraceRoute(ssk_ipc::RouteTraceRequest {
+                app_id: app_id.map(str::to_string),
+                dest_host: "127.0.0.1".into(),
+                dest_port: 443,
+                protocol: "tcp".into(),
+                risk: "low".into(),
+                profile_id: None,
+            })
+        };
+        let (sup, _dir) = supervisor_with(real_data_plane());
+        match call(&sup, trace(None)).await {
+            Response::RouteTrace(answer) => {
+                assert_eq!(answer.profile_used.as_deref(), Some("default"));
+                assert_eq!(answer.profile_source.as_deref(), Some("default_profile"));
+                assert_eq!(answer.evaluated_as.as_deref(), Some("legacy_activation"));
+                assert_eq!(answer.app_id_used.as_deref(), Some("unknown-app"));
+                assert_eq!(answer.refusal, None);
+                assert!(answer.guards_skipped.is_empty());
+            }
+            other => panic!("unexpected response: {other:?}"),
+        }
+
+        sup.inner.lock().await.active_profile = Some("default".into());
+        match call(&sup, trace(Some("browser"))).await {
+            Response::RouteTrace(answer) => {
+                assert_eq!(answer.profile_used.as_deref(), Some("default"));
+                assert_eq!(answer.profile_source.as_deref(), Some("active_session"));
+                assert_eq!(answer.app_id_used.as_deref(), Some("browser"));
+            }
+            other => panic!("unexpected response: {other:?}"),
+        }
+    }
+
     #[tokio::test]
     async fn audit_chain_verifies_after_activation_and_is_not_vacuous() {
         let (sup, _dir) = supervisor_with(real_data_plane());
@@ -2288,6 +2566,7 @@ mod tests {
                 dest_port: 443,
                 protocol: "tcp".into(),
                 risk: "low".into(),
+                profile_id: None,
             }),
         )
         .await;
@@ -2317,6 +2596,7 @@ mod tests {
                 dest_port: 443,
                 protocol: "tcp".into(),
                 risk: "low".into(),
+                profile_id: None,
             }),
         )
         .await;

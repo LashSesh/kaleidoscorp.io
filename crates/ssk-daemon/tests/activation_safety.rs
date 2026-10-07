@@ -156,6 +156,7 @@ async fn configured_openvpn_is_visible_but_fails_explicitly_without_direct_fallb
             dest_port: 443,
             protocol: "tcp".into(),
             risk: "low".into(),
+            profile_id: None,
         }))
         .await
         .unwrap();
@@ -1244,6 +1245,7 @@ fn trace_request() -> Request {
         dest_port: 443,
         protocol: "tcp".into(),
         risk: "low".into(),
+        profile_id: None,
     })
 }
 
@@ -1395,6 +1397,34 @@ async fn status_is_served_while_mutators_queue_on_ipc() {
         (14, 1),
         "the activation and one Deactivate are the two mutators; the other 14 are refused"
     );
+}
+
+/// The status that is built around a dial is a different literal from the idle
+/// one. It says which protocol the daemon speaks and carries the proxy's block
+/// all the same, so that a client does not take a daemon that is busy dialing for
+/// one that predates the proxy (`ingress: None`, protocol 0).
+#[cfg(unix)]
+#[tokio::test]
+async fn a_status_read_during_a_silent_activation_carries_protocol_and_the_ingress_block() {
+    let mut dial = silent_dial().await;
+    let served = serve(std::sync::Arc::clone(&dial.supervisor)).await;
+    let (activation, held) = start_served_silent_activation(&served, &mut dial).await;
+
+    match call_within(&served, Request::GetStatus, Duration::from_secs(1)).await {
+        Some(Response::Status(status)) => {
+            assert_eq!(status.state, DaemonState::Activating);
+            assert_eq!(status.protocol, ssk_ipc::IPC_PROTOCOL_VERSION);
+            let ingress = status
+                .ingress
+                .expect("a daemon of protocol 1 never answers `ingress: None`");
+            assert_eq!(ingress.state, "disabled");
+            assert_eq!(ingress.coverage, "none");
+        }
+        Some(other) => panic!("GetStatus did not answer with a status: {other:?}"),
+        None => panic!("GetStatus was not served within 1 s of the dial starting"),
+    }
+
+    end_the_dial(activation, held).await;
 }
 
 /// The gate holds two: the activation that is dialing and one request behind

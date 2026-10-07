@@ -464,3 +464,73 @@ it refused loads. The schema is written by hand and is not a complete descriptio
 parser: where it is looser or stricter than `sskd` (a name that is not a valid host, an
 empty `system.name`, a repeated interop capability) the difference is listed in
 `crates/ssk-config/tests/schema_contract.rs`, and a new one fails the build.
+
+## IPC compatibility (protocol 1) (2026-10-07)
+
+`StatusDto` gains `protocol` (the IPC protocol the daemon speaks; this build sends
+`ssk_ipc::IPC_PROTOCOL_VERSION`, which is 1) and `ingress` (the local proxy's block,
+below). `FlowSummaryDto` gains optional fields (`peer`, `peer_verified`, `route`,
+`matched_rule`, `reason_code`, `bytes_up`, `bytes_down`, `started_ms`, `ended_ms`,
+`audit_pending_seq`, `audit_result_seq`, `front_end`, `egress_local`,
+`destination_form`). `RouteTraceRequest` gains the optional `profile_id`, and
+`RouteTraceDto` the optional `profile_used`, `profile_source`, `evaluated_as`,
+`app_id_used`, `refusal` and `guards_skipped`. `Request::SetIngress`,
+`Request::GetIngressAudit` and `Response::IngressAudit` are new. Protocol 0 is every
+earlier build: its status has no `protocol` key, which reads as 0. Until the first
+release tag, protocol 1 is the whole of M2 and further additions to it stay additive.
+
+**Older client, newer daemon.** Everything the client knew keeps working: the twelve
+requests of protocol 0 decode byte for byte (the frames of build `b62c4c8` are pinned in
+`crates/ssk-ipc/tests/wire_protocol0.rs`), and fields the client does not know are
+ignored. Measured with an `ssk` built before this change against a daemon built from it:
+`status`, `--json status` and `list-profiles` answer as before.
+
+**Newer client, older daemon.** An older daemon cannot decode `SetIngress` or
+`GetIngressAudit`: it closes the connection without an answer (measured against a daemon
+built before this change), which the client library reports as the retriable
+`IPC_IO_FAILED`, exactly what a crashed daemon looks like. It decodes a `TraceRoute`
+that carries `profile_id` and ignores the field, so it answers for its own choice of
+profile, which is a wrong answer and not an error. A client that needs protocol 1
+therefore reads `StatusDto.protocol` from a `GetStatus` first, which every daemon
+answers, and refuses below it with the new code `DAEMON_TOO_OLD` (class `Runtime`,
+`StatusDto::require_protocol`); it sets `profile_id` only then, and reads a preview
+whose `profile_used` is absent or another profile as "not honoured". `ingress: None`
+likewise means only "this daemon predates the proxy". A running daemon keeps executing
+the binary it was started from, so `sskd` has to be restarted after an upgrade; an older
+client sends nothing a daemon could inspect, so it cannot be warned about newer
+features.
+
+**Rules for later changes.** A new capability is a new request variant; a new field on
+an existing request is allowed only where ignoring it still yields a correct answer. No
+new variant in an enum that an older client decodes (`DaemonState`, `Response`, `Event`,
+`RouteKind`, `PolicyAction`, `AuditOutcome`) without a protocol bump and an entry here.
+`Response::IngressAudit` is the one new `Response` variant of M2; a protocol-0 client
+never receives it, because it never sends `GetIngressAudit`. New vocabularies (the
+ingress `state`, `coverage`, outcome and reason words) are strings with a documented
+closed set, and a client renders a word it does not know as unknown. No IPC type denies
+unknown fields; a test pins that for every type. `clamp_request_limits` has no catch-all
+arm any more, so a new `Request` variant does not compile until it is listed as sized or
+size-free; `GetIngressAudit.limit` is cut to 1000 like the other lists.
+
+**What this build sends.** It opens no proxy listener yet. The `ingress` block is always
+present and says `state: "disabled"`, `coverage: "none"` and `system_wide: false`, with
+a fixed notice of what the coverage would be; everything else in it is the unknown
+default (empty words, zero counters, no digests). The answer built during an activation
+carries the same block. `SetIngress` (arm or disarm) and `GetIngressAudit` answer the
+refusal `INGRESS_DISABLED` (class `Config`, not retriable, nothing changed, no ledger
+entry). `ListRecentFlows` still answers an empty list and `InspectFlow`
+`FLOW_NOT_FOUND`, so the new `FlowSummaryDto` fields are never sent. A `TraceRoute`
+answer now names the profile it used (`profile_source` is `active_session` or
+`default_profile`, `evaluated_as` is `legacy_activation`) and the application id
+(`app_id_used`); the request's `profile_id` is not acted on yet.
+
+**`ssk --json status|activate|deactivate`** prints the whole status under `state`, so
+its output gains the keys `protocol` and `ingress` (an object) there; consumers must
+ignore unknown keys. The human `ssk status` line is unchanged.
+
+**Rust API (library, not wire).** A caller that builds a `StatusDto`,
+`RouteTraceRequest` or `RouteTraceDto` with a struct literal has to name the new fields;
+`StatusDto`, `FlowSummaryDto`, the ingress types and `DaemonState` (default `Inactive`)
+implement `Default`, so `..Default::default()` is enough where a daemon that reports
+nothing else is meant. A caller that matches `Request` or `Response` exhaustively needs
+arms for the new variants.

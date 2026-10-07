@@ -9,8 +9,9 @@ use serde::{Deserialize, Serialize};
 use crate::auth::PeerIdentity;
 use crate::dto::{
     ActivateProfileRequest, AuditEntryDto, DeactivateRequest, DoctorReportDto, ExplainRequest,
-    ExplainResponse, FlowInspectionDto, FlowSummaryDto, ProfileSummaryDto, RouteTraceDto,
-    RouteTraceRequest, StatusDto, SubscribeEventsRequest, VerifyAuditChainResponse,
+    ExplainResponse, FlowInspectionDto, FlowSummaryDto, IngressAuditPageDto, ProfileSummaryDto,
+    RouteTraceDto, RouteTraceRequest, SetIngressRequest, StatusDto, SubscribeEventsRequest,
+    VerifyAuditChainResponse,
 };
 use crate::error::IpcError;
 use crate::state::Event;
@@ -25,16 +26,44 @@ pub enum Request {
     ActivateProfile(ActivateProfileRequest),
     Deactivate(DeactivateRequest),
     ListProfiles,
-    InspectFlow { flow_id: String },
+    InspectFlow {
+        flow_id: String,
+    },
     TraceRoute(RouteTraceRequest),
-    ListRecentFlows { limit: usize },
-    GetAuditEntries { limit: usize },
+    ListRecentFlows {
+        limit: usize,
+    },
+    GetAuditEntries {
+        limit: usize,
+    },
     VerifyAuditChain,
     RunDoctor,
     ExplainError(ExplainRequest),
     SubscribeEvents(SubscribeEventsRequest),
+    /// Protocol 1: arm or disarm the local proxy. A daemon that predates it
+    /// cannot decode the request and drops the connection, which is harmless;
+    /// the client reads `StatusDto::protocol` first so that it never gets there
+    /// (`StatusDto::require_protocol`).
+    SetIngress(SetIngressRequest),
+    /// Protocol 1: one page of the ingress ledger, newest first. A request of its
+    /// own and not a selector on `GetAuditEntries`, because an older daemon would
+    /// ignore the selector and answer with the other ledger as if it were this
+    /// one.
+    GetIngressAudit {
+        limit: usize,
+        #[serde(default)]
+        before_seq: Option<u64>,
+        #[serde(default)]
+        verify: bool,
+    },
 }
 
+// The proxy's block makes `Status` the one large variant (about 1.8 KB inline).
+// A response is built once per request, encoded and dropped, so the size costs
+// nothing; boxing `Status` would change a constructor that the daemon, the CLI
+// and their tests all call, and boxing the block would change the type that the
+// wire documents as `Option<IngressStatusDto>`.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Response {
     Status(StatusDto),
@@ -49,18 +78,23 @@ pub enum Response {
     Event(Event),
     Ack,
     Err(IpcError),
+    /// Protocol 1: the answer to `GetIngressAudit`. The one `Response` variant
+    /// that M2 adds: a protocol-0 client never sends that request, so it is never
+    /// sent this. No other enum an older client decodes gains a variant without a
+    /// protocol bump (`COMPATIBILITY_MATRIX.md`, "IPC compatibility").
+    IngressAudit(IngressAuditPageDto),
 }
 
 /// Upper bound the transport clamps `limit`-bearing requests to before the
 /// handler sees them.
 ///
-/// `Request::ListRecentFlows { limit }` and `Request::GetAuditEntries { limit }`
-/// carry an attacker-controlled `usize` that feeds a `Vec` allocation on the
-/// handler side. The peer is authenticated by the time this applies, so it is
-/// defence in depth rather than the boundary — but an authenticated peer is
-/// still not entitled to name an allocation size, and the response cap
-/// ([`crate::framing::MAX_RESPONSE_FRAME_LEN`]) would otherwise be reached only
-/// *after* the allocation had already happened.
+/// `Request::ListRecentFlows { limit }`, `Request::GetAuditEntries { limit }` and
+/// `Request::GetIngressAudit { limit, .. }` carry an attacker-controlled `usize`
+/// that feeds a `Vec` allocation on the handler side. The peer is authenticated
+/// by the time this applies, so it is defence in depth rather than the boundary
+/// — but an authenticated peer is still not entitled to name an allocation
+/// size, and the response cap ([`crate::framing::MAX_RESPONSE_FRAME_LEN`])
+/// would otherwise be reached only *after* the allocation had already happened.
 pub const MAX_LIST_LIMIT: usize = 1000;
 
 /// Bounds a served connection. Every field is explicit — there is no ambient
@@ -97,6 +131,12 @@ impl Default for ServeLimits {
 
 /// Clamp the attacker-controlled `limit` fields. Returns the request either
 /// unchanged or with `limit` reduced to [`MAX_LIST_LIMIT`].
+///
+/// Every variant is named, with no catch-all: the clamp exists because a peer
+/// must not choose an allocation size, and a catch-all would let the next
+/// variant that carries a size through unclamped without anyone having decided
+/// that. Adding a `Request` variant is a compile error here until it is listed
+/// either as sized (clamped) or as size-free (passed on).
 #[must_use]
 pub fn clamp_request_limits(req: Request) -> Request {
     match req {
@@ -106,7 +146,26 @@ pub fn clamp_request_limits(req: Request) -> Request {
         Request::GetAuditEntries { limit } => Request::GetAuditEntries {
             limit: limit.min(MAX_LIST_LIMIT),
         },
-        other => other,
+        Request::GetIngressAudit {
+            limit,
+            before_seq,
+            verify,
+        } => Request::GetIngressAudit {
+            limit: limit.min(MAX_LIST_LIMIT),
+            before_seq,
+            verify,
+        },
+        Request::GetStatus
+        | Request::ActivateProfile(_)
+        | Request::Deactivate(_)
+        | Request::ListProfiles
+        | Request::InspectFlow { .. }
+        | Request::TraceRoute(_)
+        | Request::VerifyAuditChain
+        | Request::RunDoctor
+        | Request::ExplainError(_)
+        | Request::SubscribeEvents(_)
+        | Request::SetIngress(_) => req,
     }
 }
 
@@ -829,6 +888,161 @@ mod tests {
             Request::ListRecentFlows { limit } => assert_eq!(limit, 7),
             other => panic!("wrong variant: {other:?}"),
         }
+    }
+
+    /// One request of every variant, the sized ones asking for the most a peer
+    /// can name.
+    fn one_of_each_request() -> Vec<Request> {
+        vec![
+            Request::GetStatus,
+            Request::ActivateProfile(crate::dto::ActivateProfileRequest {
+                profile_id: "p".into(),
+                dest_host: None,
+                dest_port: None,
+            }),
+            Request::Deactivate(crate::dto::DeactivateRequest {
+                release_kill_switch: false,
+            }),
+            Request::ListProfiles,
+            Request::InspectFlow {
+                flow_id: "f".into(),
+            },
+            Request::TraceRoute(crate::dto::RouteTraceRequest {
+                app_id: None,
+                dest_host: "example.org".into(),
+                dest_port: 443,
+                protocol: "tcp".into(),
+                risk: "low".into(),
+                profile_id: None,
+            }),
+            Request::ListRecentFlows { limit: usize::MAX },
+            Request::GetAuditEntries { limit: usize::MAX },
+            Request::VerifyAuditChain,
+            Request::RunDoctor,
+            Request::ExplainError(crate::dto::ExplainRequest { code: "C".into() }),
+            Request::SubscribeEvents(crate::dto::SubscribeEventsRequest { kinds: None }),
+            Request::SetIngress(crate::dto::SetIngressRequest {
+                armed: true,
+                profile_id: None,
+                client: None,
+                expect_profile: None,
+                expect_routing_digest: None,
+            }),
+            Request::GetIngressAudit {
+                limit: usize::MAX,
+                before_seq: Some(7),
+                verify: true,
+            },
+        ]
+    }
+
+    /// Where a request sits in `one_of_each_request`, and whether a peer chooses
+    /// a size with it. No wildcard: a new variant does not compile here until it
+    /// is listed, and the list is then checked against the variants it must cover.
+    fn position_and_sized(request: &Request) -> (usize, bool) {
+        match request {
+            Request::GetStatus => (0, false),
+            Request::ActivateProfile(_) => (1, false),
+            Request::Deactivate(_) => (2, false),
+            Request::ListProfiles => (3, false),
+            Request::InspectFlow { .. } => (4, false),
+            Request::TraceRoute(_) => (5, false),
+            Request::ListRecentFlows { .. } => (6, true),
+            Request::GetAuditEntries { .. } => (7, true),
+            Request::VerifyAuditChain => (8, false),
+            Request::RunDoctor => (9, false),
+            Request::ExplainError(_) => (10, false),
+            Request::SubscribeEvents(_) => (11, false),
+            Request::SetIngress(_) => (12, false),
+            Request::GetIngressAudit { .. } => (13, true),
+        }
+    }
+
+    /// The clamp exists because a peer must not name an allocation size
+    /// (`MAX_LIST_LIMIT`). A request that carries no size passes unchanged; one
+    /// that does is cut to the cap and keeps everything else it said.
+    #[test]
+    fn clamp_keeps_every_size_free_variant_and_clamps_the_sized_ones() {
+        let requests = one_of_each_request();
+        let mut covered: Vec<usize> = requests.iter().map(|r| position_and_sized(r).0).collect();
+        covered.sort_unstable();
+        assert_eq!(
+            covered,
+            (0..requests.len()).collect::<Vec<_>>(),
+            "the list must hold every variant of Request exactly once, in order"
+        );
+
+        for request in requests {
+            let (_, sized) = position_and_sized(&request);
+            let before = format!("{request:?}");
+            let after = format!("{:?}", clamp_request_limits(request));
+            if sized {
+                assert_ne!(before, after, "{before} was not clamped");
+                assert!(
+                    after.contains(&MAX_LIST_LIMIT.to_string()),
+                    "{after} is not cut to the cap"
+                );
+            } else {
+                assert_eq!(
+                    before, after,
+                    "{before} carries no size and must not change"
+                );
+            }
+        }
+
+        match clamp_request_limits(Request::GetIngressAudit {
+            limit: usize::MAX,
+            before_seq: Some(7),
+            verify: true,
+        }) {
+            Request::GetIngressAudit {
+                limit,
+                before_seq,
+                verify,
+            } => {
+                assert_eq!(limit, MAX_LIST_LIMIT);
+                assert_eq!(before_seq, Some(7), "the cursor is not a size");
+                assert!(verify, "the clamp changes the size and nothing else");
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
+    }
+
+    /// The exhaustive `match` is what turns "a new variant that carries a size"
+    /// into a compile error. A catch-all arm brings the silent pass-through
+    /// back (`other => other` let every new variant through unclamped), so no
+    /// arm may be a wildcard or a bare binding.
+    #[test]
+    fn clamp_request_limits_has_no_catch_all_arm() {
+        let source = include_str!("server.rs");
+        let start = source
+            .find("pub fn clamp_request_limits")
+            .expect("the clamp is in this file");
+        let body = &source[start..];
+        let body = &body[..body.find("\n}\n").expect("the function ends at column 0")];
+        let mut arms = 0;
+        for line in body.lines().map(str::trim) {
+            if line.starts_with("//") {
+                continue;
+            }
+            if let Some((pattern, _)) = line.split_once("=>") {
+                arms += 1;
+                let pattern = pattern.trim_start_matches('|').trim();
+                let binding = pattern
+                    .trim_start_matches("ref ")
+                    .trim_start_matches("mut ")
+                    .trim();
+                // An empty pattern is one that began on an earlier line.
+                assert!(
+                    binding.is_empty() || !binding.chars().all(|c| c.is_alphanumeric() || c == '_'),
+                    "a catch-all arm in the clamp: {line}"
+                );
+            }
+        }
+        assert!(
+            arms >= 4,
+            "found {arms} arms; the scan is looking at the wrong text"
+        );
     }
 
     #[test]
