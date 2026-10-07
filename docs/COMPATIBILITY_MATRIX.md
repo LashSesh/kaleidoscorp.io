@@ -92,6 +92,44 @@ timeout. This build validates the section when the file loads; it opens no liste
 by `cargo run -p ssk-config --example ingress_config` and `coexistence_config` into
 `docs/examples/`, and a test fails when either differs from its generator.
 
+## Configuration fingerprint (2026-10-07)
+
+`ssk_config::fingerprint` (library API, new) computes the three digests of a
+configuration, `ConfigFingerprint { version, config, routing, ingress }`, and, for one
+profile, what the ingress ledger's `Armed` record carries: a profile digest and a rule
+table (`of`, `armed`, `ArmedFacts`, `RuleTable`, `RuleRow`). Nothing calls it yet and
+nothing is written, so this build changes no file, wire message or ledger. It is recorded
+here because the ledger will persist the three digests in its `Started` record and the
+profile digest and rule table in `Armed`: the view structs the digests are computed over
+are therefore part of a persisted format, and what an auditor recomputes from an archived
+configuration file must keep agreeing with what the ledger holds.
+
+Format version 1 (`FINGERPRINT_VERSION`). Each digest is the blake3 hash, as 64 lowercase
+hex characters, of the canonical CBOR (`ssk_types::digest_of`) of an explicit view struct,
+never of `AppConfig` itself. `routing` covers `default_profile`, the adapters sorted by id
+(kind in the file's spelling, then host and port or the profile id) and the profiles
+sorted by id with their rules sorted by `(priority, id)`, every rule field included (the
+action as `direct`, `deny` or `adapter:<id>`). `ingress` covers every key of the validated
+ingress section, `destination_logging` included. `config` covers those two and nothing
+else. A profile's display `name`, the order of the three lists, the file's `version`
+number and every section outside `routing` and `ingress` do not move a digest. The `Armed`
+profile digest covers that profile's view plus the adapters its rules reference; the rule
+table lists at most 256 rules in evaluation order (id, priority, action label, attestation
+flag, whether an exact destination exists, whether a suffix exists, port) and never the
+text of a destination or suffix, and `total` and `truncated` say when it is cut.
+
+A change of this format needs a new `FINGERPRINT_VERSION` and an entry here: a field of a
+view added, removed, renamed or moved, a changed spelling or sort key, a different hash or
+encoding (an update of the CBOR writer behind `ssk-types` that alters bytes would make
+every archived digest unverifiable). `crates/ssk-config/tests/fingerprint.rs` pins exact
+digests for fixed configurations and `src/fingerprint.rs` pins the encoded bytes of the
+default views. The views are built by naming every field of the routing section, its
+profiles, rules and adapters and the ingress section, and every variant of the enums
+inside them, so a new key or variant there stops the build until its place in the
+fingerprint is decided; a new key in any other section changes no digest. `of`
+returns a `Result` (`FingerprintError`): serialising a view cannot fail today, and a
+fingerprint must not fall back to an invented value if it ever does.
+
 ## Route executor: no fallback route, bounded dial (2026-10-06)
 
 `RouteExecutor::connect` and `probe` refuse `RouteKind::Fallback` with

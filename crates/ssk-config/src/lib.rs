@@ -5,6 +5,7 @@ use serde_json::{Map, Value};
 use ssk_types::GateId;
 use std::collections::BTreeMap;
 
+pub mod fingerprint;
 pub mod ingress;
 pub mod routing;
 
