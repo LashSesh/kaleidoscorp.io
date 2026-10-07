@@ -168,10 +168,29 @@ pub struct DaemonLock {
     _file: File,
 }
 
+/// Proof that this process held the daemon lock when the proof was made. A
+/// zero-sized `Copy` token that only [`DaemonLock::proof`] can mint, because the
+/// flow ledger's writer has to run on a blocking thread (`spawn_blocking` needs
+/// `'static`, and a borrowed `&DaemonLock` cannot move into it) and still has to
+/// show that the single-writer lock is held. It outlives the borrow, not the
+/// lock: the daemon gives the lock up only by exiting
+/// ([`DaemonLock::hold_until_exit`]), so a proof is never stale in a running
+/// `sskd`.
+#[derive(Debug, Clone, Copy)]
+pub struct LockProof {
+    _private: (),
+}
+
 impl DaemonLock {
     #[must_use]
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// See [`LockProof`].
+    #[must_use]
+    pub const fn proof(&self) -> LockProof {
+        LockProof { _private: () }
     }
 
     /// Keep the lock until the process ends, when the kernel releases it.
@@ -405,6 +424,28 @@ mod tests {
         let err = acquire(&path, &info, Duration::ZERO)
             .expect_err("a second daemon against one state dir must be refused");
         assert_eq!(err.code(), "DAEMON_ALREADY_RUNNING", "{err}");
+    }
+
+    #[test]
+    fn a_proof_is_a_copyable_token_of_a_held_lock_that_can_leave_the_borrow() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("sskd.lock");
+        let held = acquire(&path, &info_for(dir.path()), Duration::ZERO).expect("acquire");
+        let proof = held.proof();
+        let copy = proof;
+        // It is `'static`, `Send` and `Copy`: what a `spawn_blocking` closure needs.
+        fn moves_into_a_thread<T: Copy + Send + 'static>(token: T) {
+            std::thread::spawn(move || {
+                let _ = token;
+            })
+            .join()
+            .expect("joined");
+        }
+        moves_into_a_thread(proof);
+        moves_into_a_thread(copy);
+        assert_eq!(std::mem::size_of::<LockProof>(), 0, "zero-sized");
+        // While the lock is held, nobody else can get one.
+        assert!(acquire(&path, &info_for(dir.path()), Duration::ZERO).is_err());
     }
 
     #[test]

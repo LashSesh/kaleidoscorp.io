@@ -13,7 +13,9 @@ pub mod fs;
 pub mod fs_unix;
 #[cfg(windows)]
 pub mod fs_win;
+pub mod input;
 pub mod record;
+pub mod writer;
 
 /// The ledger is built from `types`, `target`, `limits` and the crates below; it
 /// must not import the modules that are built on top of it. The writer (`C-A6`)

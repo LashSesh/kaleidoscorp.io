@@ -73,6 +73,16 @@ pub struct ByteCounts {
 }
 
 impl ByteCounts {
+    /// Counts that already hold a value, for tests of what reads them.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn with_counts(up: u64, down: u64) -> Self {
+        Self {
+            up: AtomicU64::new(up),
+            down: AtomicU64::new(down),
+        }
+    }
+
     /// Bytes written to the upstream (client to destination).
     #[must_use]
     pub fn up(&self) -> u64 {

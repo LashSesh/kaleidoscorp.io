@@ -51,7 +51,9 @@ const fn kind_byte(kind: HostKind) -> u8 {
     }
 }
 
-fn host_kind(kind: TargetKind) -> HostKind {
+/// The spelling class of a target, as a record names it.
+#[must_use]
+pub const fn host_kind_of(kind: TargetKind) -> HostKind {
     match kind {
         TargetKind::Name => HostKind::Name,
         TargetKind::Ipv4 => HostKind::Ipv4,
@@ -167,17 +169,26 @@ impl DestSealer {
     /// [`SealError::HostTooLong`] in hashed mode for a host no token is computed
     /// over; the record is not written in clear instead.
     pub fn dest(&self, target: &Target) -> Result<DestRef, SealError> {
+        self.dest_for(host_kind_of(target.kind()), target.host(), target.port())
+    }
+
+    /// [`DestSealer::dest`] for a destination that is not held as a `Target`
+    /// (the writer is given the admission token's host and port).
+    ///
+    /// # Errors
+    /// As [`DestSealer::dest`].
+    pub fn dest_for(&self, kind: HostKind, host: &str, port: u16) -> Result<DestRef, SealError> {
         match self {
-            Self::Plain => Ok(plain_dest(target)),
-            Self::Hashed(key) => {
-                let kind = host_kind(target.kind());
-                Ok(DestRef::Hashed {
-                    kid: key.kid().to_owned(),
-                    kind,
-                    token: key.token(kind, target.host())?,
-                    port: target.port(),
-                })
-            }
+            Self::Plain => Ok(DestRef::Plain {
+                host: host.to_owned(),
+                port,
+            }),
+            Self::Hashed(key) => Ok(DestRef::Hashed {
+                kid: key.kid().to_owned(),
+                kind,
+                token: key.token(kind, host)?,
+                port,
+            }),
         }
     }
 
