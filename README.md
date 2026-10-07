@@ -8,7 +8,7 @@
 > **Current status (2026-09-22):** Start with the
 > [restart assessment](docs/RESTART_ASSESSMENT_2026-09-21.md) and
 > [routing/OpenVPN implementation status](docs/ROUTING_AND_OPENVPN_STATUS.md).
-> The daemon now uses configured v4 routing profiles and enforced admission.
+> The daemon now uses configured v5 routing profiles and enforced admission.
 > The [OpenVPN management library](docs/OPENVPN_MANAGEMENT.md),
 > [protected profiles and Windows process containment](docs/OPENVPN_PROFILES_AND_PROCESS.md)
 > are now composed into a [verified, held startup](docs/OPENVPN_SECURE_START.md).
@@ -373,14 +373,15 @@ outstanding` (`docs/WINDOWS_PRODUCT_ROADMAP.md:383`).
 
 ## Configuration
 
-SSK Ω uses a versioned, fail-closed config model. The minimum valid configuration requires:
+SSK Ω uses a versioned, fail-closed config model; the current file is `version: 5`. A file
+states every top-level section (`ssk config schema --json` lists them), so start from a
+generated example instead of writing one by hand: `docs/examples/*.yaml`, or
 
-```yaml
-version: 2
-fail_closed: true
-runtime:
-  strict_mode: true
+```bash
+cargo run -p ssk-config --example ingress_config > ssk-config.yaml
 ```
+
+Keep `system.fail_closed: true` and `runtime.strict_mode: true`; both are refused otherwise.
 
 ```bash
 # Validate a config file
@@ -390,7 +391,8 @@ cargo run -p ssk-cli -- config lint --path ./ssk-config.yaml
 cargo run -p ssk-cli -- config schema --json
 ```
 
-Legacy v1 configs are automatically migrated on first load. Restart is blocked unless `config lint` succeeds.
+Configs of versions 1 to 4 are migrated in memory to v5 on load (files are never rewritten);
+the migrated `ingress` section is disabled. Restart is blocked unless `config lint` succeeds.
 
 ---
 
@@ -556,7 +558,7 @@ Common incident scenarios and recovery steps are in [`docs/RUNBOOK.md`](docs/RUN
 
 - **Ledger mismatch** — stop writes, run `verify-ledger`, restore last good segment, re-verify before reopening.
 - **Replay drift** — compare `run_id`/`replay_id`/`seeded`/`epoch`; isolate regression via deterministic test bisect.
-- **Corrupted config** — run `config lint`; ensure `version=2`, `fail_closed=true`, `strict_mode=true`; restart only after lint success.
+- **Corrupted config** — run `config lint`; ensure `version: 5`, `fail_closed=true`, `strict_mode=true`; restart only after lint success.
 - **Capability mismatch** — align peer/local capability sets; keep strict mode; reattempt handshake.
 
 ---

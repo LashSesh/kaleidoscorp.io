@@ -72,9 +72,21 @@ fn cases() -> Vec<Case> {
         names: "unknown field `fail_closed`",
     });
 
+    // Every field of the ingress section has a default, so serde would let a typo
+    // pass without `deny_unknown_fields`; here it is a document error that names it.
+    let mut ingress_typo = current_document();
+    ingress_typo["ingress"] = json!({"listen": {"adress": "127.0.0.1"}});
+    cases.push(Case {
+        name: "a typo inside the ingress section",
+        yaml: yaml(&ingress_typo),
+        toml: Some(toml(&ingress_typo)),
+        names: "unknown field `adress`",
+    });
+
     let mut v3 = current_document();
     v3["version"] = 3.into();
     v3.as_object_mut().unwrap().remove("routing");
+    v3.as_object_mut().unwrap().remove("ingress");
     v3.as_object_mut().unwrap().remove("core");
     cases.push(Case {
         name: "a version 3 document that lacks a section",

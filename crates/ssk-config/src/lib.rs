@@ -5,9 +5,10 @@ use serde_json::{Map, Value};
 use ssk_types::GateId;
 use std::collections::BTreeMap;
 
+pub mod ingress;
 pub mod routing;
 
-pub const CURRENT_CONFIG_VERSION: u32 = 4;
+pub const CURRENT_CONFIG_VERSION: u32 = 5;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
@@ -15,6 +16,8 @@ pub enum ConfigError {
     Structure(String),
     #[error("invalid routing configuration: {0}")]
     Routing(String),
+    #[error("invalid ingress configuration: {0}")]
+    Ingress(String),
     #[error("yaml parse error: {0}")]
     Yaml(#[from] serde_yaml::Error),
     #[error("toml parse error: {0}")]
@@ -633,6 +636,10 @@ impl Default for InteropConfig {
 #[serde(deny_unknown_fields)]
 pub struct AppConfig {
     pub routing: routing::RoutingConfig,
+    /// Required, like `routing`: a v5 document states its stance explicitly, while
+    /// every field inside the section has a default (`ingress: {}` is valid).
+    #[serde(deserialize_with = "ingress::map_only")]
+    pub ingress: ingress::IngressConfig,
     pub version: u32,
     pub policy: Policy,
     pub runtime: RuntimeConfig,
@@ -655,6 +662,7 @@ impl Default for AppConfig {
         Self {
             version: CURRENT_CONFIG_VERSION,
             routing: routing::RoutingConfig::default(),
+            ingress: ingress::IngressConfig::default(),
             policy: Policy {
                 name: "default-fail-closed".into(),
                 fail_closed: true,
@@ -755,6 +763,8 @@ impl AppConfig {
 
         self.policy.validate()?;
         self.routing.validate()?;
+        self.ingress.validate()?;
+        self.ingress.validate_against(&self.routing)?;
 
         if !self.runtime.strict_mode {
             return Err(ConfigError::RuntimeStrictModeRequired);
@@ -871,17 +881,19 @@ impl AppConfig {
     pub fn schema_json() -> serde_json::Value {
         serde_json::json!({
             "$schema": "https://json-schema.org/draft/2020-12/schema",
-            "$id": "https://kaleidoscorp.io/schema/ssk-config-v4.json",
+            "$id": "https://kaleidoscorp.io/schema/ssk-config-v5.json",
             "title": "ScorpioSync Kaleidoscorp Config",
             "type": "object",
             "required": [
                 "version", "policy", "runtime", "interop", "system", "core",
                 "locator_plane", "projective_connection_hypercube", "hypertorus",
-                "bcik", "capabilities", "privacy", "replay", "ledger", "dissolution", "routing"
+                "bcik", "capabilities", "privacy", "replay", "ledger", "dissolution", "routing",
+                "ingress"
             ],
             "additionalProperties": false,
             "properties": {
                 "routing": routing::schema_json(),
+                "ingress": ingress::IngressConfig::schema_json(),
                 "version": {"type": "integer", "const": CURRENT_CONFIG_VERSION},
                 "policy": {
                     "type": "object",
@@ -1048,6 +1060,7 @@ fn migrate_object_to_current(
     while at < CURRENT_CONFIG_VERSION {
         match at {
             3 => step_3_to_4(object)?,
+            4 => step_4_to_5(object)?,
             other => {
                 return Err(ConfigError::Structure(format!(
                     "no migration step from config version {other}"
@@ -1067,6 +1080,17 @@ fn step_3_to_4(object: &mut Map<String, Value>) -> Result<(), ConfigError> {
         "routing",
         4,
         serde_json::to_value(routing::RoutingConfig::default())?,
+    )
+}
+
+/// Version 5 added the required `ingress` section, disabled: an upgrade never
+/// opens a listener by itself.
+fn step_4_to_5(object: &mut Map<String, Value>) -> Result<(), ConfigError> {
+    introduce_section(
+        object,
+        "ingress",
+        5,
+        serde_json::to_value(ingress::IngressConfig::default())?,
     )
 }
 
@@ -1130,10 +1154,11 @@ mod tests {
     fn schema_snapshot_stable() {
         let schema = AppConfig::schema_json();
         let snapshot = serde_json::to_string_pretty(&schema).expect("schema serializes");
-        assert!(snapshot.contains("ssk-config-v4.json"));
+        assert!(snapshot.contains("ssk-config-v5.json"));
         assert!(snapshot.contains("strict_mode"));
         assert!(snapshot.contains("projective_connection_hypercube"));
         assert!(snapshot.contains("dissolution"));
+        assert!(snapshot.contains("ingress"));
     }
 
     /// Raising `CURRENT_CONFIG_VERSION` without adding the step that carries
@@ -1178,6 +1203,32 @@ mod tests {
             object["routing"],
             serde_json::json!({"default_profile": "x"})
         );
+    }
+
+    /// The same rule one version up: `ingress` in a document that declares
+    /// version 4 is refused by the step that introduces it, not migrated over.
+    #[test]
+    fn step_4_to_5_refuses_an_ingress_section_the_document_already_has() {
+        let own = serde_json::json!({"enabled": true});
+        let mut object = Map::new();
+        object.insert("ingress".into(), own.clone());
+        let err = migrate_object_to_current(&mut object, 4).expect_err("ingress at version 4");
+        assert!(
+            matches!(&err, ConfigError::Structure(message)
+                if message == "ingress requires config version 5"),
+            "{err}"
+        );
+        assert_eq!(object["ingress"], own);
+
+        // Without it the step adds the disabled default and nothing else.
+        let mut object = Map::new();
+        migrate_object_to_current(&mut object, 4).expect("version 4 migrates");
+        assert_eq!(
+            object["ingress"],
+            serde_json::to_value(ingress::IngressConfig::default()).expect("default")
+        );
+        assert_eq!(object["ingress"]["enabled"], serde_json::json!(false));
+        assert_eq!(object.len(), 2, "only ingress and the version: {object:?}");
     }
 
     #[test]

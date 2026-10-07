@@ -1,5 +1,5 @@
 {
-  "$id": "https://kaleidoscorp.io/schema/ssk-config-v4.json",
+  "$id": "https://kaleidoscorp.io/schema/ssk-config-v5.json",
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "additionalProperties": false,
   "properties": {
@@ -125,6 +125,112 @@
         "mode",
         "deterministic_replay"
       ],
+      "type": "object"
+    },
+    "ingress": {
+      "additionalProperties": false,
+      "properties": {
+        "arm_on_start": {
+          "type": "boolean"
+        },
+        "audit": {
+          "additionalProperties": false,
+          "properties": {
+            "destination_logging": {
+              "enum": [
+                "plain",
+                "hashed"
+              ],
+              "type": "string"
+            },
+            "retain_segments": {
+              "maximum": 64,
+              "minimum": 2,
+              "type": "integer"
+            },
+            "segment_mib": {
+              "maximum": 256,
+              "minimum": 1,
+              "type": "integer"
+            }
+          },
+          "type": "object"
+        },
+        "direct_address_families": {
+          "enum": [
+            "ipv4_only",
+            "any"
+          ],
+          "type": "string"
+        },
+        "enabled": {
+          "type": "boolean"
+        },
+        "hardening": {
+          "enum": [
+            "required",
+            "best_effort"
+          ],
+          "type": "string"
+        },
+        "limits": {
+          "additionalProperties": false,
+          "properties": {
+            "accept_rate_per_s": {
+              "maximum": 10000,
+              "minimum": 1,
+              "type": "integer"
+            },
+            "connect_timeout_ms": {
+              "maximum": 120000,
+              "minimum": 100,
+              "type": "integer"
+            },
+            "handshake_timeout_ms": {
+              "maximum": 60000,
+              "minimum": 100,
+              "type": "integer"
+            },
+            "idle_timeout_ms": {
+              "maximum": 86400000,
+              "minimum": 100,
+              "type": "integer"
+            },
+            "max_connections": {
+              "maximum": 4096,
+              "minimum": 1,
+              "type": "integer"
+            }
+          },
+          "type": "object"
+        },
+        "listen": {
+          "additionalProperties": false,
+          "properties": {
+            "address": {
+              "pattern": "^127\\.[0-9]{1,3}\\.[0-9]{1,3}\\.[0-9]{1,3}$",
+              "type": "string"
+            },
+            "port": {
+              "maximum": 65535,
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "type": "object"
+        },
+        "protocols": {
+          "items": {
+            "enum": [
+              "socks5"
+            ],
+            "type": "string"
+          },
+          "maxItems": 1,
+          "minItems": 1,
+          "type": "array"
+        }
+      },
       "type": "object"
     },
     "interop": {
@@ -603,7 +709,7 @@
       "type": "object"
     },
     "version": {
-      "const": 4,
+      "const": 5,
       "type": "integer"
     }
   },
@@ -623,7 +729,8 @@
     "replay",
     "ledger",
     "dissolution",
-    "routing"
+    "routing",
+    "ingress"
   ],
   "title": "ScorpioSync Kaleidoscorp Config",
   "type": "object"

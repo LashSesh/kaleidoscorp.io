@@ -48,6 +48,50 @@ previews. OpenVPN activation remains unavailable (`OPENVPN_NOT_READY`). This is
 not a backwards-compatible claim for older binaries. See
 [implementation status and migration](ROUTING_AND_OPENVPN_STATUS.md).
 
+## Config v5 and the local proxy (2026-10-07)
+
+Version 5 adds the required `ingress` section (disabled by default; every field inside
+it has a default, so `ingress: {}` is valid). Versions 1 to 4 migrate in memory to v5
+with the ingress disabled; files are never rewritten, and a file that loaded before
+still loads, including one whose routing has an adapter on `127.0.0.1:10800` or an IPv6
+literal host (the section is checked against routing only when `enabled` is `true`).
+A v5 file is rejected by older builds with `UnsupportedVersion`. A section introduced
+by a version is rejected in a document that declares an older version (`ingress
+requires config version 5` in a version 3 or 4 document). `CURRENT_CONFIG_VERSION` is 5
+and `ssk config schema` reports `ssk-config-v5.json`; the exact schema is pinned in
+`crates/ssk-config/tests/golden/`. `ssk config lint` named `v2` as the version it had
+migrated to, whatever the file was; it now names the current one.
+
+Unlike the older nested sections, which ignore unknown keys, `ingress` and each of its
+parts (`listen`, `limits`, `audit`) deny them, and each is read from a map only (a list
+is refused), so a misspelled key or a stray list never keeps a default. `protocols` is a
+list of validated names: this build accepts `socks5` and refuses anything else with
+``unsupported ingress protocol `http_connect`; this build supports: socks5``, naming what
+it does support; a later `http_connect` is a new value of that vocabulary, not a new
+config version. No key names a VPN, an interface, a source address or a credential. A
+loopback `listen.address` (`127.0.0.0/8`) is required, `listen.port` may be `0` (the OS
+chooses; for tests), every number has a floor and a ceiling, `0` never means unlimited,
+and `audit.segment_mib x audit.retain_segments` may not exceed 1024 MiB. With the
+section enabled, a routing adapter on the listener's own address and port (`localhost`
+or any loopback address) is refused, and so is an IPv6 literal adapter host while
+`direct_address_families` is `ipv4_only`. The numbers live in one table
+(`ssk_config::ingress::bounds`) that validation, the schema and the generated example read.
+
+Defaults (the owner's, pending confirmation before the first release tag; once a release
+is tagged, changing one needs a new config version): loopback `127.0.0.1` port `10800`,
+`protocols: [socks5]`, `hardening: required`, `arm_on_start: false`,
+`direct_address_families: ipv4_only`, ledger retention by size only (32 MiB x 8 segments,
+no age key), `audit.destination_logging: plain` (`hashed` is the other value), and
+256 connections, 50 accepts per second, a 10 s handshake, a 20 s dial and a one hour idle
+timeout. This build validates the section when the file loads; it opens no listener, so
+`enabled: true` has no effect yet.
+
+`ssk_config::ConfigError` (library API, not a wire type) has a new variant
+`Ingress(String)`; a Rust caller that matches the enum exhaustively has to handle it.
+`AppConfig` has a new required field `ingress`. Complete files to start from are generated
+by `cargo run -p ssk-config --example ingress_config` and `coexistence_config` into
+`docs/examples/`, and a test fails when either differs from its generator.
+
 ## Route executor: no fallback route, bounded dial (2026-10-06)
 
 `RouteExecutor::connect` and `probe` refuse `RouteKind::Fallback` with

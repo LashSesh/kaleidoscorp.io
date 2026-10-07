@@ -8,6 +8,7 @@
 //! test instead of being skipped).
 
 use serde_json::{json, Value};
+use ssk_config::ingress::{DestinationLogging, DirectAddressFamilies, IngressHardening};
 use ssk_config::routing::{AdapterTransport, RoutingAction, RoutingAdapter, RoutingRule};
 use ssk_config::{AppConfig, CURRENT_CONFIG_VERSION};
 use std::collections::BTreeSet;
@@ -323,7 +324,12 @@ fn default_document() -> Value {
 }
 
 /// The default configuration plus every routing shape: all four adapter
-/// transports and all three rule actions, with and without the optional keys.
+/// transports and all three rule actions, with and without the optional keys,
+/// and an ingress section with every key off its default. The section stays
+/// disabled: an enabled one is checked against the routing section (an IPv6
+/// literal adapter needs `any`), which would make this document diverge from the
+/// schema on a single edit of `direct_address_families` and hide what the
+/// differential test is looking for.
 fn rich_config() -> AppConfig {
     let adapter = |id: &str, transport| RoutingAdapter {
         id: id.into(),
@@ -407,6 +413,19 @@ fn rich_config() -> AppConfig {
             RoutingAction::Deny,
         ),
     ];
+    config.ingress.listen.address = "127.0.0.7".parse().expect("an address");
+    config.ingress.listen.port = 41080;
+    config.ingress.hardening = IngressHardening::BestEffort;
+    config.ingress.arm_on_start = true;
+    config.ingress.direct_address_families = DirectAddressFamilies::Any;
+    config.ingress.limits.max_connections = 8;
+    config.ingress.limits.accept_rate_per_s = 3;
+    config.ingress.limits.handshake_timeout_ms = 300;
+    config.ingress.limits.connect_timeout_ms = 400;
+    config.ingress.limits.idle_timeout_ms = 500;
+    config.ingress.audit.segment_mib = 16;
+    config.ingress.audit.retain_segments = 4;
+    config.ingress.audit.destination_logging = DestinationLogging::Hashed;
     config
         .validate()
         .expect("the rich configuration is a valid configuration");
@@ -492,15 +511,30 @@ fn the_test_validator_can_fail() {
 
 #[test]
 fn the_default_and_the_example_documents_validate_against_the_schema() {
-    let example = std::fs::read_to_string(
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../docs/examples/openvpn-routing.yaml"),
-    )
-    .expect("the OpenVPN routing example");
-    let example: Value = serde_yaml::from_str(&example).expect("the example is YAML");
+    let example = |file: &str| -> Value {
+        let text = std::fs::read_to_string(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("../../docs/examples")
+                .join(file),
+        )
+        .unwrap_or_else(|err| panic!("{file}: {err}"));
+        serde_yaml::from_str(&text).unwrap_or_else(|err| panic!("{file} is not YAML: {err}"))
+    };
     for (name, document) in [
         ("the default configuration", default_document()),
         ("the rich configuration", rich_document()),
-        ("docs/examples/openvpn-routing.yaml", example),
+        (
+            "docs/examples/openvpn-routing.yaml",
+            example("openvpn-routing.yaml"),
+        ),
+        (
+            "docs/examples/ingress.example.yaml",
+            example("ingress.example.yaml"),
+        ),
+        (
+            "docs/examples/ingress-coexistence.yaml",
+            example("ingress-coexistence.yaml"),
+        ),
     ] {
         // The parser takes them, the schema must too.
         assert!(parser_accepts(&document), "{name}: the parser refuses it");
@@ -799,7 +833,9 @@ impl Prober<'_> {
 /// means it refuses one the parser accepts. Each is a documented gap, not
 /// intended behaviour, and a reason to fix the schema or the parser, whichever
 /// the owner decides is wrong. The list may only shrink: an entry that stops
-/// being true fails the test until it is deleted.
+/// being true fails the test until it is deleted. The one addition since it was
+/// written is the ledger product of the ingress section, a constraint across two
+/// keys that no keyword of this schema can state.
 const KNOWN_DIVERGENCES: &[(&str, &str)] = &[
     // The schema types the elements as strings; the parser reads an enum.
     (
@@ -865,6 +901,17 @@ const KNOWN_DIVERGENCES: &[(&str, &str)] = &[
     (
         "/routing/profiles/*/rules/*/domain_suffix: free-form string (schema looser)",
         "the parser applies the DNS name grammar",
+    ),
+    // A constraint across two keys, which no keyword of this schema can state:
+    // validate() refuses segment_mib x retain_segments over 1024 MiB, so either
+    // key alone at its ceiling is refused while the other is at its default.
+    (
+        "/ingress/audit/retain_segments: maximum (schema looser)",
+        "validate() refuses segment_mib x retain_segments over 1024 (5.3); a schema states no products",
+    ),
+    (
+        "/ingress/audit/segment_mib: maximum (schema looser)",
+        "validate() refuses segment_mib x retain_segments over 1024 (5.3); a schema states no products",
     ),
     // serde does not apply deny_unknown_fields to the unit variants of an
     // internally tagged enum.
@@ -1060,4 +1107,144 @@ fn the_golden_file_name_follows_the_current_version() {
         json!(CURRENT_CONFIG_VERSION)
     );
     assert_eq!(AppConfig::default().version, CURRENT_CONFIG_VERSION);
+}
+
+// ---------------------------------------------------------------------------
+// The ingress section of the schema (design 5.2, 5.6, 5.11).
+// ---------------------------------------------------------------------------
+
+/// Fragments no key of the ingress section may contain: a key with one of them
+/// would imply that Kaleidoscorp starts, configures or authenticates a tunnel, or
+/// chooses an interface or a source address, none of which it does (5.2).
+const FORBIDDEN_KEY_FRAGMENTS: &[&str] = &[
+    "vpn",
+    "interface",
+    "credential",
+    "password",
+    "secret",
+    "token",
+    "username",
+    "source_address",
+    "egress",
+];
+
+/// The property names of every object in a schema, at any depth, that contain a
+/// forbidden fragment.
+fn forbidden_key_names(schema: &Value, trail: &str, out: &mut Vec<String>) {
+    match schema {
+        Value::Object(node) => {
+            for (keyword, child) in node {
+                if keyword == "properties" {
+                    for name in child.as_object().expect("properties").keys() {
+                        if FORBIDDEN_KEY_FRAGMENTS
+                            .iter()
+                            .any(|fragment| name.to_ascii_lowercase().contains(fragment))
+                        {
+                            out.push(format!("{trail}/{name}"));
+                        }
+                    }
+                }
+                forbidden_key_names(child, &format!("{trail}/{keyword}"), out);
+            }
+        }
+        Value::Array(items) => {
+            for (index, item) in items.iter().enumerate() {
+                forbidden_key_names(item, &format!("{trail}/{index}"), out);
+            }
+        }
+        _ => {}
+    }
+}
+
+#[test]
+fn ingress_schema_has_no_credential_vpn_or_interface_keys() {
+    let schema = AppConfig::schema_json();
+    let ingress = &schema["properties"]["ingress"];
+    assert!(
+        ingress.is_object(),
+        "the exported schema has no ingress section"
+    );
+    let mut found = Vec::new();
+    forbidden_key_names(ingress, "/ingress", &mut found);
+    assert!(
+        found.is_empty(),
+        "keys that imply control of a tunnel: {found:?}"
+    );
+
+    // The scan must be able to fail: planted keys, one per fragment, in nested
+    // properties and behind an `anyOf`.
+    let planted = json!({
+        "type": "object",
+        "properties": {
+            "listen": {"type": "object", "properties": {
+                "Egress_Interface": {"type": "string"},
+                "source_address": {"type": "string"}
+            }},
+            "upstream": {"anyOf": [{"type": "object", "properties": {
+                "vpn_profile": {}, "password": {}, "api_token": {}, "secret": {},
+                "username": {}, "credential_ref": {}
+            }}]}
+        }
+    });
+    let mut found = Vec::new();
+    forbidden_key_names(&planted, "", &mut found);
+    assert_eq!(found.len(), 8, "{found:?}");
+}
+
+#[test]
+fn the_new_section_and_the_top_level_deny_unknown_keys_in_the_schema() {
+    fn objects<'a>(node: &'a Value, trail: &str, out: &mut Vec<(String, &'a Value)>) {
+        match node {
+            Value::Object(map) => {
+                if map.get("type") == Some(&json!("object")) {
+                    out.push((trail.to_string(), node));
+                }
+                for (keyword, child) in map {
+                    objects(child, &format!("{trail}/{keyword}"), out);
+                }
+            }
+            Value::Array(items) => {
+                for (index, item) in items.iter().enumerate() {
+                    objects(item, &format!("{trail}/{index}"), out);
+                }
+            }
+            _ => {}
+        }
+    }
+    let schema = AppConfig::schema_json();
+    assert_eq!(schema["additionalProperties"], json!(false));
+    assert!(
+        schema["required"]
+            .as_array()
+            .expect("required")
+            .contains(&json!("ingress")),
+        "a v5 document states its ingress stance explicitly"
+    );
+    let ingress = &schema["properties"]["ingress"];
+    assert!(
+        ingress.is_object(),
+        "the exported schema has no ingress section"
+    );
+    let mut found = Vec::new();
+    objects(ingress, "/ingress", &mut found);
+    let paths: Vec<&str> = found.iter().map(|(path, _)| path.as_str()).collect();
+    assert_eq!(
+        paths,
+        [
+            "/ingress",
+            "/ingress/properties/audit",
+            "/ingress/properties/limits",
+            "/ingress/properties/listen"
+        ],
+        "the objects of the section; a new one needs its own additionalProperties: false"
+    );
+    for (path, node) in found {
+        assert_eq!(
+            node["additionalProperties"],
+            json!(false),
+            "{path} accepts unknown keys"
+        );
+        // Every field has a default, so a typo must be refused and nothing is required.
+        assert!(node.get("required").is_none(), "{path} requires a key");
+    }
 }
