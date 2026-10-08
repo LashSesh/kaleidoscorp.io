@@ -10,10 +10,22 @@
 //! closed: anything that is not exactly one clear row is `Unknown`, and
 //! `Unknown` means refuse.
 //!
-//! Nothing here reads a file or a socket. The service that does (batching, rate
-//! bound, the self-test) is `C-G7b`.
+//! The parsing and the decision read no file and no socket. The service that
+//! does ([`PeerTableService`]: one thread, one table read per batch of requests, a
+//! bound on how often the table is read) and the self-test of the peer check are
+//! at the end of this file.
 
+use std::collections::HashMap;
+use std::io::{self, Read};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use ssk_netcore::BoxFuture;
+use tokio::sync::oneshot;
 
 use super::types::Controls;
 
@@ -402,6 +414,378 @@ pub const fn no_controls() -> Controls {
         exclusive_bind: false,
         peer_check: false,
         private_audit_store: false,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The service (C-G7b)
+// ---------------------------------------------------------------------------
+
+/// Answers who owns a connection. Async on purpose: it must never block a
+/// runtime worker AND never occupy a blocking-pool slot of the runtime.
+pub trait PeerAuthorizer: Send + Sync {
+    fn authorize<'a>(&'a self, query: PeerQuery) -> BoxFuture<'a, PeerVerdict>;
+}
+
+/// Where the raw tables come from. Linux reads `/proc/net/tcp*`
+/// ([`ProcTableSource`]); the Windows source of `C-WIN2` calls
+/// `GetExtendedTcpTable`; tests inject a counting fake.
+pub trait TableSource: Send + 'static {
+    /// One snapshot of both tables. Blocking.
+    ///
+    /// # Errors
+    /// Whatever the source could not read; the service answers `Unknown`.
+    fn read(&mut self) -> io::Result<RawTables>;
+}
+
+impl TableSource for Box<dyn TableSource> {
+    fn read(&mut self) -> io::Result<RawTables> {
+        (**self).read()
+    }
+}
+
+/// `/proc/net/tcp` and, when it exists, `/proc/net/tcp6`.
+#[derive(Debug, Clone)]
+pub struct ProcTableSource {
+    tcp: PathBuf,
+    tcp6: PathBuf,
+}
+
+impl ProcTableSource {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::at("/proc/net/tcp", "/proc/net/tcp6")
+    }
+
+    /// Other paths, for tests.
+    #[must_use]
+    pub fn at(tcp: impl Into<PathBuf>, tcp6: impl Into<PathBuf>) -> Self {
+        Self {
+            tcp: tcp.into(),
+            tcp6: tcp6.into(),
+        }
+    }
+}
+
+impl Default for ProcTableSource {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// At most one byte more than the cap is read, so a table larger than the cap
+/// is seen as such by the parser and is never held whole.
+fn read_capped(path: &Path) -> io::Result<String> {
+    let limit = u64::try_from(MAX_TABLE_BYTES)
+        .unwrap_or(u64::MAX)
+        .saturating_add(1);
+    let mut text = String::new();
+    std::fs::File::open(path)?
+        .take(limit)
+        .read_to_string(&mut text)?;
+    Ok(text)
+}
+
+impl TableSource for ProcTableSource {
+    fn read(&mut self) -> io::Result<RawTables> {
+        let tcp = read_capped(&self.tcp)?;
+        // IPv6 disabled: the file is not there, which is an empty table.
+        let tcp6 = match read_capped(&self.tcp6) {
+            Ok(text) => Some(text),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error),
+        };
+        Ok(RawTables { tcp, tcp6 })
+    }
+}
+
+/// How the service paces itself. The defaults are the design's numbers; tests
+/// shrink them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ServiceTuning {
+    /// How long a caller waits for its verdict before it is `Unknown`.
+    pub timeout: Duration,
+    /// Requests that may wait for the thread; one more is `Unknown` at once.
+    pub queue: usize,
+    /// Requests served from one snapshot.
+    pub batch: usize,
+    /// The next snapshot starts no earlier than `max(min_interval, 2 x the
+    /// duration of the last one)` after the last one started: at most a third of
+    /// one core however fast connections arrive.
+    pub min_interval: Duration,
+    /// The wait before the one re-read of a miss.
+    pub reread_after: Duration,
+}
+
+impl ServiceTuning {
+    pub const DEFAULT: Self = Self {
+        timeout: Duration::from_millis(500),
+        queue: 256,
+        batch: 256,
+        min_interval: Duration::from_millis(20),
+        reread_after: Duration::from_millis(5),
+    };
+}
+
+impl Default for ServiceTuning {
+    fn default() -> Self {
+        Self::DEFAULT
+    }
+}
+
+/// What the service counted, for the doctor and the tests.
+#[derive(Debug, Default)]
+pub struct ServiceCounters {
+    snapshots: AtomicU64,
+    rereads: AtomicU64,
+    queue_full: AtomicU64,
+    timeouts: AtomicU64,
+    source_errors: AtomicU64,
+    abandoned: AtomicU64,
+}
+
+/// A copy of [`ServiceCounters`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ServiceStats {
+    /// Table reads, the re-reads excluded.
+    pub snapshots: u64,
+    pub rereads: u64,
+    /// Requests refused because the queue was full.
+    pub queue_full: u64,
+    pub timeouts: u64,
+    /// Reads that failed (every request of the batch was `Unknown`).
+    pub source_errors: u64,
+    /// Requests whose caller had given up before the thread got to them.
+    pub abandoned: u64,
+}
+
+impl ServiceCounters {
+    fn bump(counter: &AtomicU64) {
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[must_use]
+    pub fn stats(&self) -> ServiceStats {
+        ServiceStats {
+            snapshots: self.snapshots.load(Ordering::Relaxed),
+            rereads: self.rereads.load(Ordering::Relaxed),
+            queue_full: self.queue_full.load(Ordering::Relaxed),
+            timeouts: self.timeouts.load(Ordering::Relaxed),
+            source_errors: self.source_errors.load(Ordering::Relaxed),
+            abandoned: self.abandoned.load(Ordering::Relaxed),
+        }
+    }
+}
+
+struct Request {
+    query: PeerQuery,
+    reply: oneshot::Sender<PeerVerdict>,
+}
+
+/// One dedicated thread (not a slot of the runtime's blocking pool) that reads
+/// the kernel's table for every request that queued meanwhile, once.
+///
+/// Every request was enqueued after its connection was accepted, so a snapshot
+/// started afterwards already holds that connection's row: there is no cache and
+/// no staleness window. Dropping the service ends the thread.
+pub struct PeerTableService {
+    tx: SyncSender<Request>,
+    timeout: Duration,
+    counters: Arc<ServiceCounters>,
+}
+
+impl PeerTableService {
+    /// Starts the thread. `own_uid` is the identity "same user" means.
+    ///
+    /// # Errors
+    /// The thread could not be started.
+    pub fn start(
+        source: impl TableSource,
+        own_uid: u32,
+        tuning: ServiceTuning,
+    ) -> io::Result<Self> {
+        let (tx, rx) = mpsc::sync_channel(tuning.queue);
+        let counters = Arc::new(ServiceCounters::default());
+        let worker = Worker {
+            source: Box::new(source),
+            rx,
+            own_uid,
+            tuning,
+            counters: Arc::clone(&counters),
+        };
+        std::thread::Builder::new()
+            .name("ssk-ingress-peer".to_owned())
+            .spawn(move || worker.run())?;
+        Ok(Self {
+            tx,
+            timeout: tuning.timeout,
+            counters,
+        })
+    }
+
+    #[must_use]
+    pub fn stats(&self) -> ServiceStats {
+        self.counters.stats()
+    }
+}
+
+impl PeerAuthorizer for PeerTableService {
+    fn authorize<'a>(&'a self, query: PeerQuery) -> BoxFuture<'a, PeerVerdict> {
+        Box::pin(async move {
+            let (reply, answer) = oneshot::channel();
+            match self.tx.try_send(Request { query, reply }) {
+                Ok(()) => {}
+                Err(TrySendError::Full(_)) => {
+                    ServiceCounters::bump(&self.counters.queue_full);
+                    return PeerVerdict::Unknown;
+                }
+                // The thread is gone: nobody can say.
+                Err(TrySendError::Disconnected(_)) => return PeerVerdict::Unknown,
+            }
+            match tokio::time::timeout(self.timeout, answer).await {
+                Ok(Ok(verdict)) => verdict,
+                Ok(Err(_)) => PeerVerdict::Unknown,
+                Err(_) => {
+                    ServiceCounters::bump(&self.counters.timeouts);
+                    PeerVerdict::Unknown
+                }
+            }
+        })
+    }
+}
+
+struct Worker {
+    source: Box<dyn TableSource>,
+    rx: Receiver<Request>,
+    own_uid: u32,
+    tuning: ServiceTuning,
+    counters: Arc<ServiceCounters>,
+}
+
+impl Worker {
+    fn run(mut self) {
+        let mut next_allowed: Option<Instant> = None;
+        while let Ok(first) = self.rx.recv() {
+            // The duty cycle: wait for the interval, then take everything that
+            // queued meanwhile into the same snapshot.
+            if let Some(at) = next_allowed {
+                if let Some(wait) = at.checked_duration_since(Instant::now()) {
+                    std::thread::sleep(wait);
+                }
+            }
+            let mut batch = vec![first];
+            while batch.len() < self.tuning.batch {
+                match self.rx.try_recv() {
+                    Ok(request) => batch.push(request),
+                    Err(_) => break,
+                }
+            }
+            let started = Instant::now();
+            self.serve(batch);
+            let took = started.elapsed();
+            next_allowed =
+                started.checked_add(self.tuning.min_interval.max(took.saturating_mul(2)));
+        }
+    }
+
+    /// One snapshot for the batch, and one shared re-read for what it missed.
+    fn serve(&mut self, batch: Vec<Request>) {
+        let live: Vec<Request> = batch
+            .into_iter()
+            .filter(|request| {
+                let gone = request.reply.is_closed();
+                if gone {
+                    ServiceCounters::bump(&self.counters.abandoned);
+                }
+                !gone
+            })
+            .collect();
+        if live.is_empty() {
+            return;
+        }
+        ServiceCounters::bump(&self.counters.snapshots);
+        let missed = self.answer(live);
+        if missed.is_empty() {
+            return;
+        }
+        // `/proc/net/tcp` is not an atomic snapshot: a row can be skipped. Once
+        // more, for every miss of the batch together, then `Unknown`.
+        std::thread::sleep(self.tuning.reread_after);
+        ServiceCounters::bump(&self.counters.rereads);
+        for request in self.answer(missed) {
+            let _ = request.reply.send(PeerVerdict::Unknown);
+        }
+    }
+
+    /// Reads the tables once and answers every request it can. Returns the
+    /// requests whose connection has no row.
+    fn answer(&mut self, requests: Vec<Request>) -> Vec<Request> {
+        let raw = match self.source.read() {
+            Ok(raw) => raw,
+            Err(_) => {
+                ServiceCounters::bump(&self.counters.source_errors);
+                for request in requests {
+                    let _ = request.reply.send(PeerVerdict::Unknown);
+                }
+                return Vec::new();
+            }
+        };
+        // One parse per listener (in practice one).
+        let mut tables: HashMap<SocketAddr, Result<Table, ParseError>> = HashMap::new();
+        let mut missed = Vec::new();
+        for request in requests {
+            let table = tables
+                .entry(request.query.listener)
+                .or_insert_with(|| parse_tables(&raw, request.query.listener));
+            let decision = match table {
+                Ok(table) => decide_row(&table.rows, &request.query, self.own_uid),
+                Err(_) => RowDecision::Verdict(PeerVerdict::Unknown),
+            };
+            match decision {
+                RowDecision::Verdict(verdict) => {
+                    let _ = request.reply.send(verdict);
+                }
+                RowDecision::Miss => missed.push(request),
+            }
+        }
+        missed
+    }
+}
+
+/// The self-test of the peer check: this environment's table carries the owner of
+/// a real loopback connection. A temporary listener on `127.0.0.1:0`, a client, the
+/// accepted socket, then the real lookup of the client's address; it must find
+/// exactly one `ESTABLISHED` row, owned by `own_uid`, with an inode. Anything
+/// else (a hidden `/proc`, a container without the table, a changed layout) is
+/// `PEER_SELFTEST_FAILED`: the file existing proves nothing.
+///
+/// # Errors
+/// [`MissingControl::PeerSelftestFailed`].
+pub fn selftest(source: &mut dyn TableSource, own_uid: u32) -> Result<(), MissingControl> {
+    let failed = || MissingControl::PeerSelftestFailed;
+    let listener = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).map_err(|_| failed())?;
+    let listen_addr = listener.local_addr().map_err(|_| failed())?;
+    let client = std::net::TcpStream::connect(listen_addr).map_err(|_| failed())?;
+    // Keeps the accepted socket (and so its row) alive for the lookup.
+    let (_accepted, _) = listener.accept().map_err(|_| failed())?;
+    let client_addr = client.local_addr().map_err(|_| failed())?;
+    let raw = source.read().map_err(|_| failed())?;
+    let table = parse_tables(&raw, listen_addr).map_err(|_| failed())?;
+    if table.malformed != 0 {
+        return Err(MissingControl::PeerSelftestFailed);
+    }
+    let query = PeerQuery {
+        client: client_addr,
+        listener: listen_addr,
+    };
+    let established = table.rows.iter().any(|row| {
+        normalise(row.local) == normalise(client_addr)
+            && normalise(row.remote) == normalise(listen_addr)
+            && row.state == STATE_ESTABLISHED
+    });
+    match decide_row(&table.rows, &query, own_uid) {
+        RowDecision::Verdict(PeerVerdict::SameUser) if established => Ok(()),
+        _ => Err(MissingControl::PeerSelftestFailed),
     }
 }
 
@@ -1082,5 +1466,695 @@ mod tests {
             own_uid.wrapping_add(1),
         );
         assert_eq!(other, RowDecision::Verdict(PeerVerdict::DifferentUser));
+    }
+
+    // -- the service (C-G7b) --------------------------------------------------------------------
+
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::Mutex;
+
+    use crate::ingress::types::lock_unpoisoned;
+
+    const OWN: u32 = 1000;
+
+    /// The text of a `/proc/net/tcp` that holds the client rows of `clients` (ports on
+    /// 127.0.0.1) connected to `listener`, each owned by `uid`.
+    fn table_text(listener: SocketAddr, clients: &[u16], uid: u32) -> String {
+        let SocketAddr::V4(listener) = listener else {
+            panic!("an IPv4 listener");
+        };
+        let word = |ip: Ipv4Addr| u32::from_ne_bytes(ip.octets());
+        let mut text = String::from(HEADER);
+        text.push('\n');
+        for (n, port) in clients.iter().enumerate() {
+            text.push_str(&format!(
+                "  {n}: {:08X}:{:04X} {:08X}:{:04X} 01 00000000:00000000 00:00000000 00000000 {uid:5}        0 {} 1 0000000000000000 20 0 0 10 -1\n",
+                word(Ipv4Addr::LOCALHOST),
+                port,
+                word(*listener.ip()),
+                listener.port(),
+                10_000 + n
+            ));
+        }
+        text
+    }
+
+    fn raw(text: String) -> RawTables {
+        RawTables {
+            tcp: text,
+            tcp6: None,
+        }
+    }
+
+    /// A source that counts its reads and hands out whatever `make` builds.
+    #[derive(Clone)]
+    struct Counting {
+        reads: Arc<AtomicUsize>,
+        make: Arc<dyn Fn(usize) -> io::Result<RawTables> + Send + Sync>,
+        delay: Duration,
+    }
+
+    impl Counting {
+        fn new(make: impl Fn(usize) -> io::Result<RawTables> + Send + Sync + 'static) -> Self {
+            Self {
+                reads: Arc::new(AtomicUsize::new(0)),
+                make: Arc::new(make),
+                delay: Duration::ZERO,
+            }
+        }
+
+        fn reads(&self) -> usize {
+            self.reads.load(Ordering::SeqCst)
+        }
+    }
+
+    impl TableSource for Counting {
+        fn read(&mut self) -> io::Result<RawTables> {
+            let n = self.reads.fetch_add(1, Ordering::SeqCst);
+            std::thread::sleep(self.delay);
+            (self.make)(n)
+        }
+    }
+
+    fn listener() -> SocketAddr {
+        sa("127.0.0.1:10800")
+    }
+
+    fn client_query(port: u16) -> PeerQuery {
+        PeerQuery {
+            client: sa(&format!("127.0.0.1:{port}")),
+            listener: listener(),
+        }
+    }
+
+    fn service(source: impl TableSource, tuning: ServiceTuning) -> PeerTableService {
+        PeerTableService::start(source, OWN, tuning).expect("starts")
+    }
+
+    #[tokio::test]
+    async fn a_connection_with_a_row_gets_its_owner_s_verdict() {
+        let source = Counting::new(|_| Ok(raw(table_text(listener(), &[40001], OWN))));
+        let svc = service(source.clone(), ServiceTuning::DEFAULT);
+        assert_eq!(
+            svc.authorize(client_query(40001)).await,
+            PeerVerdict::SameUser
+        );
+        let other = Counting::new(|_| Ok(raw(table_text(listener(), &[40001], 4242))));
+        let svc = service(other, ServiceTuning::DEFAULT);
+        assert_eq!(
+            svc.authorize(client_query(40001)).await,
+            PeerVerdict::DifferentUser
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn snapshot_service_batches_concurrent_requests() {
+        let ports: Vec<u16> = (40_000..40_100).collect();
+        let text = table_text(listener(), &ports, OWN);
+        let mut source = Counting::new(move |_| Ok(raw(text.clone())));
+        // A slow first read, so that the others queue behind it.
+        source.delay = Duration::from_millis(60);
+        let svc = Arc::new(service(source.clone(), ServiceTuning::DEFAULT));
+        let mut tasks = Vec::new();
+        for port in ports {
+            let svc = Arc::clone(&svc);
+            tasks.push(tokio::spawn(async move {
+                svc.authorize(client_query(port)).await
+            }));
+        }
+        for task in tasks {
+            assert_eq!(task.await.expect("joined"), PeerVerdict::SameUser);
+        }
+        // One read for the first request, one for the rest that queued behind it.
+        assert!(
+            source.reads() <= 2,
+            "{} reads for 100 requests",
+            source.reads()
+        );
+        assert_eq!(svc.stats().rereads, 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn snapshot_rate_is_bounded_under_flood() {
+        let text = table_text(listener(), &[40001], OWN);
+        let source = Counting::new(move |_| Ok(raw(text.clone())));
+        let svc = Arc::new(service(source.clone(), ServiceTuning::DEFAULT));
+        let began = Instant::now();
+        let mut tasks = Vec::new();
+        // Eight callers asking one after the other for 400 ms.
+        for _ in 0..8 {
+            let svc = Arc::clone(&svc);
+            tasks.push(tokio::spawn(async move {
+                let mut answered = 0_u32;
+                while began.elapsed() < Duration::from_millis(400) {
+                    assert_eq!(
+                        svc.authorize(client_query(40001)).await,
+                        PeerVerdict::SameUser
+                    );
+                    answered += 1;
+                }
+                answered
+            }));
+        }
+        let mut total = 0;
+        for task in tasks {
+            total += task.await.expect("joined");
+        }
+        let elapsed = began.elapsed();
+        // One read at most per 20 ms, plus the first.
+        let allowed = usize::try_from(elapsed.as_millis() / 20).expect("fits") + 2;
+        assert!(
+            source.reads() <= allowed,
+            "{} reads in {elapsed:?}",
+            source.reads()
+        );
+        assert!(total > 20, "{total} answers: the flood was served");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_miss_is_read_again_once_and_shared_by_every_miss_of_the_batch() {
+        // Read 0 is slow and only knows the blocker, so that the three requests
+        // below queue behind it and are served as one batch. Read 1 does not know
+        // them yet; read 2, the shared re-read, does.
+        let blocker = table_text(listener(), &[40000], OWN);
+        let without = table_text(listener(), &[], OWN);
+        let with = table_text(listener(), &[40001, 40002, 40003], OWN);
+        let source = Counting::new(move |n| {
+            Ok(raw(match n {
+                0 => {
+                    std::thread::sleep(Duration::from_millis(80));
+                    blocker.clone()
+                }
+                1 => without.clone(),
+                _ => with.clone(),
+            }))
+        });
+        let svc = Arc::new(service(source.clone(), ServiceTuning::DEFAULT));
+        let first = {
+            let svc = Arc::clone(&svc);
+            tokio::spawn(async move { svc.authorize(client_query(40000)).await })
+        };
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let (a, b, c) = tokio::join!(
+            svc.authorize(client_query(40001)),
+            svc.authorize(client_query(40002)),
+            svc.authorize(client_query(40003))
+        );
+        assert_eq!(first.await.expect("joined"), PeerVerdict::SameUser);
+        assert_eq!([a, b, c], [PeerVerdict::SameUser; 3]);
+        assert_eq!(
+            source.reads(),
+            3,
+            "the blocker, the batch, one shared re-read"
+        );
+        assert_eq!((svc.stats().snapshots, svc.stats().rereads), (2, 1));
+    }
+
+    #[tokio::test]
+    async fn a_connection_that_never_gets_a_row_is_unknown_after_exactly_one_reread() {
+        let source = Counting::new(|_| Ok(raw(table_text(listener(), &[], OWN))));
+        let svc = service(source.clone(), ServiceTuning::DEFAULT);
+        assert_eq!(
+            svc.authorize(client_query(40001)).await,
+            PeerVerdict::Unknown
+        );
+        assert_eq!(source.reads(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_source_that_fails_makes_every_request_unknown() {
+        let source = Counting::new(|_| Err(io::Error::other("no table")));
+        let svc = service(source.clone(), ServiceTuning::DEFAULT);
+        assert_eq!(
+            svc.authorize(client_query(40001)).await,
+            PeerVerdict::Unknown
+        );
+        assert_eq!(svc.stats().source_errors, 1);
+        assert_eq!(source.reads(), 1, "an error is not a miss: no re-read");
+    }
+
+    #[tokio::test]
+    async fn a_table_over_the_cap_is_unknown() {
+        let big = "x".repeat(MAX_TABLE_BYTES + 1);
+        let source = Counting::new(move |_| Ok(raw(big.clone())));
+        let svc = service(source.clone(), ServiceTuning::DEFAULT);
+        assert_eq!(
+            svc.authorize(client_query(40001)).await,
+            PeerVerdict::Unknown
+        );
+        assert_eq!(source.reads(), 1, "a table that cannot be read is no miss");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_slow_source_is_unknown_at_the_timeout_and_a_full_queue_at_once() {
+        let mut source = Counting::new(|_| Ok(raw(table_text(listener(), &[40001], OWN))));
+        source.delay = Duration::from_millis(400);
+        let tuning = ServiceTuning {
+            timeout: Duration::from_millis(100),
+            queue: 2,
+            ..ServiceTuning::DEFAULT
+        };
+        let svc = Arc::new(service(source, tuning));
+        // The first is taken by the thread and keeps it busy; two more fill the queue.
+        let busy = {
+            let svc = Arc::clone(&svc);
+            tokio::spawn(async move { svc.authorize(client_query(40001)).await })
+        };
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        let queued: Vec<_> = (0..2)
+            .map(|_| {
+                let svc = Arc::clone(&svc);
+                tokio::spawn(async move { svc.authorize(client_query(40001)).await })
+            })
+            .collect();
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        let began = Instant::now();
+        assert_eq!(
+            svc.authorize(client_query(40001)).await,
+            PeerVerdict::Unknown
+        );
+        assert!(
+            began.elapsed() < Duration::from_millis(60),
+            "refused at once"
+        );
+        assert_eq!(svc.stats().queue_full, 1);
+        assert_eq!(
+            busy.await.expect("joined"),
+            PeerVerdict::Unknown,
+            "timed out"
+        );
+        for task in queued {
+            assert_eq!(task.await.expect("joined"), PeerVerdict::Unknown);
+        }
+        assert!(svc.stats().timeouts >= 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_caller_that_gave_up_is_not_served() {
+        let mut source = Counting::new(|_| Ok(raw(table_text(listener(), &[40001], OWN))));
+        source.delay = Duration::from_millis(150);
+        let tuning = ServiceTuning {
+            timeout: Duration::from_millis(40),
+            ..ServiceTuning::DEFAULT
+        };
+        let svc = service(source.clone(), tuning);
+        assert_eq!(
+            svc.authorize(client_query(40001)).await,
+            PeerVerdict::Unknown
+        );
+        // Queued behind the slow read and abandoned before the thread looks at it.
+        assert_eq!(
+            svc.authorize(client_query(40001)).await,
+            PeerVerdict::Unknown
+        );
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        assert_eq!(svc.stats().abandoned, 1);
+        assert_eq!(source.reads(), 1, "the abandoned request cost no read");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn two_listeners_in_one_batch_are_each_filtered_for_their_own() {
+        let other: SocketAddr = sa("127.0.0.1:10801");
+        let mut text = table_text(listener(), &[40001], OWN);
+        let second = table_text(other, &[40002], 4242);
+        text.push_str(second.split_once('\n').map_or("", |(_, rest)| rest));
+        let mut source = Counting::new(move |_| Ok(raw(text.clone())));
+        // A slow first read, so that the two requests below queue behind it and are
+        // served together.
+        source.delay = Duration::from_millis(80);
+        let svc = Arc::new(service(source.clone(), ServiceTuning::DEFAULT));
+        let blocker = {
+            let svc = Arc::clone(&svc);
+            tokio::spawn(async move { svc.authorize(client_query(40001)).await })
+        };
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let (a, b) = tokio::join!(
+            svc.authorize(client_query(40001)),
+            svc.authorize(PeerQuery {
+                client: sa("127.0.0.1:40002"),
+                listener: other
+            })
+        );
+        assert_eq!(blocker.await.expect("joined"), PeerVerdict::SameUser);
+        assert_eq!((a, b), (PeerVerdict::SameUser, PeerVerdict::DifferentUser));
+        assert_eq!(source.reads(), 2, "the two shared one read");
+    }
+
+    /// A source that notes when each read began.
+    fn timed(delay: Duration, rows: String) -> (Counting, Arc<Mutex<Vec<Instant>>>) {
+        let starts: Arc<Mutex<Vec<Instant>>> = Arc::default();
+        let log = Arc::clone(&starts);
+        let mut source = Counting::new(move |_| {
+            lock_unpoisoned(&log).push(Instant::now());
+            Ok(raw(rows.clone()))
+        });
+        source.delay = delay;
+        (source, starts)
+    }
+
+    #[test]
+    fn the_defaults_are_the_documented_pacing() {
+        let tuning = ServiceTuning::default();
+        assert_eq!(tuning, ServiceTuning::DEFAULT);
+        assert_eq!(tuning.timeout, Duration::from_millis(500));
+        assert_eq!((tuning.queue, tuning.batch), (256, 256));
+        assert_eq!(tuning.min_interval, Duration::from_millis(20));
+        assert_eq!(tuning.reread_after, Duration::from_millis(5));
+    }
+
+    #[tokio::test]
+    async fn the_next_snapshot_waits_twice_as_long_as_the_last_one_took() {
+        let (source, starts) = timed(
+            Duration::from_millis(60),
+            table_text(listener(), &[40001], OWN),
+        );
+        let tuning = ServiceTuning {
+            min_interval: Duration::from_millis(1),
+            ..ServiceTuning::DEFAULT
+        };
+        let svc = service(source, tuning);
+        assert_eq!(
+            svc.authorize(client_query(40001)).await,
+            PeerVerdict::SameUser
+        );
+        assert_eq!(
+            svc.authorize(client_query(40001)).await,
+            PeerVerdict::SameUser
+        );
+        let starts = lock_unpoisoned(&starts).clone();
+        assert_eq!(starts.len(), 2);
+        let gap = starts[1].duration_since(starts[0]);
+        assert!(gap >= Duration::from_millis(115), "{gap:?}: 2 x 60 ms");
+    }
+
+    #[tokio::test]
+    async fn the_interval_has_a_floor_however_fast_the_table_is_read() {
+        let (source, starts) = timed(Duration::ZERO, table_text(listener(), &[40001], OWN));
+        let tuning = ServiceTuning {
+            min_interval: Duration::from_millis(50),
+            ..ServiceTuning::DEFAULT
+        };
+        let svc = service(source, tuning);
+        assert_eq!(
+            svc.authorize(client_query(40001)).await,
+            PeerVerdict::SameUser
+        );
+        assert_eq!(
+            svc.authorize(client_query(40001)).await,
+            PeerVerdict::SameUser
+        );
+        let starts = lock_unpoisoned(&starts).clone();
+        let gap = starts[1].duration_since(starts[0]);
+        assert!(gap >= Duration::from_millis(48), "{gap:?}");
+    }
+
+    #[tokio::test]
+    async fn a_miss_is_read_again_only_after_the_wait() {
+        let (source, starts) = timed(Duration::ZERO, table_text(listener(), &[], OWN));
+        let tuning = ServiceTuning {
+            reread_after: Duration::from_millis(80),
+            ..ServiceTuning::DEFAULT
+        };
+        let svc = service(source, tuning);
+        assert_eq!(
+            svc.authorize(client_query(40001)).await,
+            PeerVerdict::Unknown
+        );
+        let starts = lock_unpoisoned(&starts).clone();
+        assert_eq!(starts.len(), 2);
+        let gap = starts[1].duration_since(starts[0]);
+        assert!(gap >= Duration::from_millis(75), "{gap:?}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_batch_never_holds_more_requests_than_its_cap() {
+        let ports: Vec<u16> = (40_000..40_005).collect();
+        let (mut source, _) = timed(Duration::ZERO, table_text(listener(), &ports, OWN));
+        // The first read is slow, so that all five are queued behind it.
+        source.delay = Duration::from_millis(80);
+        let tuning = ServiceTuning {
+            batch: 2,
+            min_interval: Duration::from_millis(1),
+            ..ServiceTuning::DEFAULT
+        };
+        let svc = Arc::new(service(source.clone(), tuning));
+        let tasks: Vec<_> = ports
+            .iter()
+            .map(|port| {
+                let svc = Arc::clone(&svc);
+                let port = *port;
+                tokio::spawn(async move { svc.authorize(client_query(port)).await })
+            })
+            .collect();
+        for task in tasks {
+            assert_eq!(task.await.expect("joined"), PeerVerdict::SameUser);
+        }
+        // 1 + 2 + 2: five requests in batches of at most two.
+        assert!(source.reads() >= 3, "{} reads", source.reads());
+    }
+
+    #[tokio::test]
+    async fn a_source_that_panics_leaves_every_caller_unknown_and_the_service_refusing() {
+        struct Panicking;
+        impl TableSource for Panicking {
+            fn read(&mut self) -> io::Result<RawTables> {
+                panic!("the table source was told to panic");
+            }
+        }
+        let svc = service(Panicking, ServiceTuning::DEFAULT);
+        assert_eq!(
+            svc.authorize(client_query(40001)).await,
+            PeerVerdict::Unknown
+        );
+        // The thread is gone; nobody is let in on a guess.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let began = Instant::now();
+        assert_eq!(
+            svc.authorize(client_query(40001)).await,
+            PeerVerdict::Unknown
+        );
+        assert!(
+            began.elapsed() < Duration::from_millis(100),
+            "refused at once"
+        );
+    }
+
+    #[test]
+    fn dropping_the_service_ends_its_thread() {
+        let source = Counting::new(|_| Ok(raw(String::new())));
+        let reads = Arc::clone(&source.reads);
+        let svc = service(source, ServiceTuning::DEFAULT);
+        drop(svc);
+        std::thread::sleep(Duration::from_millis(50));
+        // The thread held the only other reference to the counter's owner; once it
+        // ended, ours is the last.
+        assert_eq!(Arc::strong_count(&reads), 1);
+    }
+
+    // -- the real table ---------------------------------------------------------------------------
+
+    #[cfg(target_os = "linux")]
+    mod linux {
+        use super::*;
+        use std::io::Write as _;
+        use std::net::{Shutdown, TcpListener, TcpStream};
+
+        fn own_uid() -> u32 {
+            rustix::process::getuid().as_raw()
+        }
+
+        fn connected() -> (TcpListener, TcpStream, TcpStream, PeerQuery) {
+            let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind");
+            let listen_addr = listener.local_addr().expect("addr");
+            let client = TcpStream::connect(listen_addr).expect("connect");
+            let (accepted, _) = listener.accept().expect("accept");
+            let query = PeerQuery {
+                client: client.local_addr().expect("client addr"),
+                listener: accepted.local_addr().expect("listener addr"),
+            };
+            (listener, client, accepted, query)
+        }
+
+        #[tokio::test]
+        async fn a_real_loopback_client_is_the_same_user() {
+            let svc =
+                PeerTableService::start(ProcTableSource::new(), own_uid(), ServiceTuning::DEFAULT)
+                    .expect("starts");
+            let (_listener, client, _accepted, query) = connected();
+            assert_eq!(svc.authorize(query).await, PeerVerdict::SameUser);
+            // A client that has written its request and half-closed is still served.
+            let mut client = client;
+            client.write_all(b"hello").expect("write");
+            client.shutdown(Shutdown::Write).expect("shutdown");
+            assert_eq!(svc.authorize(query).await, PeerVerdict::SameUser);
+        }
+
+        #[tokio::test]
+        async fn a_client_that_has_gone_is_never_the_same_user() {
+            let svc =
+                PeerTableService::start(ProcTableSource::new(), own_uid(), ServiceTuning::DEFAULT)
+                    .expect("starts");
+            let (_listener, client, _accepted, query) = connected();
+            drop(client);
+            // An orphan row (inode 0), a row in another state, or no row at all.
+            assert_eq!(svc.authorize(query).await, PeerVerdict::Unknown);
+        }
+
+        #[tokio::test]
+        async fn the_other_users_connection_is_a_different_user() {
+            // Only root can run a helper as another uid.
+            if rustix::process::geteuid().as_raw() != 0 {
+                eprintln!("skipped: not root");
+                return;
+            }
+            use std::os::unix::process::CommandExt as _;
+            let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind");
+            let port = listener.local_addr().expect("addr").port();
+            let script = format!("exec 3<>/dev/tcp/127.0.0.1/{port}; read -t 5 -u 3 _");
+            let mut helper = match std::process::Command::new("bash")
+                .arg("-c")
+                .arg(script)
+                .uid(65534)
+                .spawn()
+            {
+                Ok(child) => child,
+                Err(error) => {
+                    eprintln!("skipped: cannot run a helper as uid 65534: {error}");
+                    return;
+                }
+            };
+            let accepted = listener.accept().map(|(stream, _)| stream);
+            let Ok(accepted) = accepted else {
+                helper.kill().ok();
+                eprintln!("skipped: the helper did not connect");
+                return;
+            };
+            let query = PeerQuery {
+                client: accepted.peer_addr().expect("peer"),
+                listener: accepted.local_addr().expect("local"),
+            };
+            let svc =
+                PeerTableService::start(ProcTableSource::new(), own_uid(), ServiceTuning::DEFAULT)
+                    .expect("starts");
+            let verdict = svc.authorize(query).await;
+            helper.kill().ok();
+            helper.wait().ok();
+            assert_eq!(verdict, PeerVerdict::DifferentUser);
+        }
+
+        #[test]
+        fn the_self_test_passes_on_this_machine() {
+            let mut source = ProcTableSource::new();
+            assert_eq!(selftest(&mut source, own_uid()), Ok(()));
+        }
+
+        #[test]
+        fn the_self_test_wants_an_established_row_not_just_a_clear_one() {
+            // State 05 is a row the lookup accepts (a half-closed client), but the
+            // self-test's connection is open: any other state means the table is not
+            // telling the truth about it.
+            struct HalfClosed;
+            impl TableSource for HalfClosed {
+                fn read(&mut self) -> io::Result<RawTables> {
+                    let mut real = ProcTableSource::new().read()?;
+                    real.tcp = real.tcp.replace(" 01 ", " 05 ");
+                    Ok(real)
+                }
+            }
+            assert_eq!(
+                selftest(&mut HalfClosed, own_uid()),
+                Err(MissingControl::PeerSelftestFailed)
+            );
+        }
+
+        #[test]
+        fn the_self_test_fails_when_the_table_does_not_carry_the_owner() {
+            // Another identity than the one that made the connection.
+            let mut source = ProcTableSource::new();
+            assert_eq!(
+                selftest(&mut source, own_uid().wrapping_add(1)),
+                Err(MissingControl::PeerSelftestFailed)
+            );
+            // A table that does not exist.
+            let mut missing = ProcTableSource::at("/nonexistent/tcp", "/nonexistent/tcp6");
+            assert_eq!(
+                selftest(&mut missing, own_uid()),
+                Err(MissingControl::PeerSelftestFailed)
+            );
+            // A table in a layout this parser does not know is not trusted.
+            struct OtherLayout;
+            impl TableSource for OtherLayout {
+                fn read(&mut self) -> io::Result<RawTables> {
+                    let mut real = ProcTableSource::new().read()?;
+                    real.tcp = real.tcp.replacen("rem_address", "elsewhere", 1);
+                    Ok(real)
+                }
+            }
+            assert_eq!(
+                selftest(&mut OtherLayout, own_uid()),
+                Err(MissingControl::PeerSelftestFailed)
+            );
+            // Neither is one with a line of the connection's own shape that does not
+            // parse: every ESTABLISHED line is repeated with a state that is not hex.
+            struct Garbled;
+            impl TableSource for Garbled {
+                fn read(&mut self) -> io::Result<RawTables> {
+                    let mut real = ProcTableSource::new().read()?;
+                    let extra: String = real
+                        .tcp
+                        .lines()
+                        .skip(1)
+                        .filter(|line| line.contains(" 01 "))
+                        .map(|line| format!("{}\n", line.replace(" 01 ", " 0Z ")))
+                        .collect();
+                    real.tcp.push_str(&extra);
+                    Ok(real)
+                }
+            }
+            assert_eq!(
+                selftest(&mut Garbled, own_uid()),
+                Err(MissingControl::PeerSelftestFailed)
+            );
+        }
+    }
+
+    #[test]
+    fn the_proc_source_reads_both_files_and_treats_a_missing_tcp6_as_empty() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let tcp = dir.path().join("tcp");
+        std::fs::write(&tcp, HEADER).expect("write");
+        let mut source = ProcTableSource::at(&tcp, dir.path().join("absent6"));
+        let raw = source.read().expect("reads");
+        assert_eq!(raw.tcp, HEADER);
+        assert_eq!(raw.tcp6, None);
+        let tcp6 = dir.path().join("tcp6");
+        std::fs::write(&tcp6, HEADER6).expect("write");
+        let mut both = ProcTableSource::at(&tcp, &tcp6);
+        assert_eq!(both.read().expect("reads").tcp6.as_deref(), Some(HEADER6));
+        // A tcp6 that is there and cannot be read is an error, not an empty table.
+        let unreadable = dir.path().join("dir6");
+        std::fs::create_dir(&unreadable).expect("mkdir");
+        let mut bad6 = ProcTableSource::at(&tcp, &unreadable);
+        assert!(bad6.read().is_err());
+        // A missing IPv4 table is an error, not an empty one.
+        let mut none = ProcTableSource::at(dir.path().join("absent"), &tcp6);
+        assert!(none.read().is_err());
+    }
+
+    #[test]
+    fn a_table_over_the_cap_is_read_to_one_byte_past_it_and_no_further() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let tcp = dir.path().join("tcp");
+        let file = std::fs::File::create(&tcp).expect("create");
+        file.set_len(u64::try_from(MAX_TABLE_BYTES).expect("fits") * 2)
+            .expect("sparse");
+        // A sparse file of NULs is valid UTF-8; the cap stops the read.
+        let mut source = ProcTableSource::at(&tcp, dir.path().join("absent6"));
+        let raw = source.read().expect("reads");
+        assert_eq!(raw.tcp.len(), MAX_TABLE_BYTES + 1);
+        assert_eq!(
+            parse_tables(&raw, sa("127.0.0.1:10800")).err(),
+            Some(ParseError::TooLarge)
+        );
     }
 }

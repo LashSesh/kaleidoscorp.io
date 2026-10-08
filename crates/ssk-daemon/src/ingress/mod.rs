@@ -29,6 +29,7 @@ pub mod guard;
 pub mod limits;
 pub mod path;
 pub mod peer;
+pub mod platform;
 pub mod pump;
 pub mod socks5;
 pub mod target;
