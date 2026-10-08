@@ -68,27 +68,34 @@ impl LedgerIo for StoreIo {
     fn prune(&mut self, victims: &[u64]) -> io::Result<PruneOutcome> {
         let mut outcome = PruneOutcome::default();
         for (done, victim) in victims.iter().enumerate() {
-            match self.store.remove_segment(*victim) {
-                Ok(()) => outcome.removed.push(*victim),
+            let gone = match self.store.remove_segment(*victim) {
+                Ok(()) => true,
                 // Gone already (an earlier round got as far as the unlink): fine.
-                Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                    outcome.removed.push(*victim);
-                }
-                Err(_) => {
-                    // Oldest first, and no further: removing a newer segment while an
-                    // older one stays would leave a hole in the chain, which no
-                    // verifier could tell from damage. This one and every newer
-                    // victim are kept and retried.
-                    let left = victims.len().saturating_sub(done);
-                    outcome.deferred = u32::try_from(left).unwrap_or(u32::MAX);
-                    break;
-                }
+                Err(error) => error.kind() == io::ErrorKind::NotFound,
+            };
+            if !gone {
+                // Oldest first, and no further: removing a newer segment while an
+                // older one stays would leave a hole in the chain, which no
+                // verifier could tell from damage. This one and every newer
+                // victim are kept and retried.
+                let left = victims.len().saturating_sub(done);
+                outcome.deferred = u32::try_from(left).unwrap_or(u32::MAX);
+                break;
             }
-        }
-        if !outcome.removed.is_empty() {
-            // Best effort: a pruned segment that reappears after a crash is a valid,
-            // anchored prefix and is pruned again.
-            let _ = self.store.sync_dir();
+            outcome.removed.push(*victim);
+            // Each unlink is made durable before the next is issued. One directory
+            // fsync at the end would let a crash persist the removal of a newer
+            // segment and not that of an older one, and the ledger would come back
+            // with a hole that no verifier can tell from damage. Done one at a time,
+            // what a crash can bring back is a suffix of the victims: the oldest
+            // segments that remain, a valid anchored prefix that is pruned again.
+            if self.store.sync_dir().is_err() {
+                // Not known to be durable, so nothing newer is unlinked after it;
+                // the newer victims wait for the next round.
+                let left = victims.len().saturating_sub(done).saturating_sub(1);
+                outcome.deferred = u32::try_from(left).unwrap_or(u32::MAX);
+                break;
+            }
         }
         Ok(outcome)
     }
@@ -296,7 +303,7 @@ mod tests {
     }
 
     #[test]
-    fn a_prune_removes_oldest_first_and_makes_the_directory_durable_once() {
+    fn a_prune_removes_oldest_first_and_makes_each_removal_durable_before_the_next() {
         let (mut io, log) = io_over(store());
         let outcome = io.prune(&[1, 11, 21]).expect("prunes");
         assert_eq!(
@@ -308,7 +315,14 @@ mod tests {
         );
         assert_eq!(
             take(&log),
-            ["remove 1", "remove 11", "remove 21", "sync_dir"]
+            [
+                "remove 1",
+                "sync_dir",
+                "remove 11",
+                "sync_dir",
+                "remove 21",
+                "sync_dir"
+            ]
         );
         // Nothing to remove, nothing to make durable.
         let outcome = io.prune(&[]).expect("prunes");
@@ -345,7 +359,7 @@ mod tests {
                 deferred: 3
             }
         );
-        assert_eq!(take(&log), ["remove 1", "remove 11", "sync_dir"]);
+        assert_eq!(take(&log), ["remove 1", "sync_dir", "remove 11"]);
         // And when the first cannot go, nothing is made durable.
         let mut first = store();
         first.stuck = vec![1];
@@ -361,7 +375,22 @@ mod tests {
     }
 
     #[test]
-    fn a_directory_that_cannot_be_made_durable_after_a_prune_is_not_an_error() {
+    fn a_directory_that_cannot_be_made_durable_stops_the_prune_after_the_unlink_it_made() {
+        let mut failing = store();
+        failing.fail_sync_dir = true;
+        let (mut io, log) = io_over(failing);
+        // The unlink of 1 happened and is not known to be durable: 11 and 21 are not
+        // unlinked behind it, because a crash could persist theirs and not that one.
+        // It is not an error, and the segment that is gone is counted as gone.
+        assert_eq!(
+            io.prune(&[1, 11, 21]).expect("prunes"),
+            PruneOutcome {
+                removed: vec![1],
+                deferred: 2
+            }
+        );
+        assert_eq!(take(&log), ["remove 1", "sync_dir"]);
+        // The last victim: nothing is left to wait.
         let mut failing = store();
         failing.fail_sync_dir = true;
         let (mut io, _) = io_over(failing);

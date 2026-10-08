@@ -235,6 +235,18 @@ fn add_counts(into: &mut BTreeMap<String, u64>, from: &BTreeMap<String, u64>) {
     }
 }
 
+/// Takes `taken` out of `from`: what a written or held summary already carries.
+/// Counts that arrived after `taken` was read stay, so nothing is lost and nothing
+/// is counted twice.
+pub fn subtract_counts(from: &mut BTreeMap<String, u64>, taken: &BTreeMap<String, u64>) {
+    for (key, count) in taken {
+        if let Some(entry) = from.get_mut(key) {
+            *entry = entry.saturating_sub(*count);
+        }
+    }
+    from.retain(|_, count| *count > 0);
+}
+
 type RepeatKey = (String, String, u16, String, Option<String>);
 
 fn key_of(repeat: &RepeatCount) -> RepeatKey {
@@ -437,6 +449,16 @@ mod tests {
 
     fn counts(pairs: &[(&str, u64)]) -> BTreeMap<String, u64> {
         pairs.iter().map(|(k, v)| ((*k).to_owned(), *v)).collect()
+    }
+
+    #[test]
+    fn subtracting_what_a_summary_carries_keeps_what_arrived_after() {
+        let mut left = counts(&[("A", 5), ("B", 2), ("C", 1)]);
+        subtract_counts(&mut left, &counts(&[("A", 3), ("B", 2), ("Z", 9)]));
+        assert_eq!(left, counts(&[("A", 2), ("C", 1)]));
+        // Never below zero.
+        subtract_counts(&mut left, &counts(&[("A", 100)]));
+        assert_eq!(left, counts(&[("C", 1)]));
     }
 
     #[test]

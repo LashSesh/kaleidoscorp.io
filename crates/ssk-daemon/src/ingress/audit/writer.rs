@@ -49,7 +49,7 @@ use super::input::{
 use super::record::{
     encode_line, EncodeError, FlowAuditEvent, FlowAuditRecord, GENESIS, LEDGER_FORMAT,
 };
-use super::segments::{merge_summary, Quota, SegmentBook, SegmentInfo};
+use super::segments::{merge_summary, subtract_counts, Quota, SegmentBook, SegmentInfo};
 use super::verify::{ClassBytes, CorruptKind};
 use crate::ingress::pump::ByteCounts;
 use crate::ingress::target::TargetKind;
@@ -254,9 +254,6 @@ pub struct Replayed {
     pub truncated_tail_bytes: u64,
     /// The reason of the trip that preceded this open, if one did.
     pub after_trip: Option<String>,
-    /// The active segment was created by this open (or may not be durable yet):
-    /// its size and its name are made durable before the first receipt exists (D2).
-    pub new_segment: bool,
 }
 
 impl Replayed {
@@ -274,7 +271,6 @@ impl Replayed {
             unresolved: Unresolved::default(),
             truncated_tail_bytes: 0,
             after_trip: None,
-            new_segment: true,
         }
     }
 }
@@ -1379,7 +1375,12 @@ impl Core {
             };
             self.prepare(item, last_ts, &mut prepared, &mut incoming);
         }
+        // The refusal counts that the summary of this batch will carry. Denials of this
+        // very batch that turn out to be over their quota are counted after the
+        // summary was built; they are not in it, and must survive it.
+        let mut carried: BTreeMap<String, u64> = BTreeMap::new();
         if let Some(from) = incoming.take() {
+            carried.clone_from(&self.over_quota);
             prepared.push(Prepared {
                 record: FlowAuditRecord {
                     seq: 0,
@@ -1425,9 +1426,9 @@ impl Core {
                         .and_then(|p| SummaryEvent::from_event(p.record.event.clone()))
                     {
                         // The candidate already holds the old held summaries and the
-                        // over-quota counts: it replaces both.
+                        // over-quota counts it was built from: it replaces both.
                         self.held = candidate;
-                        self.over_quota.clear();
+                        subtract_counts(&mut self.over_quota, &carried);
                     }
                     // Kept for the next summary, not lost: nothing is counted as lost.
                     drop(deliver);
@@ -1473,7 +1474,7 @@ impl Core {
             .saturating_add(encoded.added.summary);
         if summary_written {
             self.held = SummaryEvent::default();
-            self.over_quota.clear();
+            subtract_counts(&mut self.over_quota, &carried);
             self.last_summary = Some(Instant::now());
         }
         self.publish();
@@ -1489,6 +1490,23 @@ impl Core {
             return false;
         }
         true
+    }
+
+    /// A clean stop: the summary that is held back for its share, and the refusals
+    /// counted since the last one, are written now whatever the share and the
+    /// floor say. A crash or a trip loses them (the `Continue` still counts the
+    /// refusals); a clean shutdown must not.
+    fn write_unwritten_counts(&mut self) {
+        if self.held == SummaryEvent::default() && self.over_quota.is_empty() {
+            return;
+        }
+        self.last_summary = None;
+        let item = Item {
+            flow_id: String::new(),
+            event: SummaryEvent::default().into_event(),
+            deliver: None,
+        };
+        let _ = self.commit(VecDeque::from([item]));
     }
 
     /// A `Denied` was refused for want of quota: counted by reason code, to be
@@ -1586,6 +1604,9 @@ fn thread_main(mut core: Core, mut rx: mpsc::UnboundedReceiver<Job>) {
                     match rx.try_recv() {
                         Ok(job) => job,
                         Err(_) => {
+                            // A clean stop writes what is still only in memory
+                            // (the held summary and the refusal counts), once.
+                            core.write_unwritten_counts();
                             exit.clean = true;
                             return;
                         }
@@ -1768,13 +1789,15 @@ impl FlowAuditWriter {
             Some(Err(error)) => return Err(AuditOpenError::Io(error.code())),
             None => return Err(AuditOpenError::Io("AUDIT_IO")),
         };
-        if replayed.new_segment {
-            // D2: the segment's size and its name are durable before the first
-            // receipt can exist.
-            core.io
-                .make_durable()
-                .map_err(|error| AuditOpenError::Io(io_code(&error)))?;
-        }
+        // D2: the segment's size and its name are durable before the first receipt
+        // can exist. Always, not only for a segment this open created: one found at
+        // open may have been made by a rotation that died before its directory
+        // entry was forced (a process kill leaves the page cache intact, so the
+        // opener cannot tell), and a receipt handed out into it would then be
+        // acknowledged evidence in a file that a power loss takes away whole.
+        core.io
+            .make_durable()
+            .map_err(|error| AuditOpenError::Io(io_code(&error)))?;
         core.on_trip = Arc::clone(&on_trip);
 
         let (tx, rx) = mpsc::unbounded_channel();
@@ -2900,7 +2923,6 @@ mod tests {
             },
             truncated_tail_bytes: 12,
             after_trip: Some("audit_write_failed".to_owned()),
-            new_segment: false,
         };
         assert_eq!(status.entries, 2);
         let (on_trip_seen, on_trip) = trips();
@@ -6167,7 +6189,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_new_segment_is_made_durable_at_open_and_an_old_one_is_not_touched() {
+    async fn the_active_segment_is_made_durable_at_every_open_after_started() {
         let io = FakeIo::new();
         let (first, _) = open_plain(&io);
         assert!(io.calls().contains(&Call::MakeDurable));
@@ -6184,7 +6206,6 @@ mod tests {
                 records: last,
                 bytes: len,
             }],
-            new_segment: false,
             ..Replayed::fresh()
         };
         let _second = FlowAuditWriter::open_with(
@@ -6195,11 +6216,19 @@ mod tests {
             on_trip,
         )
         .expect("reopens");
-        assert!(!io
-            .calls()
+        // An existing segment is made durable too, after its Started: its directory
+        // entry may never have been forced.
+        let after: Vec<Call> = io.calls().into_iter().skip(calls_before).collect();
+        let durable = after
             .iter()
-            .skip(calls_before)
-            .any(|c| *c == Call::MakeDurable));
+            .position(|c| *c == Call::MakeDurable)
+            .expect("made durable");
+        assert!(
+            after
+                .get(..durable)
+                .is_some_and(|before| before.contains(&Call::Sync)),
+            "after the Started batch: {after:?}"
+        );
         // A failure to make it durable is the opener's.
         let other = FakeIo::new();
         other.with(|d| d.fail_make_durable = true);
@@ -6720,5 +6749,130 @@ mod tests {
         assert_eq!(result.err(), Some(AuditOpenError::SeqExhausted));
         let kinds: Vec<&str> = events(&io).iter().map(|(_, k)| *k).collect();
         assert_eq!(kinds, ["recovered"], "what fitted was written");
+    }
+
+    // -- the findings of the independent review of C-A7 ------------------------------------------
+
+    /// Three denials over their quota and a summary, in ONE batch (the disk is held
+    /// back by a record that is being appended). Returns the refusals that the
+    /// written summaries carry and the refusals that were counted.
+    async fn refusals_with_a_summary_in_one_batch(floor_passed: bool) -> (u64, u64) {
+        let io = FakeIo::new();
+        let floor = Duration::from_millis(300);
+        // A denied share and a summary share of one percent of 20 kB: less than a line.
+        let (writer, _) = open_sized(&io, 20_000, 4, 1, 1, floor);
+        queue_and_flush(&writer, busy(1)).await; // the first summary is always allowed
+        if floor_passed {
+            tokio::time::sleep(floor + Duration::from_millis(100)).await;
+        }
+        io.with(|d| d.block_append = true);
+        let blocker = {
+            let writer = Arc::clone(&writer);
+            tokio::spawn(async move {
+                writer
+                    .append_disarmed(
+                        DisarmedEvent {
+                            cause: DisarmCause::Operator,
+                            epoch: 1,
+                        },
+                        Duration::from_secs(20),
+                    )
+                    .await;
+            })
+        };
+        eventually("in append", || io.with(|d| d.in_append)).await;
+        let mut denials = Vec::new();
+        for _ in 0..3 {
+            let writer = Arc::clone(&writer);
+            denials.push(tokio::spawn(async move { deny(&writer, LONG).await }));
+        }
+        eventually("queued", || writer.status().queue_depth >= 3).await;
+        assert!(writer.queue_summary(busy(1))); // the same batch as the three denials
+        io.release();
+        for denial in denials {
+            assert!(matches!(
+                denial.await.expect("joined"),
+                Ok(DeniedOutcome::OverQuota)
+            ));
+        }
+        blocker.await.expect("joined");
+        writer
+            .flush(Duration::from_secs(10))
+            .await
+            .expect("flushed");
+        // Whatever is held is written by the next summary after the floor.
+        tokio::time::sleep(floor + Duration::from_millis(100)).await;
+        queue_and_flush(&writer, busy(1)).await;
+        let carried: u64 = written_summaries(&io)
+            .iter()
+            .flat_map(|s| s.denials_over_quota.values().copied())
+            .sum();
+        (carried, writer.status().denials_over_quota)
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn refusals_of_the_batch_of_a_held_summary_are_carried_by_a_later_one() {
+        let (carried, counted) = refusals_with_a_summary_in_one_batch(false).await;
+        assert_eq!(counted, 3);
+        assert_eq!(carried, 3, "counted once in some summary, not lost");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn refusals_of_the_batch_of_a_written_summary_are_carried_by_a_later_one() {
+        let (carried, counted) = refusals_with_a_summary_in_one_batch(true).await;
+        assert_eq!(counted, 3);
+        assert_eq!(carried, 3, "counted once in some summary, not lost");
+    }
+
+    #[tokio::test]
+    async fn a_clean_close_writes_the_summary_that_was_held_and_the_refusals_counted() {
+        let io = FakeIo::new();
+        let (writer, _) = open_sized(&io, 20_000, 4, 1, 1, SUMMARY_FLOOR);
+        queue_and_flush(&writer, busy(1)).await; // the first: written
+        for _ in 0..2 {
+            assert!(matches!(
+                deny(&writer, LONG).await.expect("answered"),
+                DeniedOutcome::OverQuota
+            ));
+        }
+        queue_and_flush(&writer, busy(4)).await; // over its share, inside the floor: held
+        assert_eq!(written_summaries(&io).len(), 1);
+        writer.close(Duration::from_secs(10)).await;
+        let all = written_summaries(&io);
+        assert_eq!(all.len(), 2, "the held one is written at the close");
+        let last = all.last().expect("summary");
+        assert_eq!(
+            last.pre_admission_rejects,
+            [("busy".to_owned(), 4)].into_iter().collect()
+        );
+        assert_eq!(
+            last.denials_over_quota,
+            [("POLICY_DENY".to_owned(), 2)].into_iter().collect()
+        );
+        // Nothing held and nothing counted: a close writes no summary.
+        let quiet = FakeIo::new();
+        let (writer, _) = open_sized(&quiet, 20_000, 4, 20, 5, SUMMARY_FLOOR);
+        writer.close(Duration::from_secs(10)).await;
+        assert!(written_summaries(&quiet).is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_clean_close_writes_refusals_that_no_summary_has_carried_yet() {
+        let io = FakeIo::new();
+        let (writer, _) = open_sized(&io, 20_000, 4, 1, 5, SUMMARY_FLOOR);
+        for _ in 0..2 {
+            assert!(matches!(
+                deny(&writer, LONG).await.expect("answered"),
+                DeniedOutcome::OverQuota
+            ));
+        }
+        assert!(written_summaries(&io).is_empty());
+        writer.close(Duration::from_secs(10)).await;
+        let all = written_summaries(&io);
+        assert_eq!(all.len(), 1);
+        assert_eq!(
+            all[0].denials_over_quota,
+            [("POLICY_DENY".to_owned(), 2)].into_iter().collect()
+        );
     }
 }

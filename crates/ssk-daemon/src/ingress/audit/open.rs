@@ -23,7 +23,13 @@
 //!   is still a valid, anchored prefix, and is pruned again.
 //!
 //! Anything else is `Corrupt`, and nothing is repaired: the operator moves the
-//! directory aside.
+//! directory aside. (That includes a tail damaged by a power loss in a way that
+//! leaves line feeds behind: cutting every invalid trailing line would also cut
+//! acknowledged records behind a damaged one.)
+//!
+//! Whichever segment ends up active, the writer makes its size and its directory
+//! entry durable before the first receipt exists: a segment found here may be the
+//! product of a rotation that died before its directory entry was forced.
 
 use super::fs::{ActiveSegment, LedgerFs, LedgerStore, StoreError};
 use super::segments::SegmentInfo;
@@ -92,7 +98,6 @@ fn recover(
 ) -> Result<(Replayed, Box<dyn ActiveSegment>), AuditOpenError> {
     let mut verified = verify_dir(store, VerifyMode::Open).map_err(verify_error)?;
     let mut truncated_tail_bytes = 0;
-    let mut new_segment = false;
 
     // A newest segment with no complete line and a predecessor: unlink it.
     if let Some(last) = verified.segments.last().filter(|s| s.records == 0) {
@@ -109,7 +114,6 @@ fn recover(
     let active: Box<dyn ActiveSegment> = match verified.segments.last() {
         None => {
             // No ledger yet: the first segment, created exclusively.
-            new_segment = true;
             store.create_segment(1).map_err(store_error)?
         }
         Some(last) if last.records == 0 => {
@@ -127,7 +131,6 @@ fn recover(
             let mut active = store.open_active(last.first_seq).map_err(store_error)?;
             active.truncate(0).map_err(|e| io_error(&e))?;
             active.sync_all().map_err(|e| io_error(&e))?;
-            new_segment = true;
             active
         }
         Some(last) => {
@@ -162,7 +165,6 @@ fn recover(
         unresolved: verified.unresolved,
         truncated_tail_bytes,
         after_trip,
-        new_segment,
     };
     Ok((replayed, active))
 }
@@ -928,12 +930,11 @@ mod tests {
     }
 
     #[test]
-    fn a_fresh_directory_is_created_and_flagged_for_a_durable_start() {
+    fn a_fresh_directory_is_created_with_its_first_segment() {
         let dir = Dir::new();
         let (spy, log) = spied(&dir);
         let (replayed, _active) = recover(&spy, None).expect("recovers");
         assert_eq!(steps(&log), ["create 1"]);
-        assert!(replayed.new_segment, "its size and name are made durable");
         assert_eq!(replayed.truncated_tail_bytes, 0);
         assert_eq!(replayed.last_seq, None);
         assert_eq!(replayed.head, "genesis");
@@ -961,7 +962,6 @@ mod tests {
             let (replayed, _active) = recover(&spy, None).expect("recovers");
             assert_eq!(steps(&log), ["remove 1000", "sync_dir", "open_active 1"]);
             assert_eq!(replayed.truncated_tail_bytes, cut);
-            assert!(!replayed.new_segment);
             assert_eq!(dir.segment_seqs(), [1]);
         }
     }
@@ -988,7 +988,6 @@ mod tests {
             ]
         );
         assert_eq!(replayed.truncated_tail_bytes, 13);
-        assert!(!replayed.new_segment);
         assert_eq!(
             replayed.segments.last().map(|s| s.bytes),
             Some(valid),
@@ -997,8 +996,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn a_lone_first_segment_without_a_record_is_cut_to_nothing_and_flagged_for_a_durable_start(
-    ) {
+    async fn a_lone_first_segment_without_a_record_is_cut_to_nothing_and_made_durable() {
         let dir = Dir::new();
         {
             let store = dir.fs().open_store().expect("store");
@@ -1009,7 +1007,6 @@ mod tests {
         let (replayed, _active) = recover(&spy, None).expect("recovers");
         assert_eq!(steps(&log), ["open_active 1", "truncate 1 0", "sync_all 1"]);
         assert_eq!(replayed.truncated_tail_bytes, 8);
-        assert!(replayed.new_segment);
         assert_eq!(replayed.last_seq, None);
     }
 
