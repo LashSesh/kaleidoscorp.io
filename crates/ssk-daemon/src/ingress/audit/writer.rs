@@ -229,6 +229,10 @@ pub struct AuditStatus {
     pub capacity_refusals: u64,
     pub destination_logging: DestinationLogging,
     pub dest_key_id: Option<String>,
+    /// The wall clock (untrusted) of the oldest retained record.
+    pub oldest_ts_ms: Option<u64>,
+    /// How much of the `Denied` share of the active segment is used, 0 to 100.
+    pub refusal_quota_used_percent: u8,
 }
 
 // ---------------------------------------------------------------------------
@@ -266,6 +270,7 @@ impl Replayed {
                 first_seq: 1,
                 records: 0,
                 bytes: 0,
+                first_ts_ms: 0,
             }],
             class_bytes: ClassBytes::default(),
             unresolved: Unresolved::default(),
@@ -321,6 +326,9 @@ struct Shared {
     segments: AtomicU64,
     pruned_entries: AtomicU64,
     prune_deferred: AtomicU64,
+    /// [`NO_TS`] when no record is retained.
+    oldest_ts_ms: AtomicU64,
+    quota_used_percent: AtomicU64,
     rotations: AtomicU64,
     denials_over_quota: AtomicU64,
     capacity_refusals: AtomicU64,
@@ -347,6 +355,8 @@ impl Shared {
             segments: AtomicU64::new(0),
             pruned_entries: AtomicU64::new(0),
             prune_deferred: AtomicU64::new(0),
+            oldest_ts_ms: AtomicU64::new(NO_TS),
+            quota_used_percent: AtomicU64::new(0),
             rotations: AtomicU64::new(0),
             denials_over_quota: AtomicU64::new(0),
             capacity_refusals: AtomicU64::new(0),
@@ -364,6 +374,9 @@ impl Shared {
         }
     }
 }
+
+/// The published "no time": the wall clock cannot be this large.
+const NO_TS: u64 = u64::MAX;
 
 fn bump(counter: &AtomicU64) {
     counter.fetch_add(1, Ordering::Relaxed);
@@ -1147,6 +1160,13 @@ impl Core {
         shared
             .prune_deferred
             .store(u64::from(self.deferred_last), Ordering::Release);
+        shared
+            .oldest_ts_ms
+            .store(self.book.oldest_ts_ms().unwrap_or(NO_TS), Ordering::Release);
+        shared.quota_used_percent.store(
+            u64::from(self.quota.denied_used_percent(&self.class_used)),
+            Ordering::Release,
+        );
         *lock_unpoisoned(&shared.head) = self.head.clone();
     }
 
@@ -1316,7 +1336,7 @@ impl Core {
         self.head = line.hash;
         self.next_seq = next_first_seq.checked_add(1);
         self.expected_len = len;
-        self.book.rotated(next_first_seq, 1, len);
+        self.book.rotated(next_first_seq, 1, len, ts_ms);
         self.class_used = ClassBytes::default();
         self.refusals_unrecorded = 0;
         bump(&self.shared.rotations);
@@ -1435,7 +1455,10 @@ impl Core {
                 }
             }
         }
+        // The time of the first record written, for the segment that had none.
+        let mut first_ts = None;
         for (index, written_at) in std::mem::take(&mut encoded.accepted) {
+            first_ts.get_or_insert_with(|| prepared.get(index).map_or(0, |p| p.record.ts_ms));
             let deliver = prepared.get_mut(index).and_then(|p| p.deliver.take());
             written.push((deliver, written_at));
         }
@@ -1466,7 +1489,8 @@ impl Core {
         self.expected_len = self.expected_len.saturating_add(added);
         self.head = encoded.head;
         self.next_seq = encoded.next;
-        self.book.appended(len_u64(written.len()), added);
+        self.book
+            .appended(len_u64(written.len()), added, first_ts.unwrap_or(0));
         self.class_used.denied = self.class_used.denied.saturating_add(encoded.added.denied);
         self.class_used.summary = self
             .class_used
@@ -2276,6 +2300,12 @@ impl FlowAuditWriter {
             capacity_refusals: shared.capacity_refusals.load(Ordering::Relaxed),
             destination_logging: self.core.sealer.mode(),
             dest_key_id: self.core.sealer.kid().map(str::to_owned),
+            oldest_ts_ms: Some(shared.oldest_ts_ms.load(Ordering::Acquire))
+                .filter(|ts| *ts != NO_TS),
+            refusal_quota_used_percent: u8::try_from(
+                shared.quota_used_percent.load(Ordering::Acquire),
+            )
+            .unwrap_or(100),
         }
     }
 
@@ -2915,6 +2945,7 @@ mod tests {
                 first_seq: 1,
                 records: last,
                 bytes: len,
+                first_ts_ms: 1,
             }],
             class_bytes: ClassBytes::default(),
             unresolved: Unresolved {
@@ -6205,6 +6236,7 @@ mod tests {
                 first_seq: 1,
                 records: last,
                 bytes: len,
+                first_ts_ms: 1,
             }],
             ..Replayed::fresh()
         };
@@ -6874,5 +6906,59 @@ mod tests {
             all[0].denials_over_quota,
             [("POLICY_DENY".to_owned(), 2)].into_iter().collect()
         );
+    }
+
+    #[tokio::test]
+    async fn status_says_how_old_the_oldest_record_is_and_how_much_of_the_refusal_share_is_used() {
+        let io = FakeIo::new();
+        // Retention 2 of 1,000-byte segments: the oldest segment moves on.
+        let (writer, _) = open_sized(&io, 1_000, 2, 100, 5, SUMMARY_FLOOR);
+        let started = io.records().first().map(|r| r.ts_ms).expect("started");
+        assert_eq!(writer.status().oldest_ts_ms, Some(started));
+        for _ in 0..8 {
+            deny(&writer, LONG).await.expect("recorded");
+        }
+        let status = writer.status();
+        assert!(status.pruned_entries > 0, "{status:?}");
+        // The oldest retained record is the first line of the oldest segment.
+        let oldest = io.records().first().map(|r| r.ts_ms).expect("a record");
+        assert!(oldest > started);
+        assert_eq!(status.oldest_ts_ms, Some(oldest));
+
+        // The share used is a whole percentage of the share of the active segment.
+        let io = FakeIo::new();
+        let (writer, _) = open_sized(&io, 40_000, 4, 20, 5, SUMMARY_FLOOR);
+        assert_eq!(writer.status().refusal_quota_used_percent, 0);
+        for _ in 0..5 {
+            deny(&writer, LONG).await.expect("recorded");
+        }
+        let used = verified(&io).newest_class_bytes.denied;
+        let share = 40_000 * 20 / 100;
+        let expected = u8::try_from(used * 100 / share).expect("fits");
+        assert!(expected > 0);
+        assert_eq!(writer.status().refusal_quota_used_percent, expected);
+    }
+
+    #[tokio::test]
+    async fn the_time_of_a_new_segment_is_that_of_the_first_record_of_its_first_batch() {
+        let io = FakeIo::new();
+        let (_seen, on_trip) = trips();
+        // Two records in the first batch: Recovered, then Started.
+        let replayed = Replayed {
+            truncated_tail_bytes: 5,
+            ..Replayed::fresh()
+        };
+        let writer = FlowAuditWriter::open_with(
+            io.clone(),
+            replayed,
+            &cfg(DestinationLogging::Plain, 8),
+            DestSealer::Plain,
+            on_trip,
+        )
+        .expect("opens");
+        let records = io.records();
+        assert_eq!(records.len(), 2);
+        assert!(records[1].ts_ms > records[0].ts_ms, "the clock ticks");
+        assert_eq!(writer.status().oldest_ts_ms, Some(records[0].ts_ms));
     }
 }

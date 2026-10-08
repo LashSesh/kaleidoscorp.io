@@ -30,6 +30,8 @@ pub struct SegmentInfo {
     pub first_seq: u64,
     pub records: u64,
     pub bytes: u64,
+    /// The untrusted wall clock of its first record; 0 when it has none yet.
+    pub first_ts_ms: u64,
 }
 
 impl From<&SegmentSummary> for SegmentInfo {
@@ -38,6 +40,7 @@ impl From<&SegmentSummary> for SegmentInfo {
             first_seq: summary.first_seq,
             records: summary.records,
             bytes: summary.bytes,
+            first_ts_ms: summary.first_ts_ms,
         }
     }
 }
@@ -105,6 +108,16 @@ impl SegmentBook {
         self.segments.last().map_or(0, |s| s.bytes)
     }
 
+    /// The wall clock (untrusted) of the oldest retained record, when the oldest
+    /// segment holds one.
+    #[must_use]
+    pub fn oldest_ts_ms(&self) -> Option<u64> {
+        self.segments
+            .first()
+            .filter(|segment| segment.records > 0)
+            .map(|segment| segment.first_ts_ms)
+    }
+
     #[must_use]
     pub fn oldest_first_seq(&self) -> Option<u64> {
         self.segments.first().map(|s| s.first_seq)
@@ -118,9 +131,13 @@ impl SegmentBook {
             .map_or(0, |seq| seq.saturating_sub(1))
     }
 
-    /// Lines were appended to the active segment.
-    pub fn appended(&mut self, records: u64, bytes: u64) {
+    /// Lines were appended to the active segment; `first_ts_ms` is the time of the
+    /// first of them, which becomes the segment's own when it held none before.
+    pub fn appended(&mut self, records: u64, bytes: u64, first_ts_ms: u64) {
         if let Some(active) = self.segments.last_mut() {
+            if active.records == 0 {
+                active.first_ts_ms = first_ts_ms;
+            }
             active.records = active.records.saturating_add(records);
             active.bytes = active.bytes.saturating_add(bytes);
         }
@@ -155,11 +172,12 @@ impl SegmentBook {
     }
 
     /// The next segment is now the active one.
-    pub fn rotated(&mut self, next_first_seq: u64, records: u64, bytes: u64) {
+    pub fn rotated(&mut self, next_first_seq: u64, records: u64, bytes: u64, first_ts_ms: u64) {
         self.segments.push(SegmentInfo {
             first_seq: next_first_seq,
             records,
             bytes,
+            first_ts_ms,
         });
     }
 
@@ -211,6 +229,18 @@ impl Quota {
             denied: share_bytes(segment_bytes, denied_percent),
             summary: share_bytes(segment_bytes, summary_percent),
         }
+    }
+
+    /// How much of the `Denied` share is used, 0 to 100 (a share of nothing is
+    /// always used up).
+    #[must_use]
+    pub fn denied_used_percent(&self, used: &ClassBytes) -> u8 {
+        let percent = used
+            .denied
+            .saturating_mul(100)
+            .checked_div(self.denied)
+            .unwrap_or(100);
+        u8::try_from(percent.min(100)).unwrap_or(100)
     }
 
     /// May a `Denied` line of `len` bytes be written, given the bytes the class
@@ -303,6 +333,7 @@ mod tests {
                     first_seq: *first_seq,
                     records: 10,
                     bytes: 100,
+                    first_ts_ms: *first_seq * 1_000,
                 })
                 .collect(),
             retain,
@@ -367,9 +398,9 @@ mod tests {
     fn the_book_follows_appends_rotations_and_prunes() {
         let mut b = book(&[1, 11], 4);
         assert_eq!((b.entries(), b.bytes(), b.len()), (20, 200, 2));
-        b.appended(3, 30);
+        b.appended(3, 30, 99_999);
         assert_eq!((b.entries(), b.bytes(), b.active_bytes()), (23, 230, 130));
-        b.rotated(21, 1, 80);
+        b.rotated(21, 1, 80, 21_000);
         assert_eq!(b.first_seqs(), [1, 11, 21]);
         assert_eq!(b.active_bytes(), 80);
         b.pruned(&[1]);
@@ -533,6 +564,76 @@ mod tests {
         assert_eq!(hosts, ["a.example", "b.example"]);
         assert_eq!(a.denials_suppressed, counts(&[("X", u64::MAX)]));
         assert_eq!(a.denials_repeated.first().map(|r| r.count), Some(6));
+    }
+
+    #[test]
+    fn the_denied_share_used_is_a_whole_percentage_capped_at_a_hundred() {
+        let quota = Quota::new(1000, 20, 5); // 200 bytes
+        let used = |denied: u64| ClassBytes { denied, summary: 0 };
+        assert_eq!(quota.denied_used_percent(&used(0)), 0);
+        assert_eq!(quota.denied_used_percent(&used(1)), 0, "rounded down");
+        assert_eq!(quota.denied_used_percent(&used(100)), 50);
+        assert_eq!(quota.denied_used_percent(&used(199)), 99);
+        assert_eq!(quota.denied_used_percent(&used(200)), 100);
+        assert_eq!(quota.denied_used_percent(&used(400)), 100, "200 percent");
+        assert_eq!(quota.denied_used_percent(&used(5_000)), 100);
+        assert_eq!(quota.denied_used_percent(&used(u64::MAX)), 100);
+        // The summary bytes are not the denied share.
+        assert_eq!(
+            quota.denied_used_percent(&ClassBytes {
+                denied: 0,
+                summary: 50
+            }),
+            0
+        );
+        // A share of nothing is used up.
+        assert_eq!(Quota::new(1000, 0, 5).denied_used_percent(&used(0)), 100);
+    }
+
+    #[test]
+    fn the_first_append_to_an_empty_segment_sets_its_time_and_later_ones_do_not() {
+        let mut b = SegmentBook::new(
+            vec![SegmentInfo {
+                first_seq: 1,
+                records: 0,
+                bytes: 0,
+                first_ts_ms: 0,
+            }],
+            4,
+        );
+        assert_eq!(b.oldest_ts_ms(), None);
+        b.appended(2, 50, 7_000);
+        assert_eq!(b.oldest_ts_ms(), Some(7_000));
+        b.appended(1, 25, 9_000);
+        assert_eq!(
+            b.oldest_ts_ms(),
+            Some(7_000),
+            "the first record's time stays"
+        );
+    }
+
+    #[test]
+    fn the_oldest_timestamp_is_the_first_record_of_the_oldest_segment() {
+        let b = book(&[11, 21], 4);
+        assert_eq!(b.oldest_ts_ms(), Some(11_000));
+        // A segment that holds no record has no time.
+        let empty = SegmentBook::new(
+            vec![SegmentInfo {
+                first_seq: 1,
+                records: 0,
+                bytes: 0,
+                first_ts_ms: 0,
+            }],
+            4,
+        );
+        assert_eq!(empty.oldest_ts_ms(), None);
+        assert_eq!(SegmentBook::new(Vec::new(), 4).oldest_ts_ms(), None);
+        // A rotation carries the time of its Continue; pruning moves the oldest.
+        let mut b = book(&[1, 11], 4);
+        b.rotated(21, 1, 80, 21_500);
+        assert_eq!(b.oldest_ts_ms(), Some(1_000));
+        b.pruned(&[1, 11]);
+        assert_eq!(b.oldest_ts_ms(), Some(21_500));
     }
 
     #[test]

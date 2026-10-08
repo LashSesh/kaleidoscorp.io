@@ -155,6 +155,7 @@ fn recover(
             first_seq: 1,
             records: 0,
             bytes: 0,
+            first_ts_ms: 0,
         });
     }
     let replayed = Replayed {
@@ -943,7 +944,8 @@ mod tests {
             [SegmentInfo {
                 first_seq: 1,
                 records: 0,
-                bytes: 0
+                bytes: 0,
+                first_ts_ms: 0
             }]
         );
     }
@@ -1063,6 +1065,8 @@ mod tests {
         assert_eq!(status.entries, on_disk.entries);
         assert_eq!(status.bytes, on_disk.bytes);
         assert_eq!(status.pruned_entries, on_disk.pruned_entries());
+        assert_eq!(status.oldest_ts_ms, on_disk.oldest_ts_ms);
+        assert!(status.oldest_ts_ms.is_some());
         assert_eq!(
             usize::try_from(status.segments).expect("fits"),
             dir.segment_seqs().len()

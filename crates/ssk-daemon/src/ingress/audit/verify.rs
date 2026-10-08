@@ -117,6 +117,9 @@ pub struct SegmentSummary {
     pub records: u64,
     /// Bytes of complete lines.
     pub bytes: u64,
+    /// The untrusted wall clock of the segment's first record; 0 for a segment
+    /// with none.
+    pub first_ts_ms: u64,
 }
 
 /// Where the newest segment ends.
@@ -358,6 +361,7 @@ fn verify_once(store: &dyn LedgerStore, mode: VerifyMode) -> Result<Verified, Ou
             last_seq: None,
             records: 0,
             bytes: 0,
+            first_ts_ms: 0,
         };
         let mut class = ClassBytes::default();
         let mut line_no: u64 = 0;
@@ -437,6 +441,7 @@ fn verify_once(store: &dyn LedgerStore, mode: VerifyMode) -> Result<Verified, Ou
                         );
                     }
                 }
+                summary.first_ts_ms = record.ts_ms;
                 if verified.oldest_ts_ms.is_none() {
                     verified.oldest_ts_ms = Some(record.ts_ms);
                 }
@@ -777,7 +782,8 @@ mod tests {
                 first_seq: 1,
                 last_seq: Some(2),
                 records: 2,
-                bytes: v.bytes
+                bytes: v.bytes,
+                first_ts_ms: 1_001
             }]
         );
         assert_eq!(v.pruned_entries(), 0);
