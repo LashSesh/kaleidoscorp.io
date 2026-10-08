@@ -181,6 +181,15 @@ pub struct LockProof {
     _private: (),
 }
 
+impl LockProof {
+    /// For tests that open a writer without a real lock.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) const fn for_tests() -> Self {
+        Self { _private: () }
+    }
+}
+
 impl DaemonLock {
     #[must_use]
     pub fn path(&self) -> &Path {

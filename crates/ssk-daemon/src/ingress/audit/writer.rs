@@ -26,7 +26,7 @@
 //! Rotation, retention and the refusal quota are `C-A7`; this module appends to
 //! the active segment it is given.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -40,7 +40,7 @@ use ssk_netadmin::admission::AdmissionToken;
 use ssk_netadmin::audit::summarise_route;
 
 use super::dest::{host_kind_of, DestSealer};
-use super::fs::{io_code, LedgerIo};
+use super::fs::{io_code, LedgerIo, StoreError};
 use super::input::{
     closed, ArmedEvent, CloseReason, ClosedEvent, ConnectedEvent, DeniedEvent, DisarmedEvent,
     FailedEvent, PendingInput, SummaryEvent, TrippedEvent, DENIED_REASON_CODES, RESULT_ERROR_CODES,
@@ -49,6 +49,8 @@ use super::input::{
 use super::record::{
     encode_line, EncodeError, FlowAuditEvent, FlowAuditRecord, GENESIS, LEDGER_FORMAT,
 };
+use super::segments::{merge_summary, Quota, SegmentBook, SegmentInfo};
+use super::verify::{ClassBytes, CorruptKind};
 use crate::ingress::pump::ByteCounts;
 use crate::ingress::target::TargetKind;
 use crate::ingress::types::{
@@ -62,6 +64,10 @@ pub const BATCH_MAX: usize = 64;
 
 /// The most addresses a `Result` lists as attempted (the format's own limit).
 pub const MAX_ATTEMPTED: usize = 8;
+
+/// A `Summary` is written at least this often even when its share of the segment is
+/// used up: a denial-only flood must stay visible.
+pub const SUMMARY_FLOOR: Duration = Duration::from_secs(300);
 
 /// Jobs that can be queued at once (compensation jobs are not counted).
 pub const DEFAULT_QUEUE_CAP: usize = 256;
@@ -86,8 +92,12 @@ pub enum AuditError {
     /// Claimed and not answered in time; abandoned. The record may become durable
     /// later, and its receipt then compensates.
     Timeout,
-    /// The ledger is at its hard cap because pruning keeps failing (`C-A7`).
+    /// The ledger is at its hard cap because pruning keeps failing: new `Pending` and
+    /// `Armed` records are refused (no trip) until a prune succeeds.
     Capacity,
+    /// A `Denied` record over its share of the segment. Only `append_denied` sees
+    /// it, and turns it into `DeniedOutcome::OverQuota`; the refusal is counted.
+    OverQuota,
     /// `close()` has started.
     Closing,
     /// The record is over the size limit; a bug, never cut.
@@ -117,6 +127,7 @@ impl AuditError {
             Self::Busy => "AUDIT_BUSY",
             Self::Timeout => "AUDIT_TIMEOUT",
             Self::Capacity => "AUDIT_CAPACITY",
+            Self::OverQuota => "AUDIT_OVER_QUOTA",
             Self::Closing => "AUDIT_CLOSING",
             Self::RecordTooLarge => "AUDIT_RECORD_TOO_LARGE",
             Self::Invalid(_) => "AUDIT_INVALID_RECORD",
@@ -128,7 +139,7 @@ impl AuditError {
 }
 
 /// Why a writer could not be opened.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AuditOpenError {
     /// The first records could not be written, or the thread not started.
     Io(&'static str),
@@ -136,6 +147,17 @@ pub enum AuditOpenError {
     ModeMismatch,
     /// The ledger has no sequence number left.
     SeqExhausted,
+    /// The directory or a file in it is not what the daemon would have made.
+    UnsafeStore(StoreError),
+    /// The chain does not hold. Nothing is repaired: the operator moves the
+    /// directory aside (RUNBOOK).
+    Corrupt {
+        segment: u64,
+        line: u64,
+        kind: CorruptKind,
+    },
+    /// The ledger was written by a newer format: nothing is read or written.
+    UnsupportedFormat { found: u32 },
 }
 
 /// The two waits of every append (design 6.4.6).
@@ -193,6 +215,18 @@ pub struct AuditStatus {
     pub compensations_lost: u64,
     pub sync_last_ms: u64,
     pub sync_max_ms: u64,
+    /// Segments on disk, the active one included.
+    pub segments: u32,
+    /// Entries pruned before the oldest retained one.
+    pub pruned_entries: u64,
+    /// Files the last prune could not remove (kept, retried).
+    pub prune_deferred: u32,
+    /// Rotations since the writer opened.
+    pub rotations: u64,
+    /// `Denied` records refused for want of quota, since the writer opened.
+    pub denials_over_quota: u64,
+    /// `Pending` and `Armed` records refused because pruning keeps failing.
+    pub capacity_refusals: u64,
     pub destination_logging: DestinationLogging,
     pub dest_key_id: Option<String>,
 }
@@ -201,7 +235,7 @@ pub struct AuditStatus {
 // Opening
 // ---------------------------------------------------------------------------
 
-/// What the open found in the ledger. `C-A7`'s `open_dir` fills it from a
+/// What the open found in the ledger. [`FlowAuditWriter::open_dir`] fills it from a
 /// verified chain; a fresh ledger is [`Replayed::fresh`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Replayed {
@@ -209,17 +243,20 @@ pub struct Replayed {
     pub head: String,
     /// The last sequence number written, `None` for a fresh ledger.
     pub last_seq: Option<u64>,
-    /// The length of the active segment, which the writer checks against `fstat`
-    /// before every batch.
-    pub active_len: u64,
-    pub entries: u64,
-    pub bytes: u64,
+    /// The retained segments, ascending; the last is the active one, whose length
+    /// the writer checks against `fstat` before every batch.
+    pub segments: Vec<SegmentInfo>,
+    /// Bytes of the active segment by record class, for the refusal quota.
+    pub class_bytes: ClassBytes,
     pub unresolved: Unresolved,
     /// Bytes of a torn tail that were cut off; a `Recovered` record is written
     /// when this is not zero.
     pub truncated_tail_bytes: u64,
     /// The reason of the trip that preceded this open, if one did.
     pub after_trip: Option<String>,
+    /// The active segment was created by this open (or may not be durable yet):
+    /// its size and its name are made durable before the first receipt exists (D2).
+    pub new_segment: bool,
 }
 
 impl Replayed {
@@ -228,12 +265,16 @@ impl Replayed {
         Self {
             head: GENESIS.to_owned(),
             last_seq: None,
-            active_len: 0,
-            entries: 0,
-            bytes: 0,
+            segments: vec![SegmentInfo {
+                first_seq: 1,
+                records: 0,
+                bytes: 0,
+            }],
+            class_bytes: ClassBytes::default(),
             unresolved: Unresolved::default(),
             truncated_tail_bytes: 0,
             after_trip: None,
+            new_segment: true,
         }
     }
 }
@@ -254,6 +295,9 @@ pub struct AuditOpenCfg {
     pub daemon_version: String,
     /// Depth of normal jobs; [`DEFAULT_QUEUE_CAP`] in production.
     pub queue_cap: usize,
+    /// One `Summary` is always written this often, whatever its share is
+    /// ([`SUMMARY_FLOOR`] in production).
+    pub summary_floor: Duration,
     /// Wall clock in milliseconds since the epoch; the record's `ts_ms`.
     pub clock: ClockFn,
 }
@@ -278,6 +322,12 @@ pub fn system_clock() -> ClockFn {
 struct Shared {
     entries: AtomicU64,
     bytes: AtomicU64,
+    segments: AtomicU64,
+    pruned_entries: AtomicU64,
+    prune_deferred: AtomicU64,
+    rotations: AtomicU64,
+    denials_over_quota: AtomicU64,
+    capacity_refusals: AtomicU64,
     head: Mutex<String>,
     /// Milliseconds since `base` plus one while the disk part of a batch is
     /// running, 0 otherwise.
@@ -296,8 +346,14 @@ struct Shared {
 impl Shared {
     fn new(replayed: &Replayed) -> Self {
         Self {
-            entries: AtomicU64::new(replayed.entries),
-            bytes: AtomicU64::new(replayed.bytes),
+            entries: AtomicU64::new(0),
+            bytes: AtomicU64::new(0),
+            segments: AtomicU64::new(0),
+            pruned_entries: AtomicU64::new(0),
+            prune_deferred: AtomicU64::new(0),
+            rotations: AtomicU64::new(0),
+            denials_over_quota: AtomicU64::new(0),
+            capacity_refusals: AtomicU64::new(0),
             head: Mutex::new(replayed.head.clone()),
             io_started: AtomicU64::new(0),
             sync_last_ms: AtomicU64::new(0),
@@ -915,12 +971,77 @@ struct Item {
     deliver: Option<Deliver>,
 }
 
+/// The kinds of record the quota and the capacity rule tell apart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Class {
+    Denied,
+    Summary,
+    /// `Pending` and `Armed`: what pruning that keeps failing eventually refuses.
+    Admission,
+    Other,
+}
+
+fn class_of(event: &FlowAuditEvent) -> Class {
+    match event {
+        FlowAuditEvent::Denied { .. } => Class::Denied,
+        FlowAuditEvent::Summary { .. } => Class::Summary,
+        FlowAuditEvent::Pending { .. } | FlowAuditEvent::Armed { .. } => Class::Admission,
+        _ => Class::Other,
+    }
+}
+
+/// A record on its way to the file: everything but the sequence number and the hash
+/// is decided; those are assigned by the pass that encodes it.
+struct Prepared {
+    record: FlowAuditRecord,
+    deliver: Option<Deliver>,
+    class: Class,
+}
+
+/// Why a prepared record was not written.
+enum Verdict {
+    Error(AuditError),
+    /// A `Denied` over its share: counted, not written.
+    OverQuota,
+    /// A `Summary` over its share before its floor: kept for the next one.
+    Held,
+}
+
+/// The outcome of encoding the prepared records one after the other.
+struct Encoded {
+    bytes: Vec<u8>,
+    head: String,
+    next: Option<u64>,
+    /// Index into the prepared records, and what was assigned to it.
+    accepted: Vec<(usize, Written)>,
+    refused: Vec<(usize, Verdict)>,
+    added: ClassBytes,
+    /// A record found no sequence number left.
+    exhausted: bool,
+}
+
 struct Core {
     io: Box<dyn LedgerIo>,
     head: String,
     /// `None` once the last representable sequence number has been written.
     next_seq: Option<u64>,
     expected_len: u64,
+    book: SegmentBook,
+    quota: Quota,
+    segment_bytes: u64,
+    /// Bytes of the active segment by class, for the quota.
+    class_used: ClassBytes,
+    /// Files the last prune could not remove: the next `Continue` says so.
+    deferred_last: u32,
+    /// `Denied` records not written since the last `Continue`.
+    refusals_unrecorded: u64,
+    /// `Denied` records refused for want of quota since the last `Summary` was
+    /// written or held, by reason code.
+    over_quota: BTreeMap<String, u64>,
+    /// Summaries that were merged instead of written because their share was used.
+    held: SummaryEvent,
+    last_summary: Option<Instant>,
+    summary_floor: Duration,
     shared: Arc<Shared>,
     clock: ClockFn,
     on_trip: TripFn,
@@ -961,9 +1082,25 @@ impl Drop for PanicTrip {
     }
 }
 
-/// The answers a batch owes: the callers of the records that were written, and of
-/// those that were refused for want of a sequence number.
+/// The answers a batch owes: the callers of the records that were written.
 type Written2 = (Option<Deliver>, Written);
+
+/// Has the floor between two `Summary` records passed since the last one was
+/// written (`None`: none was)? Every summary is allowed once the floor has.
+fn floor_elapsed(last: Option<Instant>, floor: Duration, now: Instant) -> bool {
+    last.is_none_or(|at| now.saturating_duration_since(at) >= floor)
+}
+
+/// Would appending `batch` bytes to a segment that holds `active` go past `limit`? A
+/// segment that holds nothing is never rotated away, so a batch larger than a
+/// segment still gets one of its own.
+fn overflows(active: u64, batch: u64, limit: u64) -> bool {
+    active > 0 && active.saturating_add(batch) > limit
+}
+
+fn len_u64(len: usize) -> u64 {
+    u64::try_from(len).unwrap_or(u64::MAX)
+}
 
 impl Core {
     fn trip(&self) {
@@ -983,71 +1120,327 @@ impl Core {
     }
 
     /// A write fault: trips first, then answers, so that whoever sees the error
-    /// also sees a tripped gate.
-    fn fail_batch(&self, written: Vec<Written2>, refused: Vec<Option<Deliver>>, error: AuditError) {
+    /// also sees a tripped gate. `failed` get the fault, `exhausted` are told that
+    /// no sequence number was left for them.
+    fn fail_batch(
+        &self,
+        failed: Vec<Option<Deliver>>,
+        exhausted: Vec<Option<Deliver>>,
+        error: AuditError,
+    ) {
         self.trip();
-        for (deliver, _) in written {
+        for deliver in failed {
             self.answer(deliver, Err(error));
         }
-        for deliver in refused {
+        for deliver in exhausted {
             self.answer(deliver, Err(AuditError::SeqExhausted));
         }
     }
 
-    /// Writes `items` as one batch: encode, check the file, append, sync, answer.
-    /// `false` when the writer must stop.
-    fn commit(&mut self, mut items: VecDeque<Item>) -> bool {
+    /// Publishes what status shows. Only the writer thread writes these.
+    fn publish(&self) {
+        let shared = &self.shared;
+        shared.entries.store(self.book.entries(), Ordering::Release);
+        shared.bytes.store(self.book.bytes(), Ordering::Release);
+        shared
+            .segments
+            .store(len_u64(self.book.len()), Ordering::Release);
+        shared
+            .pruned_entries
+            .store(self.book.pruned_entries(), Ordering::Release);
+        shared
+            .prune_deferred
+            .store(u64::from(self.deferred_last), Ordering::Release);
+        *lock_unpoisoned(&shared.head) = self.head.clone();
+    }
+
+    /// Turns a job into a prepared record, or answers it at once. Summaries are not
+    /// prepared one by one: they are folded into `incoming`, so that what the writer
+    /// adds to a summary is added once per batch.
+    fn prepare(
+        &self,
+        item: Item,
+        ts_ms: u64,
+        out: &mut Vec<Prepared>,
+        incoming: &mut Option<SummaryEvent>,
+    ) {
+        let class = class_of(&item.event);
+        if class == Class::Admission && self.book.over_capacity() {
+            // Pruning keeps failing: no new admission until it succeeds. Not a fault.
+            bump(&self.shared.capacity_refusals);
+            self.answer(item.deliver, Err(AuditError::Capacity));
+            return;
+        }
+        if class == Class::Summary {
+            if let Some(from) = SummaryEvent::from_event(item.event) {
+                match incoming {
+                    Some(into) => merge_summary(into, from),
+                    None => *incoming = Some(from),
+                }
+            }
+            return;
+        }
+        out.push(Prepared {
+            record: FlowAuditRecord {
+                seq: 0,
+                ts_ms,
+                flow_id: item.flow_id,
+                event: item.event,
+            },
+            deliver: item.deliver,
+            class,
+        });
+    }
+
+    /// The candidate summary of a batch: the host's, with what the writer holds back
+    /// and what it refused for want of quota.
+    fn summary_candidate(&self, from: SummaryEvent) -> SummaryEvent {
+        let mut candidate = self.held.clone();
+        merge_summary(&mut candidate, from);
+        merge_summary(
+            &mut candidate,
+            SummaryEvent {
+                denials_over_quota: self.over_quota.clone(),
+                ..SummaryEvent::default()
+            },
+        );
+        candidate
+    }
+
+    /// Encodes the prepared records one after the other from the current head and
+    /// sequence number, deciding on the way which are written.
+    fn encode_pass(&self, prepared: &mut [Prepared], now: Instant) -> Encoded {
         let mut head = self.head.clone();
         let mut next = self.next_seq;
-        let mut bytes: Vec<u8> = Vec::new();
+        let floor_due = floor_elapsed(self.last_summary, self.summary_floor, now);
+        let mut out = Encoded {
+            bytes: Vec::new(),
+            head: String::new(),
+            next,
+            accepted: Vec::new(),
+            refused: Vec::new(),
+            added: ClassBytes::default(),
+            exhausted: false,
+        };
+        for (index, item) in prepared.iter_mut().enumerate() {
+            let Some(seq) = next else {
+                out.refused
+                    .push((index, Verdict::Error(AuditError::SeqExhausted)));
+                out.exhausted = true;
+                continue;
+            };
+            item.record.seq = seq;
+            let line = match encode_line(&head, &item.record) {
+                Ok(line) => line,
+                Err(error) => {
+                    out.refused
+                        .push((index, Verdict::Error(encode_error(&error))));
+                    continue;
+                }
+            };
+            let len = len_u64(line.bytes.len());
+            match item.class {
+                Class::Denied => {
+                    if !self
+                        .quota
+                        .denied_fits(&self.class_used, out.added.denied, len)
+                    {
+                        out.refused.push((index, Verdict::OverQuota));
+                        continue;
+                    }
+                    out.added.denied = out.added.denied.saturating_add(len);
+                }
+                Class::Summary => {
+                    if !floor_due && !self.quota.summary_fits(&self.class_used, len) {
+                        out.refused.push((index, Verdict::Held));
+                        continue;
+                    }
+                    out.added.summary = out.added.summary.saturating_add(len);
+                }
+                Class::Admission | Class::Other => {}
+            }
+            out.bytes.extend_from_slice(&line.bytes);
+            head.clone_from(&line.hash);
+            next = seq.checked_add(1);
+            out.accepted.push((
+                index,
+                Written {
+                    seq,
+                    hash: line.hash,
+                },
+            ));
+        }
+        out.head = head;
+        out.next = next;
+        out
+    }
+
+    /// The first sequence number of the next segment, when this batch would overflow
+    /// the active one. A batch is never split, so the limit is soft by at most one
+    /// batch.
+    fn rotation_due(&self, batch_len: usize) -> Option<u64> {
+        if batch_len == 0
+            || !overflows(
+                self.book.active_bytes(),
+                len_u64(batch_len),
+                self.segment_bytes,
+            )
+        {
+            return None;
+        }
+        self.next_seq
+    }
+
+    /// D5, R1 to R7: chooses the segments to prune, creates the next one with its
+    /// `Continue`, makes it durable, switches to it, and unlinks the pruned ones.
+    fn rotate(&mut self, next_first_seq: u64) -> Result<(), AuditError> {
+        let ts_ms = (self.clock)();
+        let plan = self.book.plan_rotation(next_first_seq);
+        let record = FlowAuditRecord {
+            seq: next_first_seq,
+            ts_ms,
+            flow_id: String::new(),
+            event: FlowAuditEvent::Continue {
+                prev_segment_head: self.head.clone(),
+                prev_seq: next_first_seq.saturating_sub(1),
+                pruned_before_seq: plan.pruned_before_seq,
+                prune_deferred: self.deferred_last,
+                refusals_unrecorded: self.refusals_unrecorded,
+            },
+        };
+        let line = encode_line(&self.head, &record).map_err(|error| encode_error(&error))?;
+        {
+            let _mark = IoMark::start(Arc::clone(&self.shared), self.base);
+            self.io
+                .rotate(next_first_seq, &line.bytes)
+                .map_err(|error| AuditError::Io(io_code(&error)))?;
+        }
+        // The new segment is the active one from here on.
+        let len = len_u64(line.bytes.len());
+        self.head = line.hash;
+        self.next_seq = next_first_seq.checked_add(1);
+        self.expected_len = len;
+        self.book.rotated(next_first_seq, 1, len);
+        self.class_used = ClassBytes::default();
+        self.refusals_unrecorded = 0;
+        bump(&self.shared.rotations);
+        self.prune(&plan.victims);
+        self.publish();
+        Ok(())
+    }
+
+    /// R7, and the retry of an earlier round's leftovers: a segment that cannot be
+    /// removed is kept and counted, never a fault.
+    fn prune(&mut self, victims: &[u64]) {
+        if victims.is_empty() {
+            return;
+        }
+        let outcome = {
+            let _mark = IoMark::start(Arc::clone(&self.shared), self.base);
+            self.io.prune(victims)
+        };
+        match outcome {
+            Ok(outcome) => {
+                self.book.pruned(&outcome.removed);
+                self.deferred_last = outcome.deferred;
+            }
+            Err(_) => {
+                self.deferred_last = u32::try_from(victims.len()).unwrap_or(u32::MAX);
+            }
+        }
+    }
+
+    /// Writes `items` as one batch: prepare, encode, rotate if the segment is full,
+    /// check the file, append, sync, answer. `false` when the writer must stop.
+    #[allow(clippy::too_many_lines)]
+    fn commit(&mut self, mut items: VecDeque<Item>) -> bool {
+        let mut prepared: Vec<Prepared> = Vec::new();
         let mut written: Vec<Written2> = Vec::new();
-        let mut refused: Vec<Option<Deliver>> = Vec::new();
+        let mut exhausted_delivers: Vec<Option<Deliver>> = Vec::new();
         // After everything that holds a reply channel (see `PanicTrip`).
         let _panic_trip = PanicTrip {
             shared: Arc::clone(&self.shared),
             on_trip: Arc::clone(&self.on_trip),
         };
+        if self.book.over_capacity() {
+            // Pruning failed for so long that new admissions are being refused: try
+            // again now, so that the first success lifts the refusal.
+            let leftovers = self.book.leftovers();
+            self.prune(&leftovers);
+            self.publish();
+        }
+        let mut incoming: Option<SummaryEvent> = None;
+        let mut last_ts = 0;
         while !items.is_empty() {
             // Read before the item is taken: the clock is somebody else's code.
-            let ts_ms = (self.clock)();
+            last_ts = (self.clock)();
             let Some(item) = items.pop_front() else {
                 break;
             };
-            let Some(seq) = next else {
-                refused.push(item.deliver);
-                continue;
-            };
-            let Item {
-                flow_id,
-                event,
-                deliver,
-            } = item;
-            let record = FlowAuditRecord {
-                seq,
-                ts_ms,
-                flow_id,
-                event,
-            };
-            match encode_line(&head, &record) {
-                Ok(line) => {
-                    bytes.extend_from_slice(&line.bytes);
-                    head = line.hash.clone();
-                    next = seq.checked_add(1);
-                    written.push((
-                        deliver,
-                        Written {
-                            seq,
-                            hash: line.hash,
-                        },
-                    ));
+            self.prepare(item, last_ts, &mut prepared, &mut incoming);
+        }
+        if let Some(from) = incoming.take() {
+            prepared.push(Prepared {
+                record: FlowAuditRecord {
+                    seq: 0,
+                    ts_ms: last_ts,
+                    flow_id: String::new(),
+                    event: self.summary_candidate(from).into_event(),
+                },
+                deliver: None,
+                class: Class::Summary,
+            });
+        }
+
+        let now = Instant::now();
+        let mut encoded = self.encode_pass(&mut prepared, now);
+        if let Some(next_first_seq) = self.rotation_due(encoded.bytes.len()) {
+            if let Err(error) = self.rotate(next_first_seq) {
+                let all = prepared.iter_mut().map(|p| p.deliver.take()).collect();
+                self.fail_batch(all, Vec::new(), error);
+                return false;
+            }
+            // The new segment starts with its `Continue`: numbers, hashes and the
+            // quota's counters all start again from there.
+            encoded = self.encode_pass(&mut prepared, now);
+        }
+        let exhausted = encoded.exhausted;
+        let summary_written = encoded.accepted.iter().any(|(index, _)| {
+            prepared
+                .get(*index)
+                .is_some_and(|p| p.class == Class::Summary)
+        });
+        for (index, verdict) in std::mem::take(&mut encoded.refused) {
+            let deliver = prepared.get_mut(index).and_then(|p| p.deliver.take());
+            match verdict {
+                Verdict::Error(AuditError::SeqExhausted) => exhausted_delivers.push(deliver),
+                Verdict::Error(error) => self.answer(deliver, Err(error)),
+                Verdict::OverQuota => {
+                    self.note_over_quota(prepared.get(index).map(|p| &p.record.event));
+                    self.answer(deliver, Err(AuditError::OverQuota));
                 }
-                Err(error) => self.answer(deliver, Err(encode_error(&error))),
+                Verdict::Held => {
+                    if let Some(candidate) = prepared
+                        .get(index)
+                        .and_then(|p| SummaryEvent::from_event(p.record.event.clone()))
+                    {
+                        // The candidate already holds the old held summaries and the
+                        // over-quota counts: it replaces both.
+                        self.held = candidate;
+                        self.over_quota.clear();
+                    }
+                    // Kept for the next summary, not lost: nothing is counted as lost.
+                    drop(deliver);
+                }
             }
         }
-        let exhausted = !refused.is_empty();
+        for (index, written_at) in std::mem::take(&mut encoded.accepted) {
+            let deliver = prepared.get_mut(index).and_then(|p| p.deliver.take());
+            written.push((deliver, written_at));
+        }
         if written.is_empty() {
             if exhausted {
-                self.fail_batch(Vec::new(), refused, AuditError::SeqExhausted);
+                self.fail_batch(Vec::new(), exhausted_delivers, AuditError::SeqExhausted);
                 return false;
             }
             return true;
@@ -1055,38 +1448,58 @@ impl Core {
 
         let took = {
             let _mark = IoMark::start(Arc::clone(&self.shared), self.base);
-            self.write_batch(&bytes)
+            self.write_batch(&encoded.bytes)
         };
         let took = match took {
             Ok(took) => took,
             Err(error) => {
-                self.fail_batch(written, refused, error);
+                let failed = written.drain(..).map(|(deliver, _)| deliver).collect();
+                self.fail_batch(failed, exhausted_delivers, error);
                 return false;
             }
         };
 
         // Durable. Move the state first, then answer, so that a caller that sees
         // its receipt also sees the status that includes it.
-        let added = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
-        let count = u64::try_from(written.len()).unwrap_or(u64::MAX);
+        let added = len_u64(encoded.bytes.len());
         self.expected_len = self.expected_len.saturating_add(added);
-        self.head = head;
-        self.next_seq = next;
-        self.shared.entries.fetch_add(count, Ordering::AcqRel);
-        self.shared.bytes.fetch_add(added, Ordering::AcqRel);
-        *lock_unpoisoned(&self.shared.head) = self.head.clone();
+        self.head = encoded.head;
+        self.next_seq = encoded.next;
+        self.book.appended(len_u64(written.len()), added);
+        self.class_used.denied = self.class_used.denied.saturating_add(encoded.added.denied);
+        self.class_used.summary = self
+            .class_used
+            .summary
+            .saturating_add(encoded.added.summary);
+        if summary_written {
+            self.held = SummaryEvent::default();
+            self.over_quota.clear();
+            self.last_summary = Some(Instant::now());
+        }
+        self.publish();
         self.shared.sync_last_ms.store(took, Ordering::Release);
         self.shared.sync_max_ms.fetch_max(took, Ordering::AcqRel);
-        for (deliver, written) in written {
-            self.answer(deliver, Ok(written));
+        for (deliver, written_at) in written.drain(..) {
+            self.answer(deliver, Ok(written_at));
         }
         if exhausted {
             // The numbers ran out inside this batch: what fitted is durable and
             // answered; the rest are refused, after the trip.
-            self.fail_batch(Vec::new(), refused, AuditError::SeqExhausted);
+            self.fail_batch(Vec::new(), exhausted_delivers, AuditError::SeqExhausted);
             return false;
         }
         true
+    }
+
+    /// A `Denied` was refused for want of quota: counted by reason code, to be
+    /// carried by the next `Summary`, and in total by the next `Continue`.
+    fn note_over_quota(&mut self, event: Option<&FlowAuditEvent>) {
+        if let Some(FlowAuditEvent::Denied { reason_code, .. }) = event {
+            let count = self.over_quota.entry(reason_code.clone()).or_insert(0);
+            *count = count.saturating_add(1);
+        }
+        self.refusals_unrecorded = self.refusals_unrecorded.saturating_add(1);
+        bump(&self.shared.denials_over_quota);
     }
 
     /// The disk part of a batch: check the file, append, sync. On a failure the file
@@ -1266,9 +1679,8 @@ impl FlowAuditWriter {
     /// # Errors
     /// [`AuditOpenError`].
     // Crate-internal on purpose: a writer over a disk of one's own choosing can
-    // issue receipts. `open_dir` (`C-A7`) is the entry point; this is its body and
+    // issue receipts. `open::open_dir` is the entry point; this is its body and
     // the seam of the tests.
-    #[allow(dead_code)]
     pub(crate) fn open_with(
         io: impl LedgerIo,
         replayed: Replayed,
@@ -1288,11 +1700,26 @@ impl FlowAuditWriter {
         }
         let shared = Arc::new(Shared::new(&replayed));
         let base = Instant::now();
+        let book = SegmentBook::new(replayed.segments.clone(), cfg.retain_segments);
         let mut core = Core {
             io: Box::new(io),
             head: replayed.head.clone(),
             next_seq,
-            expected_len: replayed.active_len,
+            expected_len: book.active_bytes(),
+            book,
+            quota: Quota::new(
+                cfg.segment_bytes,
+                cfg.denied_share_percent,
+                cfg.summary_share_percent,
+            ),
+            segment_bytes: cfg.segment_bytes,
+            class_used: replayed.class_bytes,
+            deferred_last: 0,
+            refusals_unrecorded: 0,
+            over_quota: BTreeMap::new(),
+            held: SummaryEvent::default(),
+            last_summary: None,
+            summary_floor: cfg.summary_floor,
             shared: Arc::clone(&shared),
             clock: Arc::clone(&cfg.clock),
             // A failure while opening is the opener's to report, not a trip.
@@ -1341,6 +1768,13 @@ impl FlowAuditWriter {
             Some(Err(error)) => return Err(AuditOpenError::Io(error.code())),
             None => return Err(AuditOpenError::Io("AUDIT_IO")),
         };
+        if replayed.new_segment {
+            // D2: the segment's size and its name are durable before the first
+            // receipt can exist.
+            core.io
+                .make_durable()
+                .map_err(|error| AuditOpenError::Io(io_code(&error)))?;
+        }
         core.on_trip = Arc::clone(&on_trip);
 
         let (tx, rx) = mpsc::unbounded_channel();
@@ -1663,11 +2097,16 @@ impl FlowAuditWriter {
             route: event.route,
             coalesced: event.coalesced,
         };
-        self.core
+        match self
+            .core
             .submit(String::new(), record, waits, |written, _| {
                 DeniedOutcome::Recorded(Receipt::new(written))
             })
             .await
+        {
+            Err(AuditError::OverQuota) => Ok(DeniedOutcome::OverQuota),
+            other => other,
+        }
     }
 
     /// `Armed`: durable before the gate opens.
@@ -1805,6 +2244,13 @@ impl FlowAuditWriter {
             compensations_lost: shared.compensations_lost.load(Ordering::Relaxed),
             sync_last_ms: shared.sync_last_ms.load(Ordering::Relaxed),
             sync_max_ms: shared.sync_max_ms.load(Ordering::Relaxed),
+            segments: u32::try_from(shared.segments.load(Ordering::Acquire)).unwrap_or(u32::MAX),
+            pruned_entries: shared.pruned_entries.load(Ordering::Acquire),
+            prune_deferred: u32::try_from(shared.prune_deferred.load(Ordering::Acquire))
+                .unwrap_or(u32::MAX),
+            rotations: shared.rotations.load(Ordering::Relaxed),
+            denials_over_quota: shared.denials_over_quota.load(Ordering::Relaxed),
+            capacity_refusals: shared.capacity_refusals.load(Ordering::Relaxed),
             destination_logging: self.core.sealer.mode(),
             dest_key_id: self.core.sealer.kid().map(str::to_owned),
         }
@@ -1855,11 +2301,23 @@ mod tests {
         Append(usize),
         Sync,
         Truncate(u64),
+        Rotate(u64, usize),
+        Prune(Vec<u64>),
+        MakeDurable,
     }
 
-    #[derive(Default)]
     struct Disk {
+        /// The active segment.
         file: Vec<u8>,
+        /// The first sequence number the active segment is named for.
+        active_first: u64,
+        /// Segments that were rotated away from, oldest first.
+        closed: Vec<(u64, Vec<u8>)>,
+        /// Segments whose removal fails (they are kept and counted as deferred).
+        stuck: Vec<u64>,
+        fail_rotate: bool,
+        fail_make_durable: bool,
+        prune_errors: bool,
         calls: Vec<Call>,
         appends: usize,
         syncs: usize,
@@ -1871,6 +2329,10 @@ mod tests {
         in_sync: bool,
         block_append: bool,
         in_append: bool,
+        block_rotate: bool,
+        in_rotate: bool,
+        block_prune: bool,
+        in_prune: bool,
         unlinked: bool,
         stat_fails: bool,
         panic_on_append: bool,
@@ -1884,12 +2346,51 @@ mod tests {
     #[derive(Clone)]
     struct FakeIo(Arc<DiskCell>);
 
+    impl Default for Disk {
+        fn default() -> Self {
+            Self {
+                file: Vec::new(),
+                active_first: 1,
+                closed: Vec::new(),
+                stuck: Vec::new(),
+                fail_rotate: false,
+                fail_make_durable: false,
+                prune_errors: false,
+                calls: Vec::new(),
+                appends: 0,
+                syncs: 0,
+                fail_append_at: None,
+                fail_sync_at: None,
+                block_sync: false,
+                in_sync: false,
+                block_append: false,
+                in_append: false,
+                block_rotate: false,
+                in_rotate: false,
+                block_prune: false,
+                in_prune: false,
+                unlinked: false,
+                stat_fails: false,
+                panic_on_append: false,
+            }
+        }
+    }
+
     impl FakeIo {
         fn new() -> Self {
             Self(Arc::new(DiskCell {
                 disk: Mutex::new(Disk::default()),
                 changed: Condvar::new(),
             }))
+        }
+
+        /// Every segment, oldest first, as (first sequence number, bytes).
+        fn segments(&self) -> Vec<(u64, Vec<u8>)> {
+            self.with(|d| {
+                let mut all = d.closed.clone();
+                all.push((d.active_first, d.file.clone()));
+                all
+            })
         }
 
         fn with<T>(&self, f: impl FnOnce(&mut Disk) -> T) -> T {
@@ -1904,6 +2405,8 @@ mod tests {
             self.with(|d| {
                 d.block_sync = false;
                 d.block_append = false;
+                d.block_rotate = false;
+                d.block_prune = false;
             });
             self.0.changed.notify_all();
         }
@@ -1917,21 +2420,43 @@ mod tests {
         }
 
         fn text(&self) -> String {
-            self.with(|d| String::from_utf8_lossy(&d.file).into_owned())
+            let all: Vec<u8> = self
+                .segments()
+                .into_iter()
+                .flat_map(|(_, bytes)| bytes)
+                .collect();
+            String::from_utf8_lossy(&all).into_owned()
         }
 
-        /// Every record on the "disk", each verified against the chain from genesis.
+        /// Every record on the "disk", oldest first, each verified against the
+        /// chain: from genesis when segment 1 is still there, else from the anchor
+        /// of the oldest segment.
         fn records(&self) -> Vec<FlowAuditRecord> {
-            let bytes = self.with(|d| d.file.clone());
-            let mut chain = Chain::genesis();
+            let mut chain: Option<Chain> = None;
             let mut out = Vec::new();
-            for line in bytes.split(|byte| *byte == b'\n') {
-                if line.is_empty() {
-                    continue;
+            for (first_seq, bytes) in self.segments() {
+                for line in bytes.split(|byte| *byte == b'\n') {
+                    if line.is_empty() {
+                        continue;
+                    }
+                    let chain = chain.get_or_insert_with(|| {
+                        if first_seq == 1 {
+                            Chain::genesis()
+                        } else {
+                            let (head, prev_seq) = crate::ingress::audit::verify::peek_anchor(line)
+                                .expect("the oldest segment starts with its anchor");
+                            Chain::resume(head, prev_seq)
+                        }
+                    });
+                    out.push(chain.accept(line).expect("every line chains"));
                 }
-                out.push(chain.accept(line).expect("every line chains"));
             }
             out
+        }
+
+        /// A read-only view for `verify_dir`.
+        fn view(&self) -> FakeView {
+            FakeView(self.clone())
         }
     }
 
@@ -2003,12 +2528,125 @@ mod tests {
             Ok(())
         }
 
-        fn rotate(&mut self, _next_first_seq: u64, _first_record: &[u8]) -> io::Result<()> {
-            Err(io::Error::other("rotation is C-A7"))
+        fn rotate(&mut self, next_first_seq: u64, first_record: &[u8]) -> io::Result<()> {
+            let mut disk = lock_unpoisoned(&self.0.disk);
+            disk.in_rotate = true;
+            self.0.changed.notify_all();
+            while disk.block_rotate {
+                disk = self
+                    .0
+                    .changed
+                    .wait(disk)
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+            }
+            disk.in_rotate = false;
+            disk.calls
+                .push(Call::Rotate(next_first_seq, first_record.len()));
+            if disk.fail_rotate {
+                return Err(io::Error::from(io::ErrorKind::StorageFull));
+            }
+            let old = std::mem::replace(&mut disk.file, first_record.to_vec());
+            let old_first = std::mem::replace(&mut disk.active_first, next_first_seq);
+            disk.closed.push((old_first, old));
+            Ok(())
         }
 
-        fn prune(&mut self, _keep: u32) -> io::Result<super::super::fs::PruneOutcome> {
-            Err(io::Error::other("pruning is C-A7"))
+        fn prune(&mut self, victims: &[u64]) -> io::Result<super::super::fs::PruneOutcome> {
+            let mut disk = lock_unpoisoned(&self.0.disk);
+            disk.in_prune = true;
+            self.0.changed.notify_all();
+            while disk.block_prune {
+                disk = self
+                    .0
+                    .changed
+                    .wait(disk)
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+            }
+            disk.in_prune = false;
+            disk.calls.push(Call::Prune(victims.to_vec()));
+            if disk.prune_errors {
+                return Err(io::Error::other("the directory cannot be listed"));
+            }
+            let mut outcome = super::super::fs::PruneOutcome::default();
+            for (done, victim) in victims.iter().enumerate() {
+                if disk.stuck.contains(victim) {
+                    // Oldest first, and no further (see `StoreIo::prune`).
+                    outcome.deferred = u32::try_from(victims.len() - done).expect("fits");
+                    break;
+                }
+                disk.closed.retain(|(first, _)| first != victim);
+                outcome.removed.push(*victim);
+            }
+            Ok(outcome)
+        }
+
+        fn make_durable(&mut self) -> io::Result<()> {
+            let mut disk = lock_unpoisoned(&self.0.disk);
+            disk.calls.push(Call::MakeDurable);
+            if disk.fail_make_durable {
+                return Err(io::Error::from(io::ErrorKind::PermissionDenied));
+            }
+            Ok(())
+        }
+    }
+
+    /// The disk double as a store that `verify_dir` can read.
+    struct FakeView(FakeIo);
+
+    impl crate::ingress::audit::fs::LedgerStore for FakeView {
+        fn created(&self) -> bool {
+            false
+        }
+
+        fn segments(&self) -> Result<crate::ingress::audit::fs::Segments, StoreError> {
+            Ok(crate::ingress::audit::fs::Segments {
+                first_seqs: self
+                    .0
+                    .segments()
+                    .into_iter()
+                    .map(|(first, _)| first)
+                    .collect(),
+                ignored: 0,
+            })
+        }
+
+        fn open_reader(
+            &self,
+            first_seq: u64,
+        ) -> Result<crate::ingress::audit::fs::SegmentReader, StoreError> {
+            let bytes = self
+                .0
+                .segments()
+                .into_iter()
+                .find(|(first, _)| *first == first_seq)
+                .map(|(_, bytes)| bytes)
+                .ok_or(StoreError::Io("AUDIT_NOT_FOUND"))?;
+            Ok(crate::ingress::audit::fs::SegmentReader {
+                len: u64::try_from(bytes.len()).expect("fits"),
+                reader: Box::new(std::io::Cursor::new(bytes)),
+            })
+        }
+
+        fn open_active(
+            &self,
+            _: u64,
+        ) -> Result<Box<dyn crate::ingress::audit::fs::ActiveSegment>, StoreError> {
+            Err(StoreError::Unsupported)
+        }
+
+        fn create_segment(
+            &self,
+            _: u64,
+        ) -> Result<Box<dyn crate::ingress::audit::fs::ActiveSegment>, StoreError> {
+            Err(StoreError::Unsupported)
+        }
+
+        fn remove_segment(&self, _: u64) -> io::Result<()> {
+            Err(io::Error::other("read-only"))
+        }
+
+        fn sync_dir(&self) -> io::Result<()> {
+            Ok(())
         }
     }
 
@@ -2028,6 +2666,7 @@ mod tests {
             fingerprint: view.fingerprint,
             daemon_version: "0.0.0-test".to_owned(),
             queue_cap,
+            summary_floor: Duration::from_secs(300),
             clock: Arc::new(move || 1_700_000_000_000 + ticks.fetch_add(1, Ordering::Relaxed)),
         }
     }
@@ -2199,7 +2838,16 @@ mod tests {
         assert_eq!(writer.boot_seq(), 1);
         assert_eq!(writer.next_flow_id(), "ingress:b1:1");
         assert_eq!(writer.next_flow_id(), "ingress:b1:2");
-        assert_eq!(io.calls(), [Call::Stat, Call::Append(io.len()), Call::Sync]);
+        assert_eq!(
+            io.calls(),
+            [
+                Call::Stat,
+                Call::Append(io.len()),
+                Call::Sync,
+                Call::MakeDurable
+            ],
+            "a new segment is made durable before the first receipt"
+        );
 
         let hashed = FakeIo::new();
         let key = Arc::new(DestKey::from_bytes([7; 32]));
@@ -2236,18 +2884,23 @@ mod tests {
         drop(receipt);
         first.close(Duration::from_secs(10)).await;
         let last = io.records().last().map(|r| r.seq).expect("records");
+        let len = u64::try_from(io.len()).expect("fits");
         let replayed = Replayed {
             head: first.status().head,
             last_seq: Some(last),
-            active_len: u64::try_from(io.len()).expect("fits"),
-            entries: last,
-            bytes: u64::try_from(io.len()).expect("fits"),
+            segments: vec![SegmentInfo {
+                first_seq: 1,
+                records: last,
+                bytes: len,
+            }],
+            class_bytes: ClassBytes::default(),
             unresolved: Unresolved {
                 pending: 1,
                 open_tunnels: 0,
             },
             truncated_tail_bytes: 12,
             after_trip: Some("audit_write_failed".to_owned()),
+            new_segment: false,
         };
         assert_eq!(status.entries, 2);
         let (on_trip_seen, on_trip) = trips();
@@ -4974,6 +5627,596 @@ mod tests {
         }));
     }
 
+    // -- rotation, retention, quota ----------------------------------------------------------
+
+    /// A writer with small segments, over `io`.
+    fn open_sized(
+        io: &FakeIo,
+        segment_bytes: u64,
+        retain: u32,
+        denied_percent: u8,
+        summary_percent: u8,
+        floor: Duration,
+    ) -> (Arc<FlowAuditWriter>, Trips) {
+        let (seen, on_trip) = trips();
+        let mut config = cfg(DestinationLogging::Plain, 64);
+        config.segment_bytes = segment_bytes;
+        config.retain_segments = retain;
+        config.denied_share_percent = denied_percent;
+        config.summary_share_percent = summary_percent;
+        config.summary_floor = floor;
+        let writer = FlowAuditWriter::open_with(
+            io.clone(),
+            Replayed::fresh(),
+            &config,
+            DestSealer::Plain,
+            on_trip,
+        )
+        .expect("opens");
+        (Arc::new(writer), seen)
+    }
+
+    fn verified(io: &FakeIo) -> crate::ingress::audit::verify::Verified {
+        crate::ingress::audit::verify::verify_dir(
+            &io.view(),
+            crate::ingress::audit::verify::VerifyMode::Open,
+        )
+        .expect("the ledger verifies")
+    }
+
+    fn continues(io: &FakeIo) -> Vec<(u64, FlowAuditEvent)> {
+        io.records()
+            .into_iter()
+            .filter(|r| matches!(r.event, FlowAuditEvent::Continue { .. }))
+            .map(|r| (r.seq, r.event))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_full_segment_rotates_and_the_chain_stays_one_chain() {
+        let io = FakeIo::new();
+        let (writer, seen) = open_sized(&io, 2_000, 8, 100, 5, SUMMARY_FLOOR);
+        for _ in 0..20 {
+            deny(&writer, LONG).await.expect("recorded");
+        }
+        let status = writer.status();
+        assert!(status.rotations >= 3, "{status:?}");
+        assert_eq!(
+            status.segments,
+            u32::try_from(io.segments().len()).expect("fits")
+        );
+        let v = verified(&io);
+        assert_eq!(v.entries, status.entries);
+        assert_eq!(v.bytes, status.bytes);
+        assert_eq!(v.head, status.head);
+        assert!(lock_unpoisoned(&seen).is_empty());
+        // Each segment but the first starts with the Continue that links it to the one
+        // before: its previous number and hash are the end of that segment.
+        let segments = io.segments();
+        for window in segments.windows(2) {
+            let first_line = window[1].1.split(|b| *b == b'\n').next().expect("line");
+            let (head, prev_seq) =
+                crate::ingress::audit::verify::peek_anchor(first_line).expect("a Continue");
+            let before = crate::ingress::audit::record::Chain::resume(String::new(), 0);
+            let _ = before;
+            let last_line = window[0]
+                .1
+                .split(|b| *b == b'\n')
+                .rfind(|l| !l.is_empty())
+                .expect("line");
+            assert_eq!(&last_line[..64], head.as_bytes(), "prev_segment_head");
+            let last: FlowAuditRecord = serde_json::from_slice(&last_line[65..]).expect("a record");
+            assert_eq!(last.seq, prev_seq, "prev_seq");
+        }
+    }
+
+    #[tokio::test]
+    async fn the_rotation_is_made_before_the_batch_and_in_the_documented_order() {
+        let io = FakeIo::new();
+        let (writer, _) = open_sized(&io, 1_200, 8, 100, 5, SUMMARY_FLOOR);
+        for _ in 0..4 {
+            deny(&writer, LONG).await.expect("recorded");
+        }
+        // Wherever the segment filled up, the rotation was the first thing done for
+        // the batch that did not fit, and the batch followed it, in the new segment.
+        let calls = io.calls();
+        let at = calls
+            .iter()
+            .position(|c| matches!(c, Call::Rotate(..)))
+            .expect("a rotation");
+        assert!(
+            matches!(
+                calls.get(at..at + 4),
+                Some([Call::Rotate(..), Call::Stat, Call::Append(_), Call::Sync])
+            ) || matches!(
+                calls.get(at..at + 5),
+                Some([
+                    Call::Rotate(..),
+                    Call::Prune(_),
+                    Call::Stat,
+                    Call::Append(_),
+                    Call::Sync
+                ])
+            ),
+            "{calls:?}"
+        );
+        // The Continue is the first record of the new segment, the batch the second.
+        let segments = io.segments();
+        let newest = &segments.last().expect("segment").1;
+        let first = newest.split(|b| *b == b'\n').next().expect("line");
+        assert!(crate::ingress::audit::verify::peek_anchor(first).is_some());
+        let kinds: Vec<&str> = io
+            .records()
+            .iter()
+            .rev()
+            .take(2)
+            .map(|r| r.event.kind())
+            .collect();
+        assert_eq!(kinds, ["denied", "continue"]);
+    }
+
+    #[tokio::test]
+    async fn retention_keeps_the_newest_segments_and_the_continue_names_the_first_survivor() {
+        let io = FakeIo::new();
+        let (writer, _) = open_sized(&io, 1_200, 3, 100, 5, SUMMARY_FLOOR);
+        for _ in 0..30 {
+            deny(&writer, LONG).await.expect("recorded");
+        }
+        let status = writer.status();
+        assert!(status.rotations >= 5);
+        assert_eq!(io.segments().len(), 3, "retain_segments");
+        assert_eq!(status.segments, 3);
+        let v = verified(&io);
+        let oldest = v.segments.first().expect("segment").first_seq;
+        assert!(oldest > 1);
+        assert_eq!(status.pruned_entries, oldest - 1);
+        assert_eq!(v.pruned_entries(), oldest - 1);
+        // The most recent Continue said which sequence number survives its own prune:
+        // the oldest segment that is there now.
+        let (_, last) = continues(&io).into_iter().next_back().expect("a continue");
+        match last {
+            FlowAuditEvent::Continue {
+                pruned_before_seq,
+                prune_deferred,
+                ..
+            } => {
+                assert_eq!(pruned_before_seq, Some(oldest));
+                assert_eq!(prune_deferred, 0);
+            }
+            other => panic!("not Continue: {other:?}"),
+        }
+        // Pruned oldest first, each round: the calls list victims in order.
+        let pruned: Vec<Vec<u64>> = io
+            .calls()
+            .into_iter()
+            .filter_map(|c| match c {
+                Call::Prune(v) => Some(v),
+                _ => None,
+            })
+            .collect();
+        assert!(pruned.iter().all(|v| v.windows(2).all(|w| w[0] < w[1])));
+        assert_eq!(pruned.first().map(Vec::len), Some(1));
+    }
+
+    #[tokio::test]
+    async fn a_batch_is_never_split_across_two_segments() {
+        let io = FakeIo::new();
+        let (writer, _) = open_sized(&io, 1_500, 8, 100, 5, SUMMARY_FLOOR);
+        deny(&writer, LONG).await.expect("recorded");
+        io.block();
+        let disarm = |writer: Arc<FlowAuditWriter>| async move {
+            writer
+                .append_disarmed(
+                    DisarmedEvent {
+                        cause: DisarmCause::Operator,
+                        epoch: 1,
+                    },
+                    Duration::from_secs(20),
+                )
+                .await;
+        };
+        let mut tasks = vec![tokio::spawn(disarm(Arc::clone(&writer)))];
+        eventually("in sync", || io.with(|d| d.in_sync)).await;
+        for _ in 0..8 {
+            tasks.push(tokio::spawn(disarm(Arc::clone(&writer))));
+        }
+        eventually("queued", || writer.status().queue_depth == 8).await;
+        io.release();
+        for task in tasks {
+            task.await.expect("joined");
+        }
+        // The nine that waited behind the sync are one batch or two, but never half of
+        // one: the segment size is soft by at most a batch. With a limit of 1500 and
+        // 8 records of about 100 bytes, the eight fit one segment.
+        let v = verified(&io);
+        let eight = v.segments.iter().filter(|s| s.records >= 8).count();
+        assert_eq!(eight, 1, "{:?}", v.segments);
+    }
+
+    #[tokio::test]
+    async fn a_batch_larger_than_a_segment_never_leaves_an_empty_segment_behind() {
+        let io = FakeIo::new();
+        // Smaller than one record.
+        let (writer, _) = open_sized(&io, 100, 4, 100, 5, SUMMARY_FLOOR);
+        for _ in 0..6 {
+            deny(&writer, LONG).await.expect("recorded");
+        }
+        let v = verified(&io);
+        assert!(
+            v.segments.iter().all(|s| s.records >= 1),
+            "{:?}",
+            v.segments
+        );
+        // One record per batch and its Continue: two per segment once rotating.
+        assert!(
+            v.segments.iter().skip(1).all(|s| s.records == 2),
+            "{:?}",
+            v.segments
+        );
+    }
+
+    #[tokio::test]
+    async fn a_rotation_that_fails_trips_and_leaves_the_old_segment_as_it_was() {
+        let io = FakeIo::new();
+        let (writer, seen) = open_sized(&io, 1_000, 8, 100, 5, SUMMARY_FLOOR);
+        deny(&writer, LONG).await.expect("recorded");
+        deny(&writer, LONG).await.expect("recorded");
+        let before = io.segments();
+        io.with(|d| d.fail_rotate = true);
+        assert_eq!(
+            deny(&writer, LONG).await.err(),
+            Some(AuditError::Io("AUDIT_DISK_FULL"))
+        );
+        assert_eq!(*lock_unpoisoned(&seen), [TripReason::AuditWriteFailed]);
+        assert_eq!(
+            io.segments(),
+            before,
+            "nothing was written to either segment"
+        );
+        assert_eq!(writer.status().state, WriterState::Down);
+    }
+
+    #[tokio::test]
+    async fn a_prune_that_fails_is_kept_counted_in_the_next_continue_and_retried() {
+        let io = FakeIo::new();
+        let (writer, seen) = open_sized(&io, 1_200, 3, 100, 5, SUMMARY_FLOOR);
+        io.with(|d| d.stuck = vec![1]);
+        for _ in 0..24 {
+            deny(&writer, LONG).await.expect("recorded");
+        }
+        assert!(
+            lock_unpoisoned(&seen).is_empty(),
+            "a prune is never a fault"
+        );
+        let status = writer.status();
+        assert!(io.segments().iter().any(|(first, _)| *first == 1), "kept");
+        assert!(status.prune_deferred >= 1);
+        // The Continue after a failed round says so.
+        let deferred: Vec<u32> = continues(&io)
+            .into_iter()
+            .filter_map(|(_, e)| match e {
+                FlowAuditEvent::Continue { prune_deferred, .. } => Some(prune_deferred),
+                _ => None,
+            })
+            .collect();
+        assert!(deferred.iter().any(|d| *d >= 1), "{deferred:?}");
+        // It verifies with the old segment still there, and the numbers are exact.
+        let v = verified(&io);
+        assert_eq!(v.entries, status.entries);
+        // When the file can be removed, the next rotation sweeps it with the rest.
+        io.with(|d| d.stuck.clear());
+        for _ in 0..12 {
+            deny(&writer, LONG).await.expect("recorded");
+        }
+        assert!(!io.segments().iter().any(|(first, _)| *first == 1));
+        assert_eq!(io.segments().len(), 3);
+        assert_eq!(writer.status().prune_deferred, 0);
+    }
+
+    #[tokio::test]
+    async fn a_prune_that_cannot_run_at_all_defers_every_victim_and_is_not_a_fault() {
+        let io = FakeIo::new();
+        let (writer, seen) = open_sized(&io, 1_200, 3, 100, 5, SUMMARY_FLOOR);
+        io.with(|d| d.prune_errors = true);
+        for _ in 0..16 {
+            deny(&writer, LONG).await.expect("recorded");
+        }
+        assert!(lock_unpoisoned(&seen).is_empty());
+        assert!(writer.status().prune_deferred >= 1);
+        assert!(io.segments().len() > 3);
+    }
+
+    #[tokio::test]
+    async fn at_twice_the_retention_admissions_are_refused_until_a_prune_succeeds() {
+        let io = FakeIo::new();
+        // Retention 2, so the hard cap is four segments.
+        let (writer, seen) = open_sized(&io, 1_000, 2, 100, 5, SUMMARY_FLOOR);
+        io.with(|d| d.stuck = (1..10_000).collect());
+        let mut n = 0;
+        while io.segments().len() < 4 && n < 200 {
+            deny(&writer, LONG).await.expect("recorded");
+            n += 1;
+        }
+        assert!(io.segments().len() >= 4);
+        // New admissions are refused, and it is not a fault.
+        assert_eq!(
+            pend(&writer, "example.com", 443, LONG).await.err(),
+            Some(AuditError::Capacity)
+        );
+        assert!(lock_unpoisoned(&seen).is_empty());
+        assert_eq!(writer.status().capacity_refusals, 1);
+        // What closes a story is still written.
+        assert!(deny(&writer, LONG).await.is_ok());
+        // The first successful prune lifts the refusal.
+        io.with(|d| d.stuck.clear());
+        assert!(
+            deny(&writer, LONG).await.is_ok(),
+            "the sweep runs with the batch"
+        );
+        let receipt = pend(&writer, "example.com", 443, LONG)
+            .await
+            .expect("admissions are back");
+        receipt.mark_dial_started();
+        assert!(io.segments().len() <= 3, "{}", io.segments().len());
+    }
+
+    #[tokio::test]
+    async fn a_denial_flood_cannot_push_admitted_evidence_out_of_the_ledger() {
+        let io = FakeIo::new();
+        // 40 kB segments; refusals may use 20 percent of one.
+        let (writer, _) = open_sized(&io, 40_000, 4, 20, 5, SUMMARY_FLOOR);
+        let kept = pend(&writer, "example.com", 443, LONG)
+            .await
+            .expect("admitted");
+        kept.mark_dial_started();
+        let (mut recorded, mut over) = (0_u64, 0_u64);
+        for _ in 0..300 {
+            match deny(&writer, LONG).await.expect("answered") {
+                DeniedOutcome::Recorded(_) => recorded += 1,
+                DeniedOutcome::OverQuota => over += 1,
+            }
+        }
+        assert!(recorded > 0 && over > 0, "{recorded} {over}");
+        let status = writer.status();
+        // The flood never reached the limit of the segment: nothing was rotated,
+        // nothing pruned, and the admitted flow's record is still there.
+        assert_eq!((status.rotations, status.segments), (0, 1));
+        assert_eq!(status.denials_over_quota, over);
+        assert!(io.text().contains("example.com"));
+        // The denied bytes in the segment stay within the share.
+        let v = verified(&io);
+        assert!(
+            v.newest_class_bytes.denied <= 8_000,
+            "{:?}",
+            v.newest_class_bytes
+        );
+        assert!(
+            v.newest_class_bytes.denied > 7_000,
+            "close to the share, not far under it"
+        );
+        drop(kept);
+    }
+
+    #[tokio::test]
+    async fn refused_denials_are_carried_by_the_next_summary_and_the_next_continue() {
+        let io = FakeIo::new();
+        let (writer, _) = open_sized(&io, 6_000, 8, 20, 50, SUMMARY_FLOOR);
+        let mut over = 0_u64;
+        for _ in 0..30 {
+            if matches!(
+                deny(&writer, LONG).await.expect("answered"),
+                DeniedOutcome::OverQuota
+            ) {
+                over += 1;
+            }
+        }
+        assert!(over > 0);
+        assert!(writer.queue_summary(SummaryEvent {
+            window_ms: 60_000,
+            ..SummaryEvent::default()
+        }));
+        writer
+            .flush(Duration::from_secs(10))
+            .await
+            .expect("flushed");
+        let summary = io
+            .records()
+            .into_iter()
+            .find_map(|r| SummaryEvent::from_event(r.event))
+            .expect("a summary");
+        assert_eq!(
+            summary.denials_over_quota,
+            [("POLICY_DENY".to_owned(), over)].into_iter().collect()
+        );
+        // And once: the next summary starts from zero.
+        assert!(writer.queue_summary(SummaryEvent::default()));
+        writer
+            .flush(Duration::from_secs(10))
+            .await
+            .expect("flushed");
+        let last = io
+            .records()
+            .into_iter()
+            .filter_map(|r| SummaryEvent::from_event(r.event))
+            .next_back()
+            .expect("a summary");
+        assert!(last.denials_over_quota.is_empty(), "{last:?}");
+        // The Continue of the next rotation counts them too, then starts again. Other
+        // records fill the segment (refusals alone never do).
+        for _ in 0..80 {
+            writer
+                .append_disarmed(
+                    DisarmedEvent {
+                        cause: DisarmCause::Operator,
+                        epoch: 2,
+                    },
+                    Duration::from_secs(20),
+                )
+                .await;
+        }
+        let unrecorded: Vec<u64> = continues(&io)
+            .into_iter()
+            .filter_map(|(_, e)| match e {
+                FlowAuditEvent::Continue {
+                    refusals_unrecorded,
+                    ..
+                } => Some(refusals_unrecorded),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            unrecorded.first().is_some_and(|n| *n >= over),
+            "{unrecorded:?}"
+        );
+        // Each refusal is counted by one Continue only: a rotation starts from zero.
+        assert!(unrecorded.len() > 1, "{unrecorded:?}");
+        assert_eq!(unrecorded.iter().sum::<u64>(), over, "{unrecorded:?}");
+    }
+
+    #[tokio::test]
+    async fn a_summary_over_its_share_is_held_and_the_floor_lets_the_merged_one_through() {
+        let io = FakeIo::new();
+        // A share of one percent holds no summary at all; the floor is short.
+        let (writer, _) = open_sized(&io, 20_000, 4, 20, 1, Duration::from_millis(150));
+        let event = |n: u64| SummaryEvent {
+            window_ms: 10,
+            pre_admission_rejects: [("busy".to_owned(), n)].into_iter().collect(),
+            ..SummaryEvent::default()
+        };
+        let summaries = |io: &FakeIo| -> Vec<SummaryEvent> {
+            io.records()
+                .into_iter()
+                .filter_map(|r| SummaryEvent::from_event(r.event))
+                .collect()
+        };
+        // The first is written whatever its share: nothing was written before it.
+        assert!(writer.queue_summary(event(1)));
+        writer
+            .flush(Duration::from_secs(10))
+            .await
+            .expect("flushed");
+        assert_eq!(summaries(&io).len(), 1);
+        // Two more inside the floor are held and merged, not written.
+        assert!(writer.queue_summary(event(2)));
+        writer
+            .flush(Duration::from_secs(10))
+            .await
+            .expect("flushed");
+        assert!(writer.queue_summary(event(4)));
+        writer
+            .flush(Duration::from_secs(10))
+            .await
+            .expect("flushed");
+        assert_eq!(summaries(&io).len(), 1, "held, not written");
+        // After the floor the next one is written, with what was held.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(writer.queue_summary(event(8)));
+        writer
+            .flush(Duration::from_secs(10))
+            .await
+            .expect("flushed");
+        let all = summaries(&io);
+        assert_eq!(all.len(), 2);
+        let last = all.last().expect("summary");
+        assert_eq!(
+            last.pre_admission_rejects,
+            [("busy".to_owned(), 14)].into_iter().collect(),
+            "2 + 4 held, 8 new"
+        );
+        assert_eq!(last.window_ms, 30);
+        // Nothing is lost and nothing is counted twice: the sum of what was written.
+        let total: u64 = all
+            .iter()
+            .flat_map(|s| s.pre_admission_rejects.values())
+            .sum();
+        assert_eq!(total, 15);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn two_summaries_of_one_batch_are_written_as_one() {
+        let io = FakeIo::new();
+        let (writer, _) = open_sized(&io, 100_000, 4, 20, 50, SUMMARY_FLOOR);
+        io.block();
+        let blocker = {
+            let writer = Arc::clone(&writer);
+            tokio::spawn(async move { deny(&writer, LONG).await })
+        };
+        eventually("in sync", || io.with(|d| d.in_sync)).await;
+        for n in [3_u64, 5] {
+            assert!(writer.queue_summary(SummaryEvent {
+                pre_admission_rejects: [("busy".to_owned(), n)].into_iter().collect(),
+                ..SummaryEvent::default()
+            }));
+        }
+        io.release();
+        assert!(blocker.await.expect("joined").is_ok());
+        writer
+            .flush(Duration::from_secs(10))
+            .await
+            .expect("flushed");
+        let summaries: Vec<SummaryEvent> = io
+            .records()
+            .into_iter()
+            .filter_map(|r| SummaryEvent::from_event(r.event))
+            .collect();
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(
+            summaries[0].pre_admission_rejects,
+            [("busy".to_owned(), 8)].into_iter().collect()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_new_segment_is_made_durable_at_open_and_an_old_one_is_not_touched() {
+        let io = FakeIo::new();
+        let (first, _) = open_plain(&io);
+        assert!(io.calls().contains(&Call::MakeDurable));
+        first.close(Duration::from_secs(10)).await;
+        let calls_before = io.calls().len();
+        let last = io.records().last().map(|r| r.seq).expect("records");
+        let (_seen, on_trip) = trips();
+        let len = u64::try_from(io.len()).expect("fits");
+        let replayed = Replayed {
+            head: first.status().head,
+            last_seq: Some(last),
+            segments: vec![SegmentInfo {
+                first_seq: 1,
+                records: last,
+                bytes: len,
+            }],
+            new_segment: false,
+            ..Replayed::fresh()
+        };
+        let _second = FlowAuditWriter::open_with(
+            io.clone(),
+            replayed,
+            &cfg(DestinationLogging::Plain, 8),
+            DestSealer::Plain,
+            on_trip,
+        )
+        .expect("reopens");
+        assert!(!io
+            .calls()
+            .iter()
+            .skip(calls_before)
+            .any(|c| *c == Call::MakeDurable));
+        // A failure to make it durable is the opener's.
+        let other = FakeIo::new();
+        other.with(|d| d.fail_make_durable = true);
+        let (_seen, on_trip) = trips();
+        let result = FlowAuditWriter::open_with(
+            other,
+            Replayed::fresh(),
+            &cfg(DestinationLogging::Plain, 8),
+            DestSealer::Plain,
+            on_trip,
+        );
+        assert_eq!(
+            result.err(),
+            Some(AuditOpenError::Io("AUDIT_PERMISSION_DENIED"))
+        );
+    }
+
     // -- the proof is sealed ---------------------------------------------------------------------------
 
     /// `ResultReceipt` is the only implementor of the sealed marker outside test
@@ -5037,5 +6280,445 @@ mod tests {
                 ),
             ]
         );
+    }
+
+    // -- the boundaries and the accounting that the mutation pass found untested --------------
+
+    #[test]
+    fn the_summary_floor_is_inclusive_and_the_first_summary_is_always_due() {
+        let t0 = Instant::now();
+        let floor = Duration::from_secs(300);
+        assert!(floor_elapsed(None, floor, t0));
+        assert!(!floor_elapsed(
+            Some(t0),
+            floor,
+            t0 + Duration::from_secs(299)
+        ));
+        assert!(floor_elapsed(Some(t0), floor, t0 + floor));
+        assert!(floor_elapsed(
+            Some(t0),
+            floor,
+            t0 + floor + Duration::from_nanos(1)
+        ));
+        // A clock reading from before the last summary is not a floor that has passed.
+        assert!(!floor_elapsed(Some(t0 + floor), floor, t0));
+    }
+
+    #[test]
+    fn a_batch_overflows_only_past_the_limit_and_never_an_empty_segment() {
+        assert!(
+            !overflows(0, u64::MAX, 10),
+            "an empty segment is not rotated away"
+        );
+        assert!(!overflows(100, 50, 150), "exactly full is not over");
+        assert!(overflows(100, 51, 150));
+        assert!(!overflows(100, 0, 150));
+        // The sum saturates: it never wraps round to "fits".
+        assert!(overflows(u64::MAX, 2, 10));
+    }
+
+    fn armed_event(epoch: u64) -> ArmedEvent {
+        ArmedEvent {
+            actor: Actor::Operator {
+                peer: Some(Arc::from("uid:1000")),
+                client: ClientLabel::Desktop,
+            },
+            profile: "main".to_owned(),
+            epoch,
+            profile_digest: "0".repeat(64),
+            rules: RuleTable {
+                total: 0,
+                truncated: false,
+                rules: Vec::new(),
+            },
+            observations: Vec::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn every_record_carries_the_time_the_clock_gave_it() {
+        let io = FakeIo::new();
+        let (writer, _) = open_sized(&io, 1_000, 8, 100, 50, Duration::ZERO);
+        for _ in 0..4 {
+            deny(&writer, LONG).await.expect("recorded");
+        }
+        assert!(writer.queue_summary(SummaryEvent {
+            window_ms: 5,
+            ..SummaryEvent::default()
+        }));
+        writer
+            .flush(Duration::from_secs(10))
+            .await
+            .expect("flushed");
+        let records = io.records();
+        let kinds: Vec<&str> = records.iter().map(|r| r.event.kind()).collect();
+        for wanted in ["started", "denied", "summary", "continue"] {
+            assert!(kinds.contains(&wanted), "{wanted} in {kinds:?}");
+        }
+        for record in &records {
+            assert!(
+                record.ts_ms >= 1_700_000_000_000,
+                "{} has {}",
+                record.event.kind(),
+                record.ts_ms
+            );
+            if matches!(
+                record.event,
+                FlowAuditEvent::Continue { .. } | FlowAuditEvent::Summary { .. }
+            ) {
+                assert_eq!(record.flow_id, "", "belongs to no flow");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn the_retry_of_a_failed_prune_runs_with_the_next_batch_and_lifts_the_refusal() {
+        let io = FakeIo::new();
+        // Retention 2, so the hard cap is four segments.
+        let (writer, _) = open_sized(&io, 1_000, 2, 100, 5, SUMMARY_FLOOR);
+        io.with(|d| d.stuck = (1..10_000).collect());
+        let mut n = 0;
+        while io.segments().len() < 4 && n < 200 {
+            deny(&writer, LONG).await.expect("recorded");
+            n += 1;
+        }
+        assert_eq!(io.segments().len(), 4);
+        // Both kinds of admission are refused; neither is a fault.
+        assert_eq!(
+            pend(&writer, "example.com", 443, LONG).await.err(),
+            Some(AuditError::Capacity)
+        );
+        assert_eq!(
+            writer.append_armed(armed_event(1), LONG).await.err(),
+            Some(AuditError::Capacity)
+        );
+        let before = writer.status();
+        assert_eq!(before.capacity_refusals, 2);
+        io.with(|d| d.stuck.clear());
+        // A small record that fits the segment, so that no rotation can be what prunes.
+        writer
+            .append_disarmed(
+                DisarmedEvent {
+                    cause: DisarmCause::Operator,
+                    epoch: 2,
+                },
+                LONG.queue_wait,
+            )
+            .await;
+        let after = writer.status();
+        assert_eq!(
+            after.rotations, before.rotations,
+            "the retry, not a rotation"
+        );
+        assert_eq!(after.segments, 2, "the leftovers are gone and published");
+        assert_eq!(after.prune_deferred, 0);
+        pend(&writer, "example.com", 443, LONG)
+            .await
+            .expect("admissions are back")
+            .mark_dial_started();
+    }
+
+    #[tokio::test]
+    async fn a_retry_that_removes_segments_is_published_even_when_nothing_is_written() {
+        let io = FakeIo::new();
+        let (writer, _) = open_sized(&io, 1_000, 2, 100, 5, SUMMARY_FLOOR);
+        io.with(|d| d.stuck = (1..10_000).collect());
+        let mut n = 0;
+        while io.segments().len() < 4 && n < 200 {
+            deny(&writer, LONG).await.expect("recorded");
+            n += 1;
+        }
+        assert_eq!(writer.status().segments, 4);
+        assert_eq!(writer.status().prune_deferred, 2);
+        io.with(|d| d.stuck.clear());
+        // A flush carries no record: the batch only retries the prune.
+        writer.flush(LONG.queue_wait).await.expect("flushed");
+        let status = writer.status();
+        assert_eq!(status.segments, 2);
+        assert_eq!(status.prune_deferred, 0);
+        assert_eq!(io.segments().len(), 2);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_denied_share_counts_what_the_batch_already_holds() {
+        // One denied line, measured.
+        let line = {
+            let io = FakeIo::new();
+            let (writer, _) = open_sized(&io, 1 << 20, 4, 100, 5, SUMMARY_FLOOR);
+            let before = io.len();
+            deny(&writer, LONG).await.expect("recorded");
+            u64::try_from(io.len() - before).expect("fits")
+        };
+        // A share of three and a half lines, in a segment far from full.
+        let io = FakeIo::new();
+        let (writer, _) = open_sized(&io, line * 7, 4, 50, 5, SUMMARY_FLOOR);
+        io.block();
+        let mut tasks = Vec::new();
+        {
+            let writer = Arc::clone(&writer);
+            tasks.push(tokio::spawn(async move { deny(&writer, LONG).await }));
+        }
+        eventually("in sync", || io.with(|d| d.in_sync)).await;
+        for _ in 0..4 {
+            let writer = Arc::clone(&writer);
+            tasks.push(tokio::spawn(async move { deny(&writer, LONG).await }));
+        }
+        eventually("queued", || writer.status().queue_depth == 4).await;
+        io.release();
+        let (mut recorded, mut over) = (0, 0);
+        for task in tasks {
+            match task.await.expect("joined").expect("answered") {
+                DeniedOutcome::Recorded(_) => recorded += 1,
+                DeniedOutcome::OverQuota => over += 1,
+            }
+        }
+        // The first, then two of the four that were one batch: the batch counts.
+        assert_eq!((recorded, over), (3, 2));
+        assert_eq!(writer.status().rotations, 0);
+    }
+
+    /// A summary with one counter, so that the sums can be followed.
+    fn busy(n: u64) -> SummaryEvent {
+        SummaryEvent {
+            window_ms: 10,
+            pre_admission_rejects: [("busy".to_owned(), n)].into_iter().collect(),
+            ..SummaryEvent::default()
+        }
+    }
+
+    fn written_summaries(io: &FakeIo) -> Vec<SummaryEvent> {
+        io.records()
+            .into_iter()
+            .filter_map(|r| SummaryEvent::from_event(r.event))
+            .collect()
+    }
+
+    async fn queue_and_flush(writer: &FlowAuditWriter, event: SummaryEvent) {
+        assert!(writer.queue_summary(event));
+        writer
+            .flush(Duration::from_secs(10))
+            .await
+            .expect("flushed");
+    }
+
+    #[tokio::test]
+    async fn the_summary_share_holds_a_few_and_what_waits_is_written_once_after_the_floor() {
+        // One summary line, measured.
+        let line = {
+            let io = FakeIo::new();
+            let (writer, _) = open_sized(&io, 1 << 20, 4, 20, 5, SUMMARY_FLOOR);
+            let before = io.len();
+            queue_and_flush(&writer, busy(1)).await;
+            u64::try_from(io.len() - before).expect("fits")
+        };
+        // A share of two and a half lines (one percent of 250 lines).
+        let io = FakeIo::new();
+        let floor = Duration::from_millis(300);
+        let (writer, _) = open_sized(&io, line * 250, 4, 20, 1, floor);
+        queue_and_flush(&writer, busy(1)).await; // the first: always allowed
+        queue_and_flush(&writer, busy(2)).await; // two lines fit
+        assert_eq!(written_summaries(&io).len(), 2);
+        queue_and_flush(&writer, busy(3)).await; // three do not: held
+        queue_and_flush(&writer, busy(4)).await; // held and merged
+        assert_eq!(written_summaries(&io).len(), 2, "held, not written");
+        tokio::time::sleep(floor + Duration::from_millis(100)).await;
+        queue_and_flush(&writer, busy(5)).await;
+        let all = written_summaries(&io);
+        assert_eq!(all.len(), 3);
+        let last = all.last().expect("summary");
+        assert_eq!(
+            last.pre_admission_rejects,
+            [("busy".to_owned(), 12)].into_iter().collect(),
+            "3 + 4 held, 5 new"
+        );
+        // What was written is not held any more: the next one starts from itself.
+        tokio::time::sleep(floor + Duration::from_millis(100)).await;
+        queue_and_flush(&writer, busy(6)).await;
+        let all = written_summaries(&io);
+        assert_eq!(all.len(), 4);
+        assert_eq!(
+            all.last().expect("summary").pre_admission_rejects,
+            [("busy".to_owned(), 6)].into_iter().collect()
+        );
+        // And no counter was lost or counted twice.
+        let total: u64 = all
+            .iter()
+            .flat_map(|s| s.pre_admission_rejects.values())
+            .sum();
+        assert_eq!(total, 1 + 2 + 3 + 4 + 5 + 6);
+    }
+
+    #[tokio::test]
+    async fn refusals_counted_in_a_held_summary_are_counted_once_when_it_is_written() {
+        let io = FakeIo::new();
+        let floor = Duration::from_millis(300);
+        // A denied share of one percent of 20 kB is less than one denied line; so is
+        // the summary share, after the first.
+        let (writer, _) = open_sized(&io, 20_000, 4, 1, 1, floor);
+        queue_and_flush(&writer, busy(1)).await; // the first: always allowed
+        for _ in 0..3 {
+            assert!(matches!(
+                deny(&writer, LONG).await.expect("answered"),
+                DeniedOutcome::OverQuota
+            ));
+        }
+        queue_and_flush(&writer, busy(2)).await; // held, with the three refusals in it
+        assert_eq!(written_summaries(&io).len(), 1);
+        tokio::time::sleep(floor + Duration::from_millis(100)).await;
+        queue_and_flush(&writer, busy(4)).await;
+        let all = written_summaries(&io);
+        assert_eq!(all.len(), 2);
+        let last = all.last().expect("summary");
+        assert_eq!(
+            last.denials_over_quota,
+            [("POLICY_DENY".to_owned(), 3)].into_iter().collect(),
+            "three refusals, once"
+        );
+        assert_eq!(
+            last.pre_admission_rejects,
+            [("busy".to_owned(), 6)].into_iter().collect()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_rotation_is_published_even_when_the_batch_that_caused_it_fails() {
+        let io = FakeIo::new();
+        let (writer, _) = open_sized(&io, 1_000, 8, 100, 5, SUMMARY_FLOOR);
+        // The started record and one denial fill most of the segment.
+        deny(&writer, LONG).await.expect("recorded");
+        let before = writer.status();
+        assert_eq!((before.segments, before.rotations), (1, 0));
+        // The next rotates, and then its append fails.
+        io.with(|d| d.fail_append_at = Some(d.appends + 1));
+        assert!(deny(&writer, LONG).await.is_err());
+        let after = writer.status();
+        assert_eq!(after.state, WriterState::Down);
+        assert_eq!((after.segments, after.rotations), (2, 1));
+        assert_eq!(
+            after.entries,
+            before.entries + 1,
+            "the Continue is on disk and counted"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_stuck_rotation_is_visible_to_the_watchdog() {
+        let io = FakeIo::new();
+        let (writer, _) = open_sized(&io, 1_000, 8, 100, 5, SUMMARY_FLOOR);
+        deny(&writer, LONG).await.expect("recorded");
+        deny(&writer, LONG).await.expect("recorded");
+        io.with(|d| d.block_rotate = true);
+        let task = {
+            let writer = Arc::clone(&writer);
+            tokio::spawn(async move { deny(&writer, LONG).await })
+        };
+        eventually("in rotate", || io.with(|d| d.in_rotate)).await;
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        let stuck = writer
+            .io_in_progress_for()
+            .expect("the rotation is running");
+        assert!(stuck >= Duration::from_millis(40), "{stuck:?}");
+        io.release();
+        assert!(task.await.expect("joined").is_ok());
+        assert_eq!(writer.io_in_progress_for(), None);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_stuck_prune_is_visible_to_the_watchdog() {
+        let io = FakeIo::new();
+        // Retention 2: the second rotation has a segment to remove.
+        let (writer, _) = open_sized(&io, 1_000, 2, 100, 5, SUMMARY_FLOOR);
+        io.with(|d| d.block_prune = true);
+        let task = {
+            let writer = Arc::clone(&writer);
+            tokio::spawn(async move {
+                for _ in 0..40 {
+                    if deny(&writer, LONG).await.is_err() {
+                        return false;
+                    }
+                }
+                true
+            })
+        };
+        eventually("in prune", || io.with(|d| d.in_prune)).await;
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        let stuck = writer.io_in_progress_for().expect("the prune is running");
+        assert!(stuck >= Duration::from_millis(40), "{stuck:?}");
+        io.release();
+        assert!(task.await.expect("joined"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_rotation_that_fails_ends_the_writer_for_a_flush_in_its_batch() {
+        let io = FakeIo::new();
+        let (writer, _) = open_sized(&io, 1_000, 8, 100, 5, SUMMARY_FLOOR);
+        deny(&writer, LONG).await.expect("recorded");
+        io.block();
+        let blocker = {
+            let writer = Arc::clone(&writer);
+            tokio::spawn(async move { deny(&writer, LONG).await })
+        };
+        eventually("in sync", || io.with(|d| d.in_sync)).await;
+        // The next one does not fit the segment: it rotates, and the rotation fails.
+        let doomed = {
+            let writer = Arc::clone(&writer);
+            tokio::spawn(async move { deny(&writer, LONG).await })
+        };
+        eventually("queued", || writer.status().queue_depth == 1).await;
+        let flush = {
+            let writer = Arc::clone(&writer);
+            tokio::spawn(async move { writer.flush(Duration::from_secs(20)).await })
+        };
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        io.with(|d| d.fail_rotate = true);
+        io.release();
+        assert!(blocker.await.expect("joined").is_ok());
+        assert_eq!(
+            doomed.await.expect("joined").err(),
+            Some(AuditError::Io("AUDIT_DISK_FULL"))
+        );
+        assert_eq!(
+            flush.await.expect("joined").err(),
+            Some(AuditError::WriterDown)
+        );
+        assert_eq!(
+            io.records().len(),
+            4,
+            "started, a denial, the continue and a denial"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_batch_in_which_nothing_is_written_touches_no_disk() {
+        let io = FakeIo::new();
+        // A denied share of nothing: every refusal is over its quota.
+        let (writer, _) = open_sized(&io, 1 << 20, 4, 0, 5, SUMMARY_FLOOR);
+        let calls = io.calls().len();
+        assert!(matches!(
+            deny(&writer, LONG).await,
+            Ok(DeniedOutcome::OverQuota)
+        ));
+        assert_eq!(io.calls().len(), calls, "no stat, no append, no sync");
+    }
+
+    #[tokio::test]
+    async fn a_ledger_whose_last_number_goes_to_recovered_cannot_take_started() {
+        let io = FakeIo::new();
+        let (_seen, on_trip) = trips();
+        let replayed = Replayed {
+            last_seq: Some(u64::MAX - 1),
+            truncated_tail_bytes: 3,
+            ..Replayed::fresh()
+        };
+        let result = FlowAuditWriter::open_with(
+            io.clone(),
+            replayed,
+            &cfg(DestinationLogging::Plain, 8),
+            DestSealer::Plain,
+            on_trip,
+        );
+        assert_eq!(result.err(), Some(AuditOpenError::SeqExhausted));
+        let kinds: Vec<&str> = events(&io).iter().map(|(_, k)| *k).collect();
+        assert_eq!(kinds, ["recovered"], "what fitted was written");
     }
 }

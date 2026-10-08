@@ -222,24 +222,31 @@ pub trait LedgerFs: Send + Sync + 'static {
     fn create_key_file(&self, bytes: &[u8]) -> Result<(), StoreError>;
 }
 
-/// What the writer's rotation and prune need from the active segment and the
-/// directory together (design 6.4.7). Implemented over a `LedgerStore` by the
-/// rotation commit and by fault-injection doubles in tests.
+/// What the writer needs from the active segment and the directory together
+/// (design 6.4.7): the I/O seam of the writer. Implemented over a [`LedgerStore`]
+/// by [`super::store_io::StoreIo`] and by fault-injection doubles in tests.
 pub trait LedgerIo: Send + 'static {
     fn append(&mut self, bytes: &[u8]) -> io::Result<()>;
     fn sync_data(&mut self) -> io::Result<()>;
     fn active_stat(&self) -> io::Result<ActiveStat>;
     fn truncate_active(&mut self, len: u64) -> io::Result<()>;
-    /// Create, write, `sync_all`, `sync_dir`, switch.
+    /// D5, R2 to R6: creates the next segment exclusively, writes `first_record`
+    /// (its `Continue`), `sync_all`, makes the directory entry durable, and only
+    /// then makes it the active segment. A failure leaves the old one active.
     fn rotate(&mut self, next_first_seq: u64, first_record: &[u8]) -> io::Result<()>;
-    /// Per-file failure is reported in the outcome, not as an error.
-    fn prune(&mut self, keep: u32) -> io::Result<PruneOutcome>;
+    /// D5, R7: unlinks `victims`, oldest first, then makes the directory durable
+    /// (a failure of that is ignored). A file that cannot be removed is kept and
+    /// counted, never an error.
+    fn prune(&mut self, victims: &[u64]) -> io::Result<PruneOutcome>;
+    /// D2: after a segment was created and its first records written, makes its
+    /// size and its directory entry durable.
+    fn make_durable(&mut self) -> io::Result<()>;
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PruneOutcome {
-    /// The first sequence number that survives, when something was pruned.
-    pub pruned_before_seq: Option<u64>,
+    /// Segments that are gone (a segment that was already gone counts).
+    pub removed: Vec<u64>,
     /// Files that could not be removed and are kept.
     pub deferred: u32,
 }

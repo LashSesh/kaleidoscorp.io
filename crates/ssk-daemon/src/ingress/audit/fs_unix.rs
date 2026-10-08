@@ -107,6 +107,17 @@ pub(super) fn check_file(facts: Facts, euid: u32) -> Result<(), UnsafeReason> {
     }
 }
 
+/// A file that was just opened: `check_file`, except that a file with no link left
+/// is not a planted hard link but a segment that was pruned between the open and the
+/// `fstat` (a reader racing the writer's prune), which is `NotFound` like any other
+/// segment that is gone.
+pub(super) fn check_opened_file(facts: Facts, euid: u32) -> Result<(), StoreError> {
+    if facts.is_file && facts.nlink == 0 {
+        return Err(StoreError::Io("AUDIT_NOT_FOUND"));
+    }
+    check_file(facts, euid).map_err(StoreError::FileUnsafe)
+}
+
 fn io_error(errno: Errno) -> StoreError {
     StoreError::Io(io_code(&io::Error::from(errno)))
 }
@@ -280,7 +291,7 @@ impl UnixStore {
             unsafe_open(errno, StoreError::FileUnsafe(UnsafeReason::NotRegularFile))
         })?;
         let stat = fstat(&fd).map_err(io_error)?;
-        check_file(Facts::of(&stat), self.euid).map_err(StoreError::FileUnsafe)?;
+        check_opened_file(Facts::of(&stat), self.euid)?;
         Ok(File::from(fd))
     }
 }
@@ -305,8 +316,12 @@ impl LedgerStore for UnixStore {
             };
             // A directory, a symlink or a device with a segment's name is not a
             // segment, and it is not ignored either.
-            let stat = statat(&self.dir_fd, entry.file_name(), AtFlags::SYMLINK_NOFOLLOW)
-                .map_err(io_error)?;
+            let stat = match statat(&self.dir_fd, entry.file_name(), AtFlags::SYMLINK_NOFOLLOW) {
+                Ok(stat) => stat,
+                // Listed and then unlinked: a segment pruned while a reader looked.
+                Err(Errno::NOENT) => continue,
+                Err(errno) => return Err(io_error(errno)),
+            };
             if FileType::from_raw_mode(stat.st_mode) != FileType::RegularFile {
                 return Err(StoreError::FileUnsafe(UnsafeReason::NotRegularFile));
             }
@@ -514,6 +529,34 @@ mod tests {
         assert_eq!(
             check_file(facts(false, false, 0o600, me, 1), me),
             Err(UnsafeReason::NotRegularFile)
+        );
+    }
+
+    #[test]
+    fn a_file_with_no_link_left_is_gone_not_planted() {
+        let me = 1000;
+        assert_eq!(
+            check_opened_file(facts(false, true, 0o600, me, 0), me),
+            Err(StoreError::Io("AUDIT_NOT_FOUND"))
+        );
+        // A second link is still a planted link, and everything else is as before.
+        assert_eq!(
+            check_opened_file(facts(false, true, 0o600, me, 2), me),
+            Err(StoreError::FileUnsafe(UnsafeReason::HardLinked))
+        );
+        assert_eq!(
+            check_opened_file(facts(false, true, 0o600, me, 1), me),
+            Ok(())
+        );
+        assert_eq!(
+            check_opened_file(facts(true, false, 0o700, me, 0), me),
+            Err(StoreError::FileUnsafe(UnsafeReason::NotRegularFile)),
+            "a directory is not a segment whatever its link count"
+        );
+        assert_eq!(
+            check_opened_file(facts(false, true, 0o640, me, 0), me),
+            Err(StoreError::Io("AUDIT_NOT_FOUND")),
+            "gone is gone, whatever its mode was"
         );
     }
 

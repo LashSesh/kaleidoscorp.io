@@ -13,7 +13,7 @@ use std::net::SocketAddr;
 
 use ssk_netadmin::admission::AdmissionToken;
 
-use super::record::RepeatCount;
+use super::record::{FlowAuditEvent, RepeatCount};
 use crate::ingress::pump::PumpEnd;
 use crate::ingress::target::{Provenance, Target, TargetKind};
 use crate::ingress::types::{Actor, DisarmCause, Observation, Resolution, RuleTable, TripReason};
@@ -290,6 +290,44 @@ pub struct SummaryEvent {
     pub denials_over_quota: BTreeMap<String, u64>,
     pub denials_repeated: Vec<RepeatCount>,
     pub other_keys: u64,
+}
+
+impl SummaryEvent {
+    /// The record this summary is written as.
+    #[must_use]
+    pub fn into_event(self) -> FlowAuditEvent {
+        FlowAuditEvent::Summary {
+            window_ms: self.window_ms,
+            pre_admission_rejects: self.pre_admission_rejects,
+            denials_suppressed: self.denials_suppressed,
+            denials_over_quota: self.denials_over_quota,
+            denials_repeated: self.denials_repeated,
+            other_keys: self.other_keys,
+        }
+    }
+
+    /// The summary a `Summary` record is; `None` for any other record.
+    #[must_use]
+    pub fn from_event(event: FlowAuditEvent) -> Option<Self> {
+        match event {
+            FlowAuditEvent::Summary {
+                window_ms,
+                pre_admission_rejects,
+                denials_suppressed,
+                denials_over_quota,
+                denials_repeated,
+                other_keys,
+            } => Some(Self {
+                window_ms,
+                pre_admission_rejects,
+                denials_suppressed,
+                denials_over_quota,
+                denials_repeated,
+                other_keys,
+            }),
+            _ => None,
+        }
+    }
 }
 
 #[cfg(test)]

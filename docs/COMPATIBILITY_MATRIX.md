@@ -165,7 +165,7 @@ field name, order, spelling or hash input, a new `event` kind or a new validatio
 value written before, needs a new `ledger_format` and an entry here. `record.rs` pins the
 persisted shape of a `started` line (field names, order and hash) and the largest record to the
 byte; the segments, rotation and retention are specified in
-`docs/M2_LOCAL_INGRESS_DESIGN.md` 6.4 and get their own paragraph when they are written.
+`docs/M2_LOCAL_INGRESS_DESIGN.md` 6.4 and have their own paragraph below.
 
 **Hashed destinations: the key file and the token function** (`ingress/audit/dest.rs`). With
 `destination_logging: hashed` a destination is recorded as a keyed token, and the key file and
@@ -183,6 +183,37 @@ vectors (key bytes 00 to 1f: `kid` `dcfd61fc2475cfd3`, `example.com` `2c8a3534e4
 are pinned by a test and were computed by an independent implementation. A change of the
 context strings, the kind bytes, the length encoding, the truncation or the key file form
 needs a new entry here and a new `kid` namespace.
+
+**Flow ledger segments, rotation and retention** (`ingress/audit/{segments,verify,store_io,open}.rs`).
+The ledger of the local proxy now has its files, and they are a persisted layout that an auditor and a
+later build must keep reading. It lives in `<state dir>/ingress-audit/` (mode 0700) as segment files
+`seg-<first sequence number as 20 decimal digits>.jsonl` (mode 0600): one hash chain across all of them,
+the name of a segment being the `seq` of its first record. A segment is only ever created and later
+unlinked: it is never renamed, and a closed segment is never truncated or rewritten (the one cut is the
+unacknowledged tail of the NEWEST segment after a crash, and a newest segment that never held a record).
+Every segment but the first starts with a `continue` record: `prev_seq` and `prev_segment_head` name the
+last record of the segment before it, `pruned_before_seq` the first sequence number that survives the
+rotation that created it (absent when nothing was pruned), `prune_deferred` the segments the previous
+prune could not remove and `refusals_unrecorded` the `denied` records that were not written, for want of
+their quota, since the previous `continue`. The `continue` of the oldest retained segment anchors the chain
+(the record before it being gone), so a ledger from which the oldest segments were removed still verifies,
+which is the prefix integrity of the format above. Retention is by size only: the newest
+`retain_segments - 1` segments are kept when a rotation creates the next one (config: 2 to 64, default 8,
+of `segment_mib` 1 to 256, default 32). Unlinking goes oldest first and stops at the first segment that
+cannot be removed, so the retained chain never has a hole; the segments that stayed are retried and counted
+in the next `continue`. Once their number reaches twice the retention the proxy refuses new admissions
+(`Capacity`, nothing trips) until a prune succeeds. Per segment, `denied` records may use 20 percent and
+`summary` records 5 percent of `segment_bytes`, so that a flood of refusals cannot push the records of
+admitted flows out; what is not written is counted (in the next `summary` by reason code, and in
+`refusals_unrecorded`).
+
+A directory that does not verify (a broken hash, a gap in the sequence, a missing or misnamed segment, a
+`continue` that does not link to its predecessor, a segment that is not the newest ending inside a line, a
+newer `ledger_format`) makes the proxy unavailable and nothing is repaired: the operator moves the directory
+aside. Earlier builds never wrote this directory, so nothing is migrated. A downgrade is not supported
+against a ledger written by a newer build, as above. A change of the file naming, of the meaning of a field
+of `continue`, of the retention rule or of the quota shares is a change of this contract and needs an entry
+here.
 
 ## Route executor: no fallback route, bounded dial (2026-10-06)
 

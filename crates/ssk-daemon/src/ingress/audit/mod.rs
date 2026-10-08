@@ -14,7 +14,11 @@ pub mod fs_unix;
 #[cfg(windows)]
 pub mod fs_win;
 pub mod input;
+pub mod open;
 pub mod record;
+pub mod segments;
+pub mod store_io;
+pub mod verify;
 pub mod writer;
 
 /// The ledger is built from `types`, `target`, `limits` and the crates below; it
