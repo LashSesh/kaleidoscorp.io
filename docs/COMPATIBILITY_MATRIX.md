@@ -215,6 +215,16 @@ against a ledger written by a newer build, as above. A change of the file naming
 of `continue`, of the retention rule or of the quota shares is a change of this contract and needs an entry
 here.
 
+**Closed vocabulary of a refusal** (`ingress/audit/input.rs`, `ingress/engine.rs`). `denied.reason_code` is
+one of: `TARGET_MALFORMED`, `TARGET_NUMERIC_ALIAS`, `TARGET_LOCALHOST`, `TARGET_SELF_LOOP`,
+`SPECIAL_USE_NEEDS_EXACT_RULE`, `SPECIAL_USE_NEEDS_PORT`, `POLICY_DENY`, `NO_VIABLE_ROUTE`,
+`ATTESTATION_REQUIRED`, `NOT_ARMED`, and, since the engine, `ROUTE_NOT_DIALABLE`, `OPENVPN_NOT_READY`,
+`DIRECT_GUARD_MISSING`, `DIRECT_NAME_NOT_RESOLVABLE` and `DIRECT_FAMILY_DISABLED` (a route the proxy
+cannot execute, and a `Direct` target it will not hand to the operating system). A word outside the list is
+written as `UNKNOWN_CODE` and counted. Adding a word is not a change of the format: a reader that does not
+know it still reads the record, and the five new words appear only in records written by this build or a later
+one.
+
 ## Route executor: no fallback route, bounded dial (2026-10-06)
 
 `RouteExecutor::connect` and `probe` refuse `RouteKind::Fallback` with

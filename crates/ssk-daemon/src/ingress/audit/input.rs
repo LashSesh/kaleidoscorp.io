@@ -85,7 +85,7 @@ pub const RESULT_REFUSALS: [&str; 21] = [
 ];
 
 /// `Denied.reason_code`.
-pub const DENIED_REASON_CODES: [&str; 11] = [
+pub const DENIED_REASON_CODES: [&str; 16] = [
     "TARGET_MALFORMED",
     "TARGET_NUMERIC_ALIAS",
     "TARGET_LOCALHOST",
@@ -96,6 +96,11 @@ pub const DENIED_REASON_CODES: [&str; 11] = [
     "NO_VIABLE_ROUTE",
     "ATTESTATION_REQUIRED",
     "NOT_ARMED",
+    "ROUTE_NOT_DIALABLE",
+    "OPENVPN_NOT_READY",
+    "DIRECT_GUARD_MISSING",
+    "DIRECT_NAME_NOT_RESOLVABLE",
+    "DIRECT_FAMILY_DISABLED",
     UNKNOWN_CODE,
 ];
 
@@ -519,6 +524,11 @@ mod tests {
                     "NO_VIABLE_ROUTE",
                     "ATTESTATION_REQUIRED",
                     "NOT_ARMED",
+                    "ROUTE_NOT_DIALABLE",
+                    "OPENVPN_NOT_READY",
+                    "DIRECT_GUARD_MISSING",
+                    "DIRECT_NAME_NOT_RESOLVABLE",
+                    "DIRECT_FAMILY_DISABLED",
                     "UNKNOWN_CODE",
                 ]
                 .as_slice()

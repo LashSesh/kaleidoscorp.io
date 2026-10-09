@@ -223,12 +223,12 @@ impl<T: AsyncWrite + Unpin> AsyncWrite for Counted<'_, '_, T> {
 }
 
 /// `true` while the gate is still the one the flow was admitted under.
-fn gate_unchanged(gate: &watch::Receiver<Gate>, epoch: u64) -> bool {
+pub(crate) fn gate_unchanged(gate: &watch::Receiver<Gate>, epoch: u64) -> bool {
     gate.borrow().epoch == epoch
 }
 
 /// Completes when the gate has changed or its sender is gone. Cancel-safe.
-async fn gate_changed(gate: &mut watch::Receiver<Gate>, epoch: u64) {
+pub(crate) async fn gate_changed(gate: &mut watch::Receiver<Gate>, epoch: u64) {
     loop {
         if !gate_unchanged(gate, epoch) {
             return;

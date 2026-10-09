@@ -25,6 +25,7 @@
 
 pub mod audit;
 pub mod budget;
+pub mod engine;
 pub mod guard;
 pub mod limits;
 pub mod path;
@@ -203,6 +204,40 @@ mod vocabulary_scan {
             "the scan must see the literals of path.rs"
         );
         assert_eq!(offenders(&source), Vec::<(String, &str)>::new());
+    }
+
+    /// The words of the engine that are about adapters, not interfaces.
+    const ADAPTER_VOCABULARY: [&str; 3] = ["OPENVPN_NOT_READY", "tls_tunnel", "open_vpn"];
+
+    /// The engine writes words into records and replies. The literals with the
+    /// letters of a guess are the closed vocabulary of ADAPTER kinds
+    /// (`tls_tunnel`, `open_vpn`: what a route's hop is, as the configuration
+    /// names it) and the existing machine code of a netcore error,
+    /// `OPENVPN_NOT_READY`, which a route to such an adapter produces. They name
+    /// kinds of configured hop and are not a statement about any interface.
+    #[test]
+    fn engine_rs_contains_no_guess_about_what_an_interface_is() {
+        let file = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/ingress/engine.rs");
+        let source = std::fs::read_to_string(&file).expect("read engine.rs");
+        let production = source.split("#[cfg(test)]").next().expect("a first part");
+        assert!(
+            string_literals(production).len() > 20,
+            "the scan must see the literals of engine.rs"
+        );
+        let found: Vec<_> = offenders(production)
+            .into_iter()
+            .filter(|(literal, _)| !ADAPTER_VOCABULARY.contains(&literal.as_str()))
+            .collect();
+        assert_eq!(found, Vec::<(String, &str)>::new());
+        // The exceptions are real, so the scan is not blind to the file.
+        for word in ADAPTER_VOCABULARY {
+            assert!(
+                offenders(production)
+                    .iter()
+                    .any(|(literal, _)| literal == word),
+                "{word}"
+            );
+        }
     }
 
     #[test]

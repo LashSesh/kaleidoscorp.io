@@ -18,6 +18,8 @@ pub mod open;
 pub mod record;
 pub mod segments;
 pub mod store_io;
+#[cfg(test)]
+pub(crate) mod testing;
 pub mod verify;
 pub mod writer;
 
