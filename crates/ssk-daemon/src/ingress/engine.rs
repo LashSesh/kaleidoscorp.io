@@ -1077,6 +1077,9 @@ mod tests {
         hung_dropped: Arc<AtomicUsize>,
         /// When set, the gate is disarmed the moment a real dial has completed.
         mover: Mutex<Option<Arc<IngressShared>>>,
+        /// Called, if set, when a dial starts: a test uses it to hold the disk at
+        /// exactly that point.
+        on_dial: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     }
 
     impl TestPlane {
@@ -1089,6 +1092,7 @@ mod tests {
                 hung: AtomicUsize::new(0),
                 hung_dropped: Arc::new(AtomicUsize::new(0)),
                 mover: Mutex::new(None),
+                on_dial: Mutex::new(None),
             })
         }
 
@@ -1116,6 +1120,10 @@ mod tests {
                 host.to_owned(),
                 port,
             ));
+            let hook = lock_unpoisoned(&self.on_dial).clone();
+            if let Some(hook) = hook {
+                hook();
+            }
             let step = match &*lock_unpoisoned(&self.script) {
                 Script::Delegate => 0,
                 Script::Fail(_) => 1,
@@ -3678,5 +3686,233 @@ mod tests {
             panic!("a result");
         };
         assert_eq!(attempted.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_peer_that_was_not_verified_is_recorded_as_unverified_in_refusals_and_pending_records(
+    ) {
+        let (spec, _resolver, _connector) = direct_spec();
+        let rig = Rig::new(spec).await;
+        let peer = PeerStamp {
+            peer: Arc::from("127.0.0.1:50001"),
+            verified: false,
+        };
+        let target = canonicalize(RawTarget::V4(OTHER.parse().expect("address"), 443)).expect("v4");
+        let denied = rig.admit_v4(OTHER, 443).expect_err("denied");
+        rig.ctx.record_denial(&peer, "main", &target, &denied).await;
+        let FlowAuditEvent::Denied {
+            peer: who,
+            peer_verified,
+            ..
+        } = denied_events(&rig).remove(0)
+        else {
+            panic!("a denied record");
+        };
+        assert_eq!((who.as_str(), peer_verified), ("127.0.0.1:50001", false));
+
+        let adm = rig.admit_v4(PUBLIC, 443).expect("admitted");
+        let mut gate = rig.shared.gate();
+        let est = open_tunnel(&rig.ctx, adm, &peer, "main", &mut gate)
+            .await
+            .expect("established");
+        let FlowAuditEvent::Pending {
+            peer: who,
+            peer_verified,
+            ..
+        } = rig
+            .events()
+            .into_iter()
+            .find(|e| e.kind() == "pending")
+            .expect("pending")
+        else {
+            panic!("pending");
+        };
+        assert_eq!((who.as_str(), peer_verified), ("127.0.0.1:50001", false));
+        drop(est);
+    }
+
+    #[tokio::test]
+    async fn a_refusal_the_ledger_cannot_take_in_time_is_counted_and_still_answered() {
+        let mut spec = Spec::new();
+        spec.tuning.audit_queue_wait = Duration::from_millis(80);
+        spec.tuning.audit_sync_wait = Duration::from_millis(80);
+        let rig = Rig::new(spec).await;
+        let target = canonicalize(RawTarget::V4(OTHER.parse().expect("address"), 443)).expect("v4");
+        let denied = rig.admit_v4(OTHER, 443).expect_err("denied");
+        rig.io.block();
+        // The call returns (the reply does not depend on the record) and says what
+        // it cost.
+        rig.ctx
+            .record_denial(&Rig::peer(), "main", &target, &denied)
+            .await;
+        rig.io.release();
+        let counters = rig.shared.counters().dto();
+        assert_eq!((counters.denied, counters.audit_timeouts), (1, 1));
+        assert!(
+            rig.trips.lock().expect("lock").is_empty(),
+            "a timeout does not trip"
+        );
+    }
+
+    #[test]
+    fn the_planned_adapters_are_the_hops_of_the_route_in_order() {
+        // A multi-hop route cannot be configured today, so `decide` never makes
+        // one; the list is still the record's statement of the plan.
+        assert_eq!(
+            adapter_ids(&RouteKind::MultiHop(vec![hop("a"), hop("b"), hop("c")])),
+            ["a", "b", "c"]
+        );
+        assert_eq!(adapter_ids(&RouteKind::SingleHop(hop("a"))), ["a"]);
+        for route in [
+            RouteKind::Direct,
+            RouteKind::OpenVpn {
+                adapter_id: "x".into(),
+                profile_id: "y".into(),
+            },
+            RouteKind::Denied { reason: "z".into() },
+        ] {
+            assert!(adapter_ids(&route).is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn attestation_is_judged_before_the_address_and_the_route() {
+        // The policy's verdict comes first: a rule that needs attestation is said
+        // to need it even where the address or the route would also be refused.
+        let mut spec = Spec::new();
+        spec.adapters.push(adapter(
+            "wrap",
+            AdapterTransport::TlsTunnel {
+                host: PROXY.into(),
+                port: 443,
+            },
+        ));
+        let mut lan = rule(
+            "attested-lan",
+            5,
+            Some("192.168.1.50"),
+            None,
+            Some(9100),
+            RoutingAction::Direct,
+        );
+        lan.require_attestation = true;
+        let mut wrapped = rule(
+            "attested-wrap",
+            6,
+            Some(PUBLIC),
+            None,
+            Some(8001),
+            adapter_action("wrap"),
+        );
+        wrapped.require_attestation = true;
+        spec.rules.insert(0, lan);
+        spec.rules.insert(1, wrapped);
+        let rig = Rig::new(spec).await;
+        for (ip, port, rule_id) in [
+            ("192.168.1.50", 9100, "attested-lan"),
+            (PUBLIC, 8001, "attested-wrap"),
+        ] {
+            let denied = rig.admit_v4(ip, port).expect_err("denied");
+            assert_eq!(denied.reason, REASON_ATTESTATION_REQUIRED, "{ip}");
+            assert_eq!(denied.rule.as_deref(), Some(rule_id));
+        }
+    }
+
+    /// Holds the disk when the dial starts, so that the record that follows it is
+    /// the one that times out.
+    fn hold_disk_at_dial(rig: &Rig) {
+        let io = rig.io.clone();
+        *lock_unpoisoned(&rig.plane.on_dial) = Some(Arc::new(move || io.block()));
+    }
+
+    fn quick_audit_spec(spec: Spec) -> Spec {
+        let mut spec = spec;
+        spec.tuning.audit_queue_wait = Duration::from_millis(60);
+        spec.tuning.audit_sync_wait = Duration::from_millis(60);
+        spec
+    }
+
+    #[tokio::test]
+    async fn a_failure_record_that_times_out_is_counted_and_the_client_still_gets_its_reply() {
+        let rig =
+            Rig::new(quick_audit_spec(Spec::new().fails_with(|| {
+                NetcoreError::ConnectionRefused("h".into(), "x".into())
+            })))
+            .await;
+        hold_disk_at_dial(&rig);
+        let adm = rig.admit_v4(PUBLIC, 443).expect("admitted");
+        let fault = rig.open(adm).await.expect_err("failed");
+        assert_eq!(fault.reply(), Some(Rep::ConnectionRefused));
+        rig.io.release();
+        let counters = rig.shared.counters().dto();
+        assert_eq!((counters.connect_failed, counters.audit_timeouts), (1, 1));
+        assert!(rig.trips.lock().expect("lock").is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_deadline_record_that_times_out_is_counted_too() {
+        let mut spec = quick_audit_spec(Spec::new().hangs());
+        spec.connect_timeout_ms = 100;
+        let rig = Rig::new(spec).await;
+        hold_disk_at_dial(&rig);
+        let adm = rig.admit_v4(PUBLIC, 443).expect("admitted");
+        let fault = rig.open(adm).await.expect_err("timed out");
+        assert!(matches!(fault, DialFault::Deadline), "{fault:?}");
+        rig.io.release();
+        let counters = rig.shared.counters().dto();
+        assert_eq!((counters.connect_failed, counters.audit_timeouts), (1, 1));
+    }
+
+    #[tokio::test]
+    async fn a_result_record_that_times_out_drops_the_tunnel_and_is_counted() {
+        let (spec, _resolver, connector) = direct_spec();
+        let rig = Rig::new(quick_audit_spec(spec)).await;
+        hold_disk_at_dial(&rig);
+        let adm = rig.admit_v4(PUBLIC, 443).expect("admitted");
+        let fault = rig.open(adm).await.expect_err("lost");
+        assert!(
+            matches!(fault, DialFault::ResultLost(AuditError::Timeout)),
+            "{fault:?}"
+        );
+        assert_eq!(fault.reply(), None);
+        assert_eq!(rig.shared.counters().dto().audit_timeouts, 1);
+        // The upstream is closed whether or not the record lands later.
+        let mut far = connector.take_far();
+        let mut byte = [0u8; 1];
+        assert_eq!(far.read(&mut byte).await.expect("read"), 0);
+        // The disk returns: the late record closes its own story and nothing trips.
+        rig.io.release();
+        rig.until("the late story to close", |rig| rig.count("closed") == 1)
+            .await;
+        assert!(rig.trips.lock().expect("lock").is_empty());
+        assert_eq!(verified(&rig).unresolved, Unresolved::default());
+    }
+
+    #[test]
+    fn zero_answers_means_nothing_was_looked_up_and_is_not_recorded() {
+        let wrap = |source: NetcoreError, answers: u8| NetcoreError::DialFailed {
+            source: Box::new(source),
+            attempts: ssk_netcore::DialAttempts {
+                answers,
+                attempted: Vec::new(),
+            },
+        };
+        let refused = |answers| NetcoreError::AddressRefused {
+            code: "private",
+            refused: 1,
+            answers,
+        };
+        assert_eq!(failed_event(&refused(0), None).answers, None);
+        assert_eq!(failed_event(&refused(3), None).answers, Some(3));
+        let refused_connect = || NetcoreError::ConnectionRefused("h".into(), "x".into());
+        assert_eq!(
+            failed_event(&wrap(refused_connect(), 0), None).answers,
+            None
+        );
+        assert_eq!(
+            failed_event(&wrap(refused_connect(), 2), None).answers,
+            Some(2)
+        );
+        assert_eq!(failed_event(&refused_connect(), None).answers, None);
     }
 }
