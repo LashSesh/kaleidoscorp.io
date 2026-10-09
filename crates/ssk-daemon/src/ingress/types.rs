@@ -5,6 +5,7 @@
 //! import from this file and never from each other, so a type that two of them
 //! need lives here. Nothing in this file does I/O.
 
+use std::collections::BTreeMap;
 use std::net::SocketAddrV4;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -13,7 +14,7 @@ use serde::{Deserialize, Serialize};
 use ssk_config::ingress::{DirectAddressFamilies, IngressHardening, IngressProtocol};
 use ssk_netcore::BoxFuture;
 
-pub use ssk_config::fingerprint::{ConfigFingerprint, RuleRow, RuleTable};
+pub use ssk_config::fingerprint::{ArmedFacts, ConfigFingerprint, RuleRow, RuleTable};
 pub use ssk_config::ingress::{DestinationLogging, IngressAuditConfig, IngressLimits};
 
 // ---------------------------------------------------------------------------
@@ -239,7 +240,7 @@ impl UnavailableCode {
     }
 
     /// The next step for a code that arming again cannot fix.
-    const fn restart_step(self) -> &'static str {
+    pub(crate) const fn restart_step(self) -> &'static str {
         match self {
             Self::ConfigInvalid => "fix the configuration, then restart sskd",
             Self::HardeningUnavailable => {
@@ -668,6 +669,10 @@ pub struct IngressCfgView {
     /// The running configuration's digests: `Started`, status, and the
     /// `expect_routing_digest` check of 11.4.
     pub fingerprint: ConfigFingerprint,
+    /// What the `Armed` record says about each profile (its digest and its rule
+    /// table), computed once with the fingerprint so that the control plane never
+    /// needs the whole configuration. A profile that is not here cannot be armed.
+    pub armed: Arc<BTreeMap<Arc<str>, ArmedFacts>>,
 }
 
 #[cfg(test)]
@@ -690,6 +695,13 @@ impl IngressCfgView {
             limits: config.ingress.limits.clone(),
             audit: config.ingress.audit.clone(),
             fingerprint,
+            armed: Arc::new(BTreeMap::from([(
+                Arc::<str>::from("main"),
+                // The default configuration's one profile is called `default`; the
+                // tests call it `main`.
+                ssk_config::fingerprint::armed(&config, &config.routing.default_profile)
+                    .expect("armed facts"),
+            )])),
         }
     }
 }

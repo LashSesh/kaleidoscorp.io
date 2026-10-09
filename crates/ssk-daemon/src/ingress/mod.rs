@@ -31,6 +31,7 @@ pub mod path;
 pub mod peer;
 pub mod platform;
 pub mod pump;
+pub mod shared;
 pub mod socks5;
 pub mod target;
 pub mod types;

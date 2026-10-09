@@ -2190,8 +2190,8 @@ impl FlowAuditWriter {
     }
 
     /// `Disarmed`. Never fails the caller: a record that could not be written is
-    /// counted.
-    pub async fn append_disarmed(&self, event: DisarmedEvent, bounded: Duration) {
+    /// counted. Returns whether it was written.
+    pub async fn append_disarmed(&self, event: DisarmedEvent, bounded: Duration) -> bool {
         let record = FlowAuditEvent::Disarmed {
             cause: event.cause.as_str().to_owned(),
             epoch: event.epoch,
@@ -2204,9 +2204,13 @@ impl FlowAuditWriter {
             .await;
         // Never fails the caller, never silent: a `Disarmed` that was not written is
         // counted with the other records that close a story.
-        if result.is_err_and(|error| error != AuditError::Timeout) {
-            bump(&self.core.shared.compensations_lost);
+        let written = result.is_ok();
+        if let Err(error) = result {
+            if error != AuditError::Timeout {
+                bump(&self.core.shared.compensations_lost);
+            }
         }
+        written
     }
 
     /// `Tripped`: synchronous, never blocks, rides the compensation channel. For
