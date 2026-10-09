@@ -547,7 +547,6 @@ pub struct Tuning {
     pub closed_deadline: Duration,
     // control
     pub control_lock_wait: Duration,
-    pub disarm_bookkeeping_wait: Duration,
     pub recover_verify_deadline: Duration,
     pub doctor_verify_deadline: Duration,
     pub audit_read_verify_deadline: Duration,
@@ -590,7 +589,6 @@ impl Default for Tuning {
             summary_floor: Duration::from_secs(300),
             closed_deadline: Duration::from_secs(1),
             control_lock_wait: Duration::from_secs(10),
-            disarm_bookkeeping_wait: Duration::from_secs(2),
             recover_verify_deadline: Duration::from_secs(60),
             doctor_verify_deadline: Duration::from_secs(10),
             audit_read_verify_deadline: Duration::from_secs(30),
@@ -1376,13 +1374,12 @@ mod tests {
         assert_eq!(
             (
                 t.control_lock_wait,
-                t.disarm_bookkeeping_wait,
                 t.recover_verify_deadline,
                 t.doctor_verify_deadline,
                 t.audit_read_verify_deadline,
                 t.session_shutdown_bound
             ),
-            (s(10), s(2), s(60), s(10), s(30), s(1))
+            (s(10), s(60), s(10), s(30), s(1))
         );
         assert_eq!((t.set_ingress_burst, t.set_ingress_refill), (5, s(2)));
         assert_eq!(t.bind_retry_recover, vec![Duration::ZERO, ms(250), ms(500)]);

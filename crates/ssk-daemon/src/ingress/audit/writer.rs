@@ -2213,6 +2213,21 @@ impl FlowAuditWriter {
         written
     }
 
+    /// `Disarmed`, synchronous and never blocking: the same road as `Tripped`. For
+    /// the gate's `disarm()` and `close()`, which queue it inside the gate write so
+    /// that its place in the ledger follows the gate's order. `false` when the
+    /// writer is gone.
+    #[must_use]
+    pub fn try_enqueue_disarmed(&self, event: DisarmedEvent) -> bool {
+        self.core.send_comp(
+            String::new(),
+            FlowAuditEvent::Disarmed {
+                cause: event.cause.as_str().to_owned(),
+                epoch: event.epoch,
+            },
+        )
+    }
+
     /// `Tripped`: synchronous, never blocks, rides the compensation channel. For
     /// the gate's `trip()`, which cannot await. `false` when the writer is gone
     /// (a trip caused by an audit failure cannot be recorded in the audit).

@@ -562,10 +562,13 @@ impl Rig {
         )
         .expect("opens");
         let boot: Arc<str> = Arc::from(format!("b{}", writer.boot_seq()));
-        shared.ledger_slot().install(Installed {
-            writer: Arc::new(writer),
-            boot,
-        });
+        shared
+            .ledger_slot()
+            .install(Installed {
+                writer: Arc::new(writer),
+                boot,
+            })
+            .expect("not sealed");
 
         // The data plane: the real executor, guarded as the daemon builds it.
         let cells = GuardCells::new();

@@ -2582,7 +2582,7 @@ mod tests {
         }
         assert_eq!(rig.plane.hung.load(Ordering::SeqCst), 1, "the dial started");
         assert_eq!(rig.plane.hung_dropped.load(Ordering::SeqCst), 0);
-        rig.shared.disarm(DisarmCause::Operator).await;
+        rig.shared.disarm(DisarmCause::Operator);
         let fault = task.await.expect("joins").expect_err("cancelled");
         assert!(matches!(fault, DialFault::Cancelled), "{fault:?}");
         assert_eq!(fault.reply(), None);
@@ -2620,7 +2620,7 @@ mod tests {
         }
         assert!(resolver.entered(), "the lookup is running");
         // The profile that is armed changes while the lookup is in flight.
-        rig.shared.disarm(DisarmCause::Operator).await;
+        rig.shared.disarm(DisarmCause::Operator);
         let fault = task.await.expect("joins").expect_err("cancelled");
         assert!(matches!(fault, DialFault::Cancelled), "{fault:?}");
         // The lookup now returns, into a dial that no longer exists.
@@ -2655,7 +2655,7 @@ mod tests {
         let (spec, _resolver, connector) = direct_spec();
         let rig = Rig::new(spec).await;
         let adm = rig.admit_v4(PUBLIC, 443).expect("admitted");
-        rig.shared.disarm(DisarmCause::Operator).await;
+        rig.shared.disarm(DisarmCause::Operator);
         let fault = rig.open(adm).await.expect_err("cancelled");
         assert!(matches!(fault, DialFault::Cancelled), "{fault:?}");
         assert_eq!(rig.count("pending"), 0);
@@ -2674,7 +2674,7 @@ mod tests {
             tokio::spawn(async move { rig.open(adm).await })
         };
         rig.wait_in_sync().await;
-        rig.shared.disarm(DisarmCause::Operator).await;
+        rig.shared.disarm(DisarmCause::Operator);
         rig.io.release();
         let fault = task.await.expect("joins").expect_err("cancelled");
         assert!(matches!(fault, DialFault::Cancelled), "{fault:?}");
@@ -2697,7 +2697,7 @@ mod tests {
         let adm = rig.admit_v4(PUBLIC, 443).expect("admitted");
         let mut gate = rig.shared.gate();
         let epoch = adm.epoch();
-        rig.shared.disarm(DisarmCause::Operator).await;
+        rig.shared.disarm(DisarmCause::Operator);
         // A receiver that never saw the change still compares epochs, so the
         // pre-check of `open_tunnel` catches it first; the check after the dial is
         // the same predicate, exercised here through `gate_unchanged`.
@@ -2732,10 +2732,13 @@ mod tests {
             Some(&*boot),
             "the new boot has another prefix"
         );
-        rig.shared.ledger_slot().install(Installed {
-            writer: Arc::new(writer),
-            boot,
-        });
+        rig.shared
+            .ledger_slot()
+            .install(Installed {
+                writer: Arc::new(writer),
+                boot,
+            })
+            .expect("not sealed");
         let fault = rig.open(adm).await.expect_err("cancelled");
         assert!(matches!(fault, DialFault::Cancelled), "{fault:?}");
         assert!(!io.text().contains("\"event\":\"pending\""));

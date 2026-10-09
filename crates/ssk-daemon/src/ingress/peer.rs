@@ -388,7 +388,8 @@ pub fn decide_row(rows: &[Row], query: &PeerQuery, own_uid: u32) -> RowDecision 
 /// `INGRESS_HARDENING_UNAVAILABLE` lists.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MissingControl {
-    /// `getuid() != geteuid()`: "same user" would be ambiguous.
+    /// "Same user" would be ambiguous: `getuid() != geteuid()`, or the user
+    /// namespace maps ids (an unmapped account would show as the overflow uid).
     IdentityAmbiguous,
     /// The self-test against a temporary loopback connection failed.
     PeerSelftestFailed,
@@ -510,8 +511,9 @@ pub struct ServiceTuning {
     /// Requests served from one snapshot.
     pub batch: usize,
     /// The next snapshot starts no earlier than `max(min_interval, 2 x the
-    /// duration of the last one)` after the last one started: at most a third of
-    /// one core however fast connections arrive.
+    /// duration of the last one)` after the last one ENDED, so a read of `d` is
+    /// followed by a rest of at least `2d`: at most a third of one core however
+    /// fast connections arrive.
     pub min_interval: Duration,
     /// The wait before the one re-read of a miss.
     pub reread_after: Duration,
@@ -683,8 +685,10 @@ impl Worker {
             let started = Instant::now();
             self.serve(batch);
             let took = started.elapsed();
+            // Measured from the END of the snapshot: a rest of twice its duration
+            // makes the busy fraction at most one in three.
             next_allowed =
-                started.checked_add(self.tuning.min_interval.max(took.saturating_mul(2)));
+                Instant::now().checked_add(self.tuning.min_interval.max(took.saturating_mul(2)));
         }
     }
 
@@ -1823,7 +1827,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_next_snapshot_waits_twice_as_long_as_the_last_one_took() {
+    async fn the_next_snapshot_rests_twice_as_long_as_the_last_one_took() {
         let (source, starts) = timed(
             Duration::from_millis(60),
             table_text(listener(), &[40001], OWN),
@@ -1844,7 +1848,11 @@ mod tests {
         let starts = lock_unpoisoned(&starts).clone();
         assert_eq!(starts.len(), 2);
         let gap = starts[1].duration_since(starts[0]);
-        assert!(gap >= Duration::from_millis(115), "{gap:?}: 2 x 60 ms");
+        // 60 ms of reading and then a rest of 2 x 60 ms: a third of the time at most.
+        assert!(
+            gap >= Duration::from_millis(175),
+            "{gap:?}: 60 ms + 2 x 60 ms"
+        );
     }
 
     #[tokio::test]
@@ -1892,9 +1900,12 @@ mod tests {
         let (mut source, _) = timed(Duration::ZERO, table_text(listener(), &ports, OWN));
         // The first read is slow, so that all five are queued behind it.
         source.delay = Duration::from_millis(80);
+        // The service rests twice as long as it read between snapshots (80 + 160 +
+        // 80 + 160 + 80 ms here), which is longer than a caller's default wait.
         let tuning = ServiceTuning {
             batch: 2,
             min_interval: Duration::from_millis(1),
+            timeout: Duration::from_secs(10),
             ..ServiceTuning::DEFAULT
         };
         let svc = Arc::new(service(source.clone(), tuning));

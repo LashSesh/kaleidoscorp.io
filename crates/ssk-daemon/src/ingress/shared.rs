@@ -22,6 +22,7 @@
 //!   reads the gate, short std mutexes and atomics; it never waits for `control`,
 //!   never awaits and never does file I/O.
 
+use std::cell::Cell;
 use std::collections::VecDeque;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -259,6 +260,14 @@ pub struct Installed {
     pub boot: Arc<str>,
 }
 
+impl std::fmt::Debug for Installed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Installed")
+            .field("boot", &self.boot)
+            .finish_non_exhaustive()
+    }
+}
+
 /// Where the current writer lives. The host installs the first one at start and a
 /// fresh one at every recover; everything else reads it through [`current`].
 ///
@@ -266,6 +275,8 @@ pub struct Installed {
 #[derive(Default)]
 pub struct LedgerSlot {
     current: RwLock<Option<Installed>>,
+    /// Set by `close()`: nothing is installed after the gate has closed.
+    sealed: AtomicBool,
 }
 
 impl LedgerSlot {
@@ -281,8 +292,25 @@ impl LedgerSlot {
     }
 
     /// Host only. Returns the writer that was replaced.
-    pub fn install(&self, new: Installed) -> Option<Installed> {
-        write_unpoisoned(&self.current).replace(new)
+    ///
+    /// # Errors
+    /// The writer itself, after [`seal`]: a recover that raced a shutdown opened a
+    /// writer nobody will close, and the host must close the one it gets back.
+    ///
+    /// [`seal`]: LedgerSlot::seal
+    pub fn install(&self, new: Installed) -> Result<Option<Installed>, Installed> {
+        let mut slot = write_unpoisoned(&self.current);
+        if self.sealed.load(Ordering::Acquire) {
+            return Err(new);
+        }
+        Ok(slot.replace(new))
+    }
+
+    /// No writer is installed after this. Taken under the lock `install` holds, so
+    /// an install either finished before or is refused.
+    pub fn seal(&self) {
+        let _slot = write_unpoisoned(&self.current);
+        self.sealed.store(true, Ordering::Release);
     }
 }
 
@@ -295,8 +323,11 @@ pub trait ControlLedger: Send + Sync {
         record: ArmedEvent,
         waits: Waits,
     ) -> BoxFuture<'_, Result<ArmReceipt, AuditError>>;
-    /// Durable, best effort. `true` when the record was written.
-    fn append_disarmed(&self, record: DisarmedEvent, bounded: Duration) -> BoxFuture<'_, bool>;
+    /// Synchronous, never blocks, rides the writer's compensation channel like
+    /// `Tripped`: called while the gate write is still in progress, so the record
+    /// is ordered with the write for everyone who saw the new gate. `false` when it
+    /// could not be queued.
+    fn try_enqueue_disarmed(&self, record: DisarmedEvent) -> bool;
     /// Synchronous, never blocks. `false` when the record could not be queued.
     fn try_enqueue_tripped(&self, record: TrippedEvent) -> bool;
     /// How long the disk part of the batch that is running now has been running;
@@ -319,13 +350,9 @@ impl ControlLedger for LedgerSlot {
         })
     }
 
-    fn append_disarmed(&self, record: DisarmedEvent, bounded: Duration) -> BoxFuture<'_, bool> {
-        Box::pin(async move {
-            match self.current() {
-                Some(installed) => installed.writer.append_disarmed(record, bounded).await,
-                None => false,
-            }
-        })
+    fn try_enqueue_disarmed(&self, record: DisarmedEvent) -> bool {
+        self.current()
+            .is_some_and(|installed| installed.writer.try_enqueue_disarmed(record))
     }
 
     fn try_enqueue_tripped(&self, record: TrippedEvent) -> bool {
@@ -650,6 +677,9 @@ impl Default for HostFacts {
 #[derive(Debug, Default)]
 struct StatusInner {
     last_error: Option<IpcError>,
+    /// The gate epoch the error was raised under: bookkeeping of an older
+    /// transition never replaces or clears the error of a newer one.
+    last_error_epoch: u64,
     last_denial: Option<DenialSummaryDto>,
     last_transition: Option<LastTransitionDto>,
     host: HostFacts,
@@ -674,6 +704,18 @@ pub struct ArmOutcome {
 pub struct DisarmOutcome {
     pub was_armed: bool,
     pub epoch: u64,
+}
+
+/// Trips `ControlPanic` when a control task unwinds. The task detaches from a
+/// requester that has gone away, so nobody may be left to read its join result.
+struct PanicTrip(Arc<IngressShared>);
+
+impl Drop for PanicTrip {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            self.0.trip(TripReason::ControlPanic);
+        }
+    }
 }
 
 pub struct IngressShared {
@@ -786,12 +828,46 @@ impl IngressShared {
         self.autostart_cancelled.load(Ordering::Acquire)
     }
 
+    /// Whether the host's step 8 (`arm_on_start`) may arm: nobody disarmed during
+    /// the start, and nothing at all has happened to the gate since the start
+    /// published it (a disarm, a trip or an arm after the publish is somebody's
+    /// decision, and a configuration default must not override it).
+    #[must_use]
+    pub fn autostart_allowed(&self, published_epoch: u64) -> bool {
+        !self.autostart_cancelled() && self.gate_now().epoch == published_epoch
+    }
+
     pub fn update_host_facts(&self, change: impl FnOnce(&mut HostFacts)) {
         change(&mut lock_unpoisoned(&self.status).host);
     }
 
+    /// Sets (under the epoch the gate has now) or clears the proxy's own last error.
     pub fn set_last_error(&self, error: Option<IpcError>) {
-        lock_unpoisoned(&self.status).last_error = error;
+        match error {
+            Some(error) => self.set_error_at(self.gate_now().epoch, error),
+            None => {
+                let mut status = lock_unpoisoned(&self.status);
+                status.last_error = None;
+            }
+        }
+    }
+
+    /// Records an error raised under `epoch`, unless a newer one is already shown.
+    fn set_error_at(&self, epoch: u64, error: IpcError) {
+        let mut status = lock_unpoisoned(&self.status);
+        if status.last_error.is_none() || epoch >= status.last_error_epoch {
+            status.last_error = Some(error);
+            status.last_error_epoch = epoch;
+        }
+    }
+
+    /// A transition at `epoch` (an arm, a recover) clears the errors raised at or
+    /// before it, and nothing a later transition raised.
+    fn clear_error_through(&self, epoch: u64) {
+        let mut status = lock_unpoisoned(&self.status);
+        if status.last_error.is_some() && status.last_error_epoch <= epoch {
+            status.last_error = None;
+        }
     }
 
     pub fn set_last_denial(&self, denial: DenialSummaryDto) {
@@ -814,7 +890,28 @@ impl IngressShared {
     where
         F: FnOnce(&GateMode) -> Option<GateMode>,
     {
-        let mut applied = None;
+        self.cas_with(expect_epoch, change, |_, _| {})
+    }
+
+    /// [`cas`] that also runs `applied(previous mode, new gate)` when the write
+    /// happened, while the watch cell's write lock is still held. Whatever it
+    /// queues is therefore ordered with the write for everyone who sees the new
+    /// gate: this is how a `Disarmed` record is kept in front of the `Armed` of an
+    /// arm that follows. It must not block: no lock, no I/O (an unbounded send is
+    /// neither).
+    ///
+    /// [`cas`]: IngressShared::cas
+    pub(crate) fn cas_with<F, A>(
+        &self,
+        expect_epoch: Option<u64>,
+        change: F,
+        applied: A,
+    ) -> Option<Gate>
+    where
+        F: FnOnce(&GateMode) -> Option<GateMode>,
+        A: FnOnce(&GateMode, &Gate),
+    {
+        let mut result = None;
         self.gate.send_if_modified(|gate| {
             if matches!(gate.mode, GateMode::Closing) {
                 return false;
@@ -822,6 +919,7 @@ impl IngressShared {
             if expect_epoch.is_some_and(|epoch| epoch != gate.epoch) {
                 return false;
             }
+            let previous = gate.mode.clone();
             let Some(mode) = change(&gate.mode) else {
                 return false;
             };
@@ -833,10 +931,11 @@ impl IngressShared {
                 // 2^64 transitions: unreachable, but never a wrap.
                 None => gate.mode = GateMode::Closing,
             }
-            applied = Some(gate.clone());
+            applied(&previous, gate);
+            result = Some(gate.clone());
             true
         });
-        applied
+        result
     }
 
     /// The host's start task publishes its outcome (transition 1 of 6.1.2) with the
@@ -858,8 +957,18 @@ impl IngressShared {
         applied
     }
 
+    /// Publishes a transition for status, unless a newer one is already shown: the
+    /// bookkeeping of two transitions can run in either order.
     fn note_transition(&self, epoch: u64, kind: &str, reason: &str, actor: Option<&str>) {
-        lock_unpoisoned(&self.status).last_transition = Some(LastTransitionDto {
+        let mut status = lock_unpoisoned(&self.status);
+        if status
+            .last_transition
+            .as_ref()
+            .is_some_and(|shown| shown.epoch > epoch)
+        {
+            return;
+        }
+        status.last_transition = Some(LastTransitionDto {
             epoch,
             kind: kind.to_owned(),
             reason_code: reason.to_owned(),
@@ -884,16 +993,13 @@ impl IngressShared {
         .map_err(|_| err_busy())
     }
 
-    /// Runs a control task to its end and maps a panic to a trip.
+    /// Waits for a control task and maps a task that did not finish to an answer.
+    /// A panic has already tripped the gate: [`PanicTrip`] does that inside the
+    /// task, so it also happens when nobody is waiting any more.
     async fn join_control<T>(&self, task: JoinHandle<Result<T, IpcError>>) -> Result<T, IpcError> {
         match task.await {
             Ok(result) => result,
-            Err(error) => {
-                if error.is_panic() {
-                    self.trip(TripReason::ControlPanic);
-                }
-                Err(err_control_failed())
-            }
+            Err(_) => Err(err_control_failed()),
         }
     }
 
@@ -911,7 +1017,10 @@ impl IngressShared {
     ) -> Result<ArmOutcome, IpcError> {
         let shared = Arc::clone(self);
         let profile: Arc<str> = Arc::from(profile);
-        let task = tokio::spawn(async move { shared.arm_task(profile, actor).await });
+        let task = tokio::spawn(async move {
+            let _trip = PanicTrip(Arc::clone(&shared));
+            shared.arm_task(profile, actor).await
+        });
         self.join_control(task).await
     }
 
@@ -992,7 +1101,7 @@ impl IngressShared {
             Some(gate) => {
                 receipt.applied();
                 self.note_transition(gate.epoch, "armed", "", Some(actor.requested_by()));
-                self.set_last_error(None);
+                self.clear_error_through(gate.epoch);
                 self.emit(
                     INGRESS_ARMED,
                     format!("the local proxy was armed for profile `{profile}`"),
@@ -1020,71 +1129,68 @@ impl IngressShared {
 
     // -- disarm -----------------------------------------------------------------------------------
 
-    /// Disarms (6.9.2). The effect is first, lock-free and cannot fail; the record
-    /// follows. It bumps the epoch even when the gate is already disarmed, tripped
-    /// or unavailable: an arm that waits for its fsync captured the old epoch.
-    pub async fn disarm(self: &Arc<Self>, cause: DisarmCause) -> DisarmOutcome {
-        let mut was_armed = false;
-        let applied = self.cas(None, |mode| match mode {
-            GateMode::Armed { .. } => {
-                was_armed = true;
-                Some(GateMode::Disarmed)
-            }
-            GateMode::Disarmed | GateMode::Tripped(_) | GateMode::Unavailable(_) => {
-                Some(mode.clone())
-            }
-            // No arm or recover can be in flight, and a bump would make the start
-            // task's own compare-and-set fail.
-            GateMode::Starting | GateMode::Disabled | GateMode::Closing => None,
-        });
+    /// Disarms (6.9.2). Lock-free, synchronous and unable to fail: the gate write, the
+    /// record and the answer are one step. The write bumps the epoch even when the
+    /// gate is already disarmed, tripped or unavailable (an arm that waits for its
+    /// fsync captured the old epoch), and the `Disarmed` record is queued inside the
+    /// write, so it precedes the `Armed` record of any arm that follows.
+    pub fn disarm(&self, cause: DisarmCause) -> DisarmOutcome {
+        let was_armed = Cell::new(false);
+        let saw_starting = Cell::new(false);
+        let applied = self.cas_with(
+            None,
+            |mode| match mode {
+                GateMode::Armed { .. } => {
+                    was_armed.set(true);
+                    Some(GateMode::Disarmed)
+                }
+                GateMode::Disarmed | GateMode::Tripped(_) | GateMode::Unavailable(_) => {
+                    Some(mode.clone())
+                }
+                // No arm or recover can be in flight, and a bump would make the start
+                // task's own compare-and-set fail. What was read HERE is what is
+                // acted on: a second read after the write could see a start that
+                // finished in between.
+                GateMode::Starting => {
+                    saw_starting.set(true);
+                    None
+                }
+                GateMode::Disabled | GateMode::Closing => None,
+            },
+            |_, gate| {
+                if was_armed.get() {
+                    self.enqueue_disarmed(cause, gate.epoch);
+                }
+            },
+        );
         let Some(gate) = applied else {
-            let gate = self.gate_now();
-            if matches!(gate.mode, GateMode::Starting) {
+            if saw_starting.get() {
                 self.autostart_cancelled.store(true, Ordering::Release);
             }
             return DisarmOutcome {
                 was_armed: false,
-                epoch: gate.epoch,
+                epoch: self.gate_now().epoch,
             };
         };
         self.note_transition(gate.epoch, "disarmed", cause.as_str(), None);
-        if was_armed {
-            // The record is bookkeeping: it runs to its end even if the requester
-            // goes away, and it never changes the answer.
-            let shared = Arc::clone(self);
-            let epoch = gate.epoch;
-            let task = tokio::spawn(async move { shared.disarm_record(cause, epoch).await });
-            if let Err(error) = task.await {
-                if error.is_panic() {
-                    self.trip(TripReason::ControlPanic);
-                }
-            }
+        if was_armed.get() {
             self.emit(
                 INGRESS_DISARMED,
                 format!("the local proxy was disarmed ({})", cause.as_str()),
             );
         }
         DisarmOutcome {
-            was_armed,
+            was_armed: was_armed.get(),
             epoch: gate.epoch,
         }
     }
 
-    async fn disarm_record(&self, cause: DisarmCause, epoch: u64) {
-        let lock = tokio::time::timeout(
-            self.tuning.disarm_bookkeeping_wait,
-            Arc::clone(&self.control).lock_owned(),
-        )
-        .await;
-        let written = match lock {
-            Ok(_guard) => {
-                self.ledger
-                    .append_disarmed(DisarmedEvent { cause, epoch }, self.tuning.closed_deadline)
-                    .await
-            }
-            Err(_) => false,
-        };
-        if !written {
+    /// Queues the record of a disarm; a record that could not be queued is counted.
+    fn enqueue_disarmed(&self, cause: DisarmCause, epoch: u64) {
+        if !self
+            .ledger
+            .try_enqueue_disarmed(DisarmedEvent { cause, epoch })
+        {
             Counters::bump(&self.counters.disarm_record_lost);
         }
     }
@@ -1107,7 +1213,8 @@ impl IngressShared {
         };
         Counters::bump(&self.counters.trips);
         self.note_transition(gate.epoch, "tripped", why.as_str(), None);
-        lock_unpoisoned(&self.status).last_error = Some(
+        self.set_error_at(
+            gate.epoch,
             IpcError::new(
                 "Runtime",
                 INGRESS_TRIPPED,
@@ -1139,6 +1246,7 @@ impl IngressShared {
     pub async fn recover(self: &Arc<Self>) -> Result<(), IpcError> {
         let shared = Arc::clone(self);
         let task = tokio::spawn(async move {
+            let _trip = PanicTrip(Arc::clone(&shared));
             let guard = shared.lock_control().await?;
             shared.recover_locked(&guard).await
         });
@@ -1169,7 +1277,7 @@ impl IngressShared {
             Ok(()) => match self.cas(Some(e0), |_| Some(GateMode::Disarmed)) {
                 Some(gate) => {
                     self.note_transition(gate.epoch, "recovered", "", None);
-                    self.set_last_error(None);
+                    self.clear_error_through(gate.epoch);
                     self.emit(
                         INGRESS_RECOVERED,
                         "the local proxy recovered and is disarmed".to_owned(),
@@ -1185,7 +1293,7 @@ impl IngressShared {
                     self.note_transition(gate.epoch, "unavailable", code.as_code(), None);
                 }
                 let error = err_recovery_failed(code, &cause);
-                self.set_last_error(Some(error.clone()));
+                self.set_error_at(self.gate_now().epoch, error.clone());
                 Err(error)
             }
         }
@@ -1193,9 +1301,21 @@ impl IngressShared {
 
     // -- close --------------------------------------------------------------------------------------
 
-    /// Terminal: nothing changes the gate after this.
+    /// Terminal: nothing changes the gate after this, and no writer is installed
+    /// after it. An armed gate leaves `Disarmed{shutdown}` in the ledger, queued in
+    /// the write, best effort (a shutdown does not wait for it).
     pub fn close(&self) {
-        if let Some(gate) = self.cas(None, |_| Some(GateMode::Closing)) {
+        let applied = self.cas_with(
+            None,
+            |_| Some(GateMode::Closing),
+            |previous, gate| {
+                if matches!(previous, GateMode::Armed { .. }) {
+                    self.enqueue_disarmed(DisarmCause::Shutdown, gate.epoch);
+                }
+            },
+        );
+        self.slot.seal();
+        if let Some(gate) = applied {
             self.note_transition(gate.epoch, "stopping", "", None);
         }
     }
@@ -1485,6 +1605,8 @@ mod tests {
         inner: Arc<LedgerSlot>,
         hold_arm: AtomicBool,
         panic_arm: AtomicBool,
+        /// Panics after the hold is released (the requester may be gone by then).
+        panic_after_hold: AtomicBool,
         arm_entered: Notify,
         arm_release: Notify,
         delay: Mutex<Duration>,
@@ -1504,6 +1626,7 @@ mod tests {
                 inner,
                 hold_arm: AtomicBool::new(false),
                 panic_arm: AtomicBool::new(false),
+                panic_after_hold: AtomicBool::new(false),
                 arm_entered: Notify::new(),
                 arm_release: Notify::new(),
                 delay: Mutex::new(Duration::ZERO),
@@ -1532,6 +1655,9 @@ mod tests {
                     self.arm_entered.notify_one();
                     self.arm_release.notified().await;
                 }
+                if self.panic_after_hold.load(Ordering::SeqCst) {
+                    panic!("the ledger double was told to panic after the hold");
+                }
                 *lock_unpoisoned(&self.last_waits) = Some(waits);
                 let delay = *lock_unpoisoned(&self.delay);
                 if !delay.is_zero() {
@@ -1544,11 +1670,9 @@ mod tests {
             })
         }
 
-        fn append_disarmed(&self, record: DisarmedEvent, bounded: Duration) -> BoxFuture<'_, bool> {
-            Box::pin(async move {
-                lock_unpoisoned(&self.disarmed).push((record.cause, record.epoch));
-                self.inner.append_disarmed(record, bounded).await
-            })
+        fn try_enqueue_disarmed(&self, record: DisarmedEvent) -> bool {
+            lock_unpoisoned(&self.disarmed).push((record.cause, record.epoch));
+            self.inner.try_enqueue_disarmed(record)
         }
 
         fn try_enqueue_tripped(&self, record: TrippedEvent) -> bool {
@@ -1685,7 +1809,6 @@ mod tests {
     fn fast_tuning() -> Tuning {
         Tuning {
             control_lock_wait: Duration::from_millis(400),
-            disarm_bookkeeping_wait: Duration::from_millis(400),
             ..Tuning::default()
         }
     }
@@ -1704,6 +1827,16 @@ mod tests {
 
     /// A control plane over a real writer in a temporary directory, gate `Disarmed`.
     async fn rig_with(cfg: IngressCfgView, tuning: Tuning) -> Rig {
+        rig_built(cfg, tuning, true).await
+    }
+
+    /// A rig whose host has not published the outcome of its start: the gate is
+    /// still `Starting`.
+    async fn rig_starting() -> Rig {
+        rig_built(cfg_with_two_profiles(), fast_tuning(), false).await
+    }
+
+    async fn rig_built(cfg: IngressCfgView, tuning: Tuning, published: bool) -> Rig {
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().expect("tempdir");
         std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700))
@@ -1729,10 +1862,13 @@ mod tests {
         slot.install(Installed {
             writer: Arc::new(writer),
             boot: Arc::from("b1"),
-        });
+        })
+        .expect("not sealed");
         healthy_host(&shared);
-        let started = shared.start_transition(0, GateMode::Disarmed);
-        assert!(started.is_some());
+        if published {
+            let started = shared.start_transition(0, GateMode::Disarmed);
+            assert!(started.is_some());
+        }
         Rig {
             dir,
             shared,
@@ -1844,7 +1980,7 @@ mod tests {
     async fn disarm_bumps_the_epoch_even_when_already_disarmed_and_records_only_an_armed_gate() {
         let mut rig = rig().await;
         let e0 = rig.shared.gate_now().epoch;
-        let first = rig.shared.disarm(DisarmCause::Operator).await;
+        let first = rig.shared.disarm(DisarmCause::Operator);
         assert_eq!(
             first,
             DisarmOutcome {
@@ -1852,7 +1988,7 @@ mod tests {
                 epoch: e0 + 1
             }
         );
-        let second = rig.shared.disarm(DisarmCause::Operator).await;
+        let second = rig.shared.disarm(DisarmCause::Operator);
         assert_eq!(second.epoch, e0 + 2);
         assert!(rig.ledger.disarmed.lock().expect("lock").is_empty());
         assert!(
@@ -1863,7 +1999,7 @@ mod tests {
         rig.shared.arm("main", operator()).await.expect("armed");
         let _ = rig.events.try_recv();
         let armed = rig.shared.gate_now().epoch;
-        let outcome = rig.shared.disarm(DisarmCause::Operator).await;
+        let outcome = rig.shared.disarm(DisarmCause::Operator);
         assert_eq!(
             outcome,
             DisarmOutcome {
@@ -1897,7 +2033,7 @@ mod tests {
         // The gate still reads Disarmed while the arm waits for its fsync; the
         // disarm must not be answered from that read. It answers at once.
         let before = rig.shared.gate_now().epoch;
-        let disarm = rig.shared.disarm(DisarmCause::Operator).await;
+        let disarm = rig.shared.disarm(DisarmCause::Operator);
         assert!(!disarm.was_armed);
         assert_eq!(disarm.epoch, before + 1);
         rig.ledger.arm_release.notify_one();
@@ -1939,12 +2075,101 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_disarm_is_in_the_ledger_before_an_arm_that_follows_it() {
+        // The record of a disarm is ordered by the gate write, not by winning the
+        // control lock: an arm queued behind another arm must not be able to put
+        // its `Armed` in front of the `Disarmed` that preceded it.
+        let rig = rig().await;
+        rig.shared.arm("main", operator()).await.expect("armed");
+        rig.ledger.hold_arm.store(true, Ordering::SeqCst);
+        let first = arm_task(&rig, "alt").await;
+        rig.ledger.arm_entered.notified().await;
+        rig.ledger.hold_arm.store(false, Ordering::SeqCst);
+        let second = arm_task(&rig, "main").await;
+        // The second arm is queued on the control lock behind the first.
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        let disarm = {
+            let shared = Arc::clone(&rig.shared);
+            tokio::spawn(async move { shared.disarm(DisarmCause::Operator) })
+        };
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        rig.ledger.arm_release.notify_one();
+        assert_eq!(code(first.await.expect("joined")), INGRESS_SUPERSEDED);
+        second.await.expect("joined").expect("armed again");
+        assert!(disarm.await.expect("joined").was_armed);
+        assert_eq!(
+            rig.mode(),
+            GateMode::Armed {
+                profile: Arc::from("main")
+            }
+        );
+        let events = rig.records().await;
+        assert_eq!(
+            ledger_says_armed(&events),
+            Some("main".to_owned()),
+            "the ledger's last word must be the gate's: {:?}",
+            kinds(&events)
+        );
+    }
+
+    #[tokio::test]
+    async fn the_bookkeeping_of_an_older_transition_never_overwrites_a_newer_one() {
+        let rig = rig().await;
+        let shared = &rig.shared;
+        shared.note_transition(9, "tripped", "accept_fatal", None);
+        shared.note_transition(7, "armed", "", Some("uid:1000"));
+        let shown = shared.snapshot().last_transition.expect("a transition");
+        assert_eq!((shown.epoch, shown.kind.as_str()), (9, "tripped"));
+        shared.set_error_at(9, err_control_failed());
+        // An arm that opened the gate at epoch 8 clears what is older than itself,
+        // not the error of the trip at epoch 9 that happened after it.
+        shared.clear_error_through(8);
+        assert_eq!(
+            shared.snapshot().last_error.map(|e| e.code),
+            Some(INGRESS_CONTROL_FAILED.to_owned())
+        );
+        shared.clear_error_through(9);
+        assert_eq!(shared.snapshot().last_error.map(|e| e.code), None);
+        // A late write of an older error does not replace a newer one either.
+        shared.set_error_at(12, err_control_failed());
+        shared.set_error_at(11, err_busy());
+        assert_eq!(
+            shared.snapshot().last_error.map(|e| e.code),
+            Some(INGRESS_CONTROL_FAILED.to_owned())
+        );
+    }
+
+    #[tokio::test]
+    async fn a_control_task_that_panics_after_its_requester_left_still_trips() {
+        let rig = rig().await;
+        rig.ledger.hold_arm.store(true, Ordering::SeqCst);
+        rig.ledger.panic_after_hold.store(true, Ordering::SeqCst);
+        let requester = {
+            let shared = Arc::clone(&rig.shared);
+            tokio::spawn(async move { shared.arm("main", operator()).await })
+        };
+        rig.ledger.arm_entered.notified().await;
+        // The requester goes away: nobody reads the join result of the control task.
+        requester.abort();
+        let _ = requester.await;
+        rig.ledger.arm_release.notify_one();
+        for _ in 0..200 {
+            if matches!(rig.mode(), GateMode::Tripped(_)) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(rig.mode(), GateMode::Tripped(TripReason::ControlPanic));
+        assert_eq!(rig.shared.snapshot().counters.trips, 1);
+    }
+
+    #[tokio::test]
     async fn closing_is_terminal() {
         let rig = rig().await;
         rig.shared.close();
         let epoch = rig.shared.gate_now().epoch;
         rig.shared.trip(TripReason::AcceptFatal);
-        let outcome = rig.shared.disarm(DisarmCause::Operator).await;
+        let outcome = rig.shared.disarm(DisarmCause::Operator);
         assert_eq!(outcome.epoch, epoch);
         assert_eq!(
             code(rig.shared.arm("main", operator()).await),
@@ -2054,7 +2279,7 @@ mod tests {
     async fn epoch_exhaustion_closes_the_gate() {
         let rig = rig().await;
         rig.shared.gate.send_modify(|g| g.epoch = u64::MAX);
-        let outcome = rig.shared.disarm(DisarmCause::Operator).await;
+        let outcome = rig.shared.disarm(DisarmCause::Operator);
         assert!(!outcome.was_armed);
         assert_eq!(rig.mode(), GateMode::Closing);
         assert_eq!(
@@ -2071,9 +2296,9 @@ mod tests {
         seen.push(rig.shared.gate_now().epoch);
         rig.shared.arm("alt", operator()).await.expect("armed");
         seen.push(rig.shared.gate_now().epoch);
-        rig.shared.disarm(DisarmCause::Operator).await;
+        rig.shared.disarm(DisarmCause::Operator);
         seen.push(rig.shared.gate_now().epoch);
-        rig.shared.disarm(DisarmCause::Operator).await;
+        rig.shared.disarm(DisarmCause::Operator);
         seen.push(rig.shared.gate_now().epoch);
         rig.shared.trip(TripReason::ListenerDied);
         seen.push(rig.shared.gate_now().epoch);
@@ -2111,7 +2336,7 @@ mod tests {
     async fn disarm_during_starting_cancels_arm_on_start_and_does_not_abort_the_start() {
         let (shared, _) = starting_shared();
         assert!(!shared.autostart_cancelled());
-        let outcome = shared.disarm(DisarmCause::Operator).await;
+        let outcome = shared.disarm(DisarmCause::Operator);
         assert!(!outcome.was_armed);
         assert_eq!(
             outcome.epoch, 0,
@@ -2157,7 +2382,7 @@ mod tests {
         let _ = slot;
         assert_eq!(code(shared.arm("main", operator()).await), INGRESS_DISABLED);
         assert!(shared.recover().await.is_err());
-        let outcome = shared.disarm(DisarmCause::Operator).await;
+        let outcome = shared.disarm(DisarmCause::Operator);
         assert_eq!(outcome.epoch, 0);
         shared.trip(TripReason::AcceptFatal);
         assert_eq!(shared.gate_now().epoch, 0);
@@ -2325,7 +2550,7 @@ mod tests {
         let shared = Arc::clone(&rig.shared);
         let recovering = tokio::spawn(async move { shared.recover().await });
         host.entered.notified().await;
-        let disarm = rig.shared.disarm(DisarmCause::Operator).await;
+        let disarm = rig.shared.disarm(DisarmCause::Operator);
         assert!(!disarm.was_armed);
         host.release.notify_one();
         let error = recovering.await.expect("joined").expect_err("lost");
@@ -2467,33 +2692,95 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_disarm_record_that_cannot_get_the_control_lock_is_counted_and_not_written() {
+    async fn a_disarm_does_not_wait_for_the_control_lock_and_its_record_is_queued_at_once() {
         let rig = rig().await;
         rig.shared.arm("main", operator()).await.expect("armed");
         // Another arm holds the control lock, inside its fsync.
         rig.ledger.hold_arm.store(true, Ordering::SeqCst);
         let other = arm_task(&rig, "alt").await;
         rig.ledger.arm_entered.notified().await;
-        let outcome = tokio::time::timeout(
-            Duration::from_secs(5),
-            rig.shared.disarm(DisarmCause::Operator),
-        )
-        .await
-        .expect("the record gives up after the bookkeeping wait, not after a minute");
-        // The effect did not wait; the record gave up after the bookkeeping wait.
+        let epoch = rig.shared.gate_now().epoch;
+        let outcome = rig.shared.disarm(DisarmCause::Operator);
         assert!(outcome.was_armed);
+        assert_eq!(outcome.epoch, epoch + 1);
         assert_eq!(rig.mode(), GateMode::Disarmed);
+        // The record was queued inside the gate write: no lock, no wait.
         assert_eq!(
-            rig.shared
-                .counters()
-                .disarm_record_lost
-                .load(Ordering::Relaxed),
-            1
+            *lock_unpoisoned(&rig.ledger.disarmed),
+            [(DisarmCause::Operator, epoch + 1)]
         );
-        assert!(lock_unpoisoned(&rig.ledger.disarmed).is_empty());
-        assert_eq!(rig.shared.snapshot().counters.disarm_record_lost, 1);
+        assert_eq!(rig.shared.snapshot().counters.disarm_record_lost, 0);
         rig.ledger.arm_release.notify_one();
         assert_eq!(code(other.await.expect("joined")), INGRESS_SUPERSEDED);
+    }
+
+    #[tokio::test]
+    async fn a_disarm_record_that_cannot_be_queued_is_counted_and_the_answer_does_not_change() {
+        let rig = rig().await;
+        rig.shared.arm("main", operator()).await.expect("armed");
+        // The writer is gone: the record has nowhere to go.
+        rig.writer().close(SHORT).await;
+        let outcome = rig.shared.disarm(DisarmCause::Operator);
+        assert!(outcome.was_armed);
+        assert_eq!(rig.mode(), GateMode::Disarmed);
+        assert_eq!(rig.shared.snapshot().counters.disarm_record_lost, 1);
+    }
+
+    #[tokio::test]
+    async fn closing_an_armed_gate_leaves_a_shutdown_record_and_no_writer_is_installed_after() {
+        let rig = rig().await;
+        rig.shared.arm("main", operator()).await.expect("armed");
+        let epoch = rig.shared.gate_now().epoch;
+        rig.shared.close();
+        let events = rig.records().await;
+        match events.last() {
+            Some(FlowAuditEvent::Disarmed { cause, epoch: at }) => {
+                assert_eq!((cause.as_str(), *at), ("shutdown", epoch + 1));
+            }
+            other => panic!("{other:?}"),
+        }
+        // A recover that raced the shutdown opened a writer nobody will close: it
+        // is handed back.
+        let spare = rig.writer();
+        let refused = rig.shared.ledger_slot().install(Installed {
+            writer: Arc::clone(&spare),
+            boot: Arc::from("b9"),
+        });
+        assert!(matches!(refused, Err(returned) if &*returned.boot == "b9"));
+        assert_eq!(
+            &*rig.shared.ledger_slot().current().expect("kept").boot,
+            "b1"
+        );
+        // Closing a gate that is not armed writes nothing.
+        let rig = self::rig().await;
+        rig.shared.close();
+        assert_eq!(kinds(&rig.records().await), ["started"]);
+    }
+
+    #[tokio::test]
+    async fn a_disarm_that_meets_the_start_cancels_the_autostart_from_what_it_read_in_the_write() {
+        let rig = rig_starting().await;
+        let epoch = rig.shared.gate_now().epoch;
+        let outcome = rig.shared.disarm(DisarmCause::Operator);
+        assert!(!outcome.was_armed);
+        assert_eq!(outcome.epoch, epoch, "a starting gate is not bumped");
+        assert!(rig.shared.autostart_cancelled());
+        assert!(!rig.shared.autostart_allowed(epoch));
+    }
+
+    #[tokio::test]
+    async fn the_autostart_is_allowed_only_for_the_gate_the_start_published() {
+        let rig = rig().await;
+        let published = rig.shared.gate_now().epoch;
+        assert!(rig.shared.autostart_allowed(published));
+        // Anything at all that happens after the publish is somebody's decision.
+        rig.shared.disarm(DisarmCause::Operator);
+        assert!(!rig.shared.autostart_allowed(published));
+        assert!(
+            !rig.shared.autostart_cancelled(),
+            "the flag is for Starting"
+        );
+        assert!(rig.shared.autostart_allowed(rig.shared.gate_now().epoch));
     }
 
     #[tokio::test]
@@ -2502,7 +2789,7 @@ mod tests {
         let host = FakeHost::new(Ok(()));
         rig.shared.set_host(host);
         rig.shared.arm("main", operator()).await.expect("armed");
-        rig.shared.disarm(DisarmCause::Deactivate).await;
+        rig.shared.disarm(DisarmCause::Deactivate);
         let t = rig.shared.snapshot().last_transition.expect("one");
         assert_eq!(
             (t.kind.as_str(), t.reason_code.as_str(), t.epoch),
@@ -2779,7 +3066,7 @@ mod tests {
                     match op {
                         0 => drop(shared.arm("main", operator()).await),
                         1 => drop(shared.arm("alt", operator()).await),
-                        2 => drop(shared.disarm(DisarmCause::Operator).await),
+                        2 => drop(shared.disarm(DisarmCause::Operator)),
                         3 => shared.trip(TripReason::ListenerDied),
                         _ => drop(shared.recover().await),
                     }
@@ -3183,10 +3470,13 @@ mod tests {
             .expect("opens"),
         );
         let _ = slot;
-        shared.ledger_slot().install(Installed {
-            writer: Arc::clone(&writer),
-            boot: Arc::from("b1"),
-        });
+        shared
+            .ledger_slot()
+            .install(Installed {
+                writer: Arc::clone(&writer),
+                boot: Arc::from("b1"),
+            })
+            .expect("not sealed");
         assert!(
             !shared
                 .snapshot()

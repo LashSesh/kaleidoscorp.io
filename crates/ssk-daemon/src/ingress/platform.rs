@@ -87,7 +87,7 @@ fn bind_loopback(addr: SocketAddrV4) -> io::Result<tokio::net::TcpListener> {
 }
 
 #[cfg(unix)]
-pub use unix::UnixPlatform;
+pub use unix::{IdMapping, UnixPlatform};
 
 #[cfg(unix)]
 mod unix {
@@ -100,12 +100,83 @@ mod unix {
 
     type Factory = Box<dyn Fn() -> Box<dyn TableSource> + Send + Sync>;
 
+    /// What the user namespace of this process does to the user ids in the kernel's
+    /// tables. The table shows a connection's owner TRANSLATED into the namespace
+    /// of the reader, and an owner the namespace does not map is shown as the
+    /// overflow uid. A daemon whose own uid is the overflow uid would therefore
+    /// take every unmapped account for itself (design 6.10, review item (h)).
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct IdMapping {
+        /// `/proc/sys/kernel/overflowuid`.
+        pub overflow_uid: u32,
+        /// Every range of `/proc/self/uid_map` maps an id to itself.
+        pub identity: bool,
+    }
+
+    /// The kernel's own default, used when the file cannot be read.
+    const DEFAULT_OVERFLOW_UID: u32 = 65534;
+
+    impl IdMapping {
+        /// A process in the initial namespace.
+        #[must_use]
+        pub const fn initial() -> Self {
+            Self {
+                overflow_uid: DEFAULT_OVERFLOW_UID,
+                identity: true,
+            }
+        }
+
+        /// From the text of the two files; `None` is a file that could not be read.
+        /// Whatever cannot be understood is read as the answer that refuses.
+        #[must_use]
+        pub fn from_texts(overflow: Option<&str>, uid_map: Option<&str>) -> Self {
+            let overflow_uid = overflow
+                .and_then(|text| text.trim().parse::<u32>().ok())
+                .unwrap_or(DEFAULT_OVERFLOW_UID);
+            let identity = uid_map.is_some_and(|text| {
+                let mut ranges = 0_usize;
+                for line in text.lines().filter(|line| !line.trim().is_empty()) {
+                    let mut fields = line.split_ascii_whitespace().map(str::parse::<u64>);
+                    match (fields.next(), fields.next(), fields.next(), fields.next()) {
+                        (Some(Ok(inside)), Some(Ok(outside)), Some(Ok(_count)), None)
+                            if inside == outside =>
+                        {
+                            ranges = ranges.saturating_add(1);
+                        }
+                        _ => return false,
+                    }
+                }
+                ranges > 0
+            });
+            Self {
+                overflow_uid,
+                identity,
+            }
+        }
+
+        /// Reads this process's own view.
+        #[must_use]
+        pub fn read() -> Self {
+            let overflow = std::fs::read_to_string("/proc/sys/kernel/overflowuid").ok();
+            let uid_map = std::fs::read_to_string("/proc/self/uid_map").ok();
+            Self::from_texts(overflow.as_deref(), uid_map.as_deref())
+        }
+
+        /// `true` when "the table says my uid" does not mean "the daemon's user".
+        #[must_use]
+        pub fn is_ambiguous_for(&self, uid: u32) -> bool {
+            uid == self.overflow_uid || !self.identity
+        }
+    }
+
     /// The Linux platform, and the other Unixes with less to offer: there the peer
     /// check is unsupported because the kernel's table is Linux's.
     pub struct UnixPlatform {
         uids: (u32, u32),
         tables: Option<Factory>,
         tuning: ServiceTuning,
+        /// `None`: read the real one when the verdict is made.
+        mapping: Option<IdMapping>,
         verdict: OnceLock<Verdict>,
     }
 
@@ -123,14 +194,16 @@ mod unix {
             } else {
                 None
             };
-            Self::with(
+            let mut platform = Self::with(
                 (
                     rustix::process::getuid().as_raw(),
                     rustix::process::geteuid().as_raw(),
                 ),
                 tables,
                 ServiceTuning::DEFAULT,
-            )
+            );
+            platform.mapping = None;
+            platform
         }
 
         /// For tests: other identities, another table source.
@@ -140,8 +213,18 @@ mod unix {
                 uids,
                 tables,
                 tuning,
+                // A test names the identities it wants; the namespace it runs in
+                // is not one of them (`with_mapping` says otherwise).
+                mapping: Some(IdMapping::initial()),
                 verdict: OnceLock::new(),
             }
+        }
+
+        /// For tests: another view of the user namespace.
+        #[must_use]
+        pub fn with_mapping(mut self, mapping: IdMapping) -> Self {
+            self.mapping = Some(mapping);
+            self
         }
 
         fn verdict(&self) -> &Verdict {
@@ -166,6 +249,10 @@ mod unix {
             // in the IPC check. The kernel's table shows the creator's EFFECTIVE
             // uid, so the two agree only if the daemon is not running setuid.
             if uid != euid {
+                return fail(MissingControl::IdentityAmbiguous);
+            }
+            let mapping = self.mapping.clone().unwrap_or_else(IdMapping::read);
+            if mapping.is_ambiguous_for(uid) {
                 return fail(MissingControl::IdentityAmbiguous);
             }
             let mut source = tables();
@@ -311,6 +398,73 @@ mod tests {
         );
         assert_eq!(platform.missing(), [MissingControl::IdentityAmbiguous]);
         assert!(platform.peer_authorizer().is_none());
+    }
+
+    fn working_tables() -> Option<Box<dyn Fn() -> Box<dyn TableSource> + Send + Sync>> {
+        Some(Box::new(|| Box::new(Failing) as Box<dyn TableSource>))
+    }
+
+    #[test]
+    fn a_daemon_whose_uid_is_the_overflow_uid_cannot_tell_a_stranger_from_itself() {
+        // The table shows every account the namespace does not map as the overflow
+        // uid. A daemon running as that uid would call all of them "the same user".
+        let platform = platform_with((65534, 65534), working_tables());
+        assert!(!platform.controls().peer_check);
+        assert_eq!(platform.missing(), [MissingControl::IdentityAmbiguous]);
+        assert!(platform.peer_authorizer().is_none());
+        // The kernel's overflow uid can be changed (`/proc/sys/kernel/overflowuid`).
+        let platform = platform_with((1000, 1000), working_tables()).with_mapping(IdMapping {
+            overflow_uid: 1000,
+            identity: true,
+        });
+        assert_eq!(platform.missing(), [MissingControl::IdentityAmbiguous]);
+    }
+
+    #[test]
+    fn a_namespace_that_maps_ids_is_ambiguous_for_every_uid() {
+        let platform = platform_with((1000, 1000), working_tables()).with_mapping(IdMapping {
+            overflow_uid: 65534,
+            identity: false,
+        });
+        assert!(!platform.controls().peer_check);
+        assert_eq!(platform.missing(), [MissingControl::IdentityAmbiguous]);
+    }
+
+    #[test]
+    fn the_id_mapping_is_read_from_the_two_files_and_unreadable_means_refuse() {
+        let initial = "         0          0 4294967295\n";
+        let identity = IdMapping::from_texts(Some("65534\n"), Some(initial));
+        assert_eq!(identity, IdMapping::initial());
+        assert!(!identity.is_ambiguous_for(1000));
+        assert!(identity.is_ambiguous_for(65534));
+        // Several ranges, each onto itself.
+        assert!(IdMapping::from_texts(None, Some("0 0 1000\n1000 1000 1\n")).identity);
+        // One range that moves ids: a rootless container.
+        assert!(!IdMapping::from_texts(None, Some("0 1000 1\n")).identity);
+        assert!(!IdMapping::from_texts(None, Some("0 0 1\n1 100000 65536\n")).identity);
+        // Nothing, garbage, a short or long line: refused, never assumed.
+        for bad in [
+            "",
+            "\n",
+            "garbage",
+            "0 0\n",
+            "0 0 1 1\n",
+            "0 x 1\n",
+            "-1 -1 1\n",
+        ] {
+            assert!(!IdMapping::from_texts(None, Some(bad)).identity, "{bad:?}");
+        }
+        assert!(!IdMapping::from_texts(None, None).identity, "unreadable");
+        // The overflow uid: the file, else the kernel's default.
+        assert_eq!(
+            IdMapping::from_texts(Some("4242\n"), None).overflow_uid,
+            4242
+        );
+        assert_eq!(IdMapping::from_texts(Some("x"), None).overflow_uid, 65534);
+        assert_eq!(IdMapping::from_texts(None, None).overflow_uid, 65534);
+        // Whatever the answer, an id that is not the overflow uid is fine if the
+        // map is the identity.
+        assert!(!IdMapping::initial().is_ambiguous_for(0));
     }
 
     #[test]
