@@ -26,7 +26,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use ssk_config::ingress::DirectAddressFamilies;
-use ssk_ipc::DenialSummaryDto;
+use ssk_ipc::{DenialSummaryDto, FlowInspectionDto};
 use ssk_netadmin::admission::AdmissionToken;
 use ssk_netadmin::audit::summarise_route;
 use ssk_netadmin::{
@@ -246,14 +246,15 @@ impl EngineCtx {
     /// Counts a refusal and, for the first occurrence of its key, writes it before
     /// returning (design 7.2 state 4). A repeat or a refusal beyond the burst is
     /// only counted and reaches the ledger as part of a `Summary`. The client's
-    /// reply does not depend on the outcome.
+    /// reply does not depend on the outcome. Returns what became of the occurrence:
+    /// only `FirstDurable` is worth a row in the registry of recent flows.
     pub async fn record_denial(
         &self,
         peer: &PeerStamp,
         profile: &str,
         target: &Target,
         denied: &Denied,
-    ) {
+    ) -> Disposition {
         let counters = self.shared.counters();
         Counters::bump(&counters.denied);
         self.shared.set_last_denial(DenialSummaryDto {
@@ -272,11 +273,11 @@ impl EngineCtx {
         let disposition = lock_unpoisoned(&self.denials).classify(key, self.clock.now());
         if disposition != Disposition::FirstDurable {
             Counters::bump(&counters.denied_suppressed);
-            return;
+            return disposition;
         }
         let Some(Installed { writer, .. }) = self.shared.ledger_slot().current() else {
             self.note_audit(AuditError::Closing);
-            return;
+            return disposition;
         };
         let event = DeniedEvent {
             peer: &peer.peer,
@@ -291,6 +292,7 @@ impl EngineCtx {
         if let Err(error) = writer.append_denied(event, self.waits()).await {
             self.note_audit(error);
         }
+        disposition
     }
 }
 
@@ -309,6 +311,7 @@ pub struct Admitted {
     target: Target,
     resolution: Resolution,
     epoch: u64,
+    inspection: FlowInspectionDto,
 }
 
 impl std::fmt::Debug for Admitted {
@@ -338,6 +341,13 @@ impl Admitted {
     #[must_use]
     pub const fn epoch(&self) -> u64 {
         self.epoch
+    }
+
+    /// What `InspectFlow` shows for this flow: the descriptor the policy saw, the
+    /// rule, the action, the route, whether attestation was required.
+    #[must_use]
+    pub fn inspection(&self) -> &FlowInspectionDto {
+        &self.inspection
     }
 
     #[must_use]
@@ -550,6 +560,13 @@ pub fn decide(
                 .with_route(route));
         }
     };
+    let inspection = FlowInspectionDto {
+        descriptor: flow.descriptor,
+        matched_rule: rule.clone(),
+        action: decided.decision.action,
+        route: token.route().clone(),
+        requires_attestation: decided.candidate.requires_attestation,
+    };
     Ok(Admitted {
         flow_id: flow.flow_id,
         adapters: adapter_ids(token.route()),
@@ -558,6 +575,7 @@ pub fn decide(
         rule,
         target: target.clone(),
         epoch,
+        inspection,
     })
 }
 
@@ -600,6 +618,30 @@ impl std::fmt::Debug for DialFault {
 }
 
 impl DialFault {
+    /// The closed machine code the registry row of the flow carries.
+    #[must_use]
+    pub fn reason_code(&self) -> &'static str {
+        match self {
+            Self::Audit(error) | Self::ResultLost(error) => error.code(),
+            Self::Dial(error) => error.code(),
+            Self::Cancelled => CODE_GATE_CLOSED,
+            Self::Deadline => CODE_CONNECT_DEADLINE,
+            Self::ReceiptMismatch => CODE_RECEIPT_MISMATCH,
+        }
+    }
+
+    /// The outcome word of the flow's row (`FlowSummaryDto.outcome`): `refused`
+    /// when nothing was dialled, `connect_failed` when a dial failed or its result
+    /// could not be recorded, `cancelled` when the gate moved on.
+    #[must_use]
+    pub const fn outcome(&self) -> &'static str {
+        match self {
+            Self::Audit(_) | Self::ReceiptMismatch => "refused",
+            Self::Dial(_) | Self::Deadline | Self::ResultLost(_) => "connect_failed",
+            Self::Cancelled => "cancelled",
+        }
+    }
+
     /// The SOCKS reply, or `None` when the connection is just closed.
     #[must_use]
     pub fn reply(&self) -> Option<Rep> {
@@ -623,6 +665,10 @@ pub struct Established {
     /// Shared with the receipt, which writes the real byte counts if the flow
     /// dies without closing the tunnel.
     pub counts: Arc<ByteCounts>,
+    /// The ledger sequence number of the flow's `Pending` record.
+    pub pending_seq: u64,
+    /// The source address the OS gave the upstream socket (an observation).
+    pub egress_local: Option<String>,
 }
 
 impl std::fmt::Debug for Established {
@@ -886,6 +932,7 @@ pub async fn open_tunnel(
         .map(|kind| kind_word(*kind))
         .collect();
     let counts = Arc::new(ByteCounts::default());
+    let egress = egress_local(session.resolution()).map(|observation| observation.value);
     match writer
         .append_connected(
             &pending,
@@ -900,6 +947,8 @@ pub async fn open_tunnel(
             result,
             chain_kinds,
             counts,
+            pending_seq: pending.seq(),
+            egress_local: egress,
         }),
         Err(error) => {
             // The tunnel is dropped first (the upstream closes), and the client
@@ -3259,5 +3308,73 @@ mod tests {
             Some(2)
         );
         assert_eq!(failed_event(&refused_connect(), None).answers, None);
+    }
+
+    #[test]
+    fn a_fault_names_the_outcome_and_the_code_of_its_registry_row() {
+        let table: Vec<(DialFault, &str, &str)> = vec![
+            (DialFault::Audit(AuditError::Busy), "refused", "AUDIT_BUSY"),
+            (DialFault::ReceiptMismatch, "refused", "RECEIPT_MISMATCH"),
+            (
+                DialFault::Dial(NetcoreError::FamilyDisabled),
+                "connect_failed",
+                "NETCORE_FAMILY_DISABLED",
+            ),
+            (DialFault::Deadline, "connect_failed", "CONNECT_DEADLINE"),
+            (
+                DialFault::ResultLost(AuditError::Timeout),
+                "connect_failed",
+                "AUDIT_TIMEOUT",
+            ),
+            (DialFault::Cancelled, "cancelled", "GATE_CLOSED"),
+        ];
+        for (fault, outcome, code) in table {
+            assert_eq!(
+                (fault.outcome(), fault.reason_code()),
+                (outcome, code),
+                "{fault:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn the_admission_carries_what_inspect_flow_shows_and_the_tunnel_what_the_row_needs() {
+        let (spec, _resolver, _connector) = direct_spec();
+        let rig = Rig::new(spec).await;
+        let adm = rig.admit_v4(PUBLIC, 443).expect("admitted");
+        let inspection = adm.inspection().clone();
+        assert_eq!(inspection.descriptor.app_id, ENGINE_APP_ID);
+        assert_eq!(inspection.descriptor.destination_host, PUBLIC);
+        assert_eq!(inspection.descriptor.destination_port, 443);
+        assert_eq!(inspection.matched_rule.as_deref(), Some("allow-web"));
+        assert_eq!(inspection.action, ssk_netadmin::PolicyAction::Allow);
+        assert_eq!(inspection.route, RouteKind::Direct);
+        assert!(!inspection.requires_attestation);
+        let established = rig.open(adm).await.expect("established");
+        // The pending record is the one before the result.
+        let records = rig.io.records();
+        let pending = records
+            .iter()
+            .find(|r| r.event.kind() == "pending")
+            .expect("pending")
+            .seq;
+        assert_eq!(established.pending_seq, pending);
+        assert_eq!(
+            established.result.seq(),
+            pending.checked_add(1).expect("fits")
+        );
+        assert_eq!(established.egress_local.as_deref(), Some("192.0.2.99"));
+    }
+
+    #[tokio::test]
+    async fn only_the_first_refusal_of_a_key_says_so() {
+        let rig = Rig::new(Spec::new()).await;
+        let target = canonicalize(RawTarget::V4(OTHER.parse().expect("address"), 443)).expect("v4");
+        let denied = rig.admit_v4(OTHER, 443).expect_err("denied");
+        let peer = Rig::peer();
+        let first = rig.ctx.record_denial(&peer, "main", &target, &denied).await;
+        let again = rig.ctx.record_denial(&peer, "main", &target, &denied).await;
+        assert_eq!(first, Disposition::FirstDurable);
+        assert_eq!(again, Disposition::Repeat);
     }
 }
