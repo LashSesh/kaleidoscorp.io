@@ -35,6 +35,8 @@ pub mod pump;
 pub mod shared;
 pub mod socks5;
 pub mod target;
+#[cfg(test)]
+pub(crate) mod test_rig;
 pub mod types;
 
 /// The std conversion of an IPv6 address to IPv4 that is not the strict mapped
