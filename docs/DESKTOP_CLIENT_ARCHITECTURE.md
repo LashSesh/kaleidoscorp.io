@@ -591,7 +591,13 @@ so the existing planner output drives the runtime directly.
 4. **Kill-switch supremacy.** When armed and the required route is unavailable, the executor
    blocks — it does not leak.
 5. **DNS honors the route.** When a route mandates DNS override, resolution that would bypass it
-   is blocked, not silently system-resolved.
+   is blocked, not silently system-resolved. *Status (M2 `C-N3`):* no executor path takes a
+   `DnsOverride` hop, so this is not enforced today. What is true: a `Direct` dial to a host name
+   is resolved by the OS resolver (`getaddrinfo`, in the `sskd` process), exactly once per dial,
+   and the dial then goes to the addresses it got (pinned: no second lookup for the next address
+   or after a refusal); proxied routes forward the name unresolved and the upstream proxy resolves
+   it. `dns_protected` therefore stays `false` for a `Direct` name and is `true` only for an IP
+   literal destination (or a chain that really traversed a `DnsOverride` hop).
 
 ---
 

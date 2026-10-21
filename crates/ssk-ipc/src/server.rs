@@ -9,8 +9,9 @@ use serde::{Deserialize, Serialize};
 use crate::auth::PeerIdentity;
 use crate::dto::{
     ActivateProfileRequest, AuditEntryDto, DeactivateRequest, DoctorReportDto, ExplainRequest,
-    ExplainResponse, FlowInspectionDto, FlowSummaryDto, ProfileSummaryDto, RouteTraceDto,
-    RouteTraceRequest, StatusDto, SubscribeEventsRequest, VerifyAuditChainResponse,
+    ExplainResponse, FlowInspectionDto, FlowSummaryDto, IngressAuditPageDto, ProfileSummaryDto,
+    RouteTraceDto, RouteTraceRequest, SetIngressRequest, StatusDto, SubscribeEventsRequest,
+    VerifyAuditChainResponse,
 };
 use crate::error::IpcError;
 use crate::state::Event;
@@ -25,16 +26,44 @@ pub enum Request {
     ActivateProfile(ActivateProfileRequest),
     Deactivate(DeactivateRequest),
     ListProfiles,
-    InspectFlow { flow_id: String },
+    InspectFlow {
+        flow_id: String,
+    },
     TraceRoute(RouteTraceRequest),
-    ListRecentFlows { limit: usize },
-    GetAuditEntries { limit: usize },
+    ListRecentFlows {
+        limit: usize,
+    },
+    GetAuditEntries {
+        limit: usize,
+    },
     VerifyAuditChain,
     RunDoctor,
     ExplainError(ExplainRequest),
     SubscribeEvents(SubscribeEventsRequest),
+    /// Protocol 1: arm or disarm the local proxy. A daemon that predates it
+    /// cannot decode the request and drops the connection, which is harmless;
+    /// the client reads `StatusDto::protocol` first so that it never gets there
+    /// (`StatusDto::require_protocol`).
+    SetIngress(SetIngressRequest),
+    /// Protocol 1: one page of the ingress ledger, newest first. A request of its
+    /// own and not a selector on `GetAuditEntries`, because an older daemon would
+    /// ignore the selector and answer with the other ledger as if it were this
+    /// one.
+    GetIngressAudit {
+        limit: usize,
+        #[serde(default)]
+        before_seq: Option<u64>,
+        #[serde(default)]
+        verify: bool,
+    },
 }
 
+// The proxy's block makes `Status` the one large variant (about 1.8 KB inline).
+// A response is built once per request, encoded and dropped, so the size costs
+// nothing; boxing `Status` would change a constructor that the daemon, the CLI
+// and their tests all call, and boxing the block would change the type that the
+// wire documents as `Option<IngressStatusDto>`.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Response {
     Status(StatusDto),
@@ -49,18 +78,23 @@ pub enum Response {
     Event(Event),
     Ack,
     Err(IpcError),
+    /// Protocol 1: the answer to `GetIngressAudit`. The one `Response` variant
+    /// that M2 adds: a protocol-0 client never sends that request, so it is never
+    /// sent this. No other enum an older client decodes gains a variant without a
+    /// protocol bump (`COMPATIBILITY_MATRIX.md`, "IPC compatibility").
+    IngressAudit(IngressAuditPageDto),
 }
 
 /// Upper bound the transport clamps `limit`-bearing requests to before the
 /// handler sees them.
 ///
-/// `Request::ListRecentFlows { limit }` and `Request::GetAuditEntries { limit }`
-/// carry an attacker-controlled `usize` that feeds a `Vec` allocation on the
-/// handler side. The peer is authenticated by the time this applies, so it is
-/// defence in depth rather than the boundary — but an authenticated peer is
-/// still not entitled to name an allocation size, and the response cap
-/// ([`crate::framing::MAX_RESPONSE_FRAME_LEN`]) would otherwise be reached only
-/// *after* the allocation had already happened.
+/// `Request::ListRecentFlows { limit }`, `Request::GetAuditEntries { limit }` and
+/// `Request::GetIngressAudit { limit, .. }` carry an attacker-controlled `usize`
+/// that feeds a `Vec` allocation on the handler side. The peer is authenticated
+/// by the time this applies, so it is defence in depth rather than the boundary
+/// — but an authenticated peer is still not entitled to name an allocation
+/// size, and the response cap ([`crate::framing::MAX_RESPONSE_FRAME_LEN`])
+/// would otherwise be reached only *after* the allocation had already happened.
 pub const MAX_LIST_LIMIT: usize = 1000;
 
 /// Bounds a served connection. Every field is explicit — there is no ambient
@@ -97,6 +131,12 @@ impl Default for ServeLimits {
 
 /// Clamp the attacker-controlled `limit` fields. Returns the request either
 /// unchanged or with `limit` reduced to [`MAX_LIST_LIMIT`].
+///
+/// Every variant is named, with no catch-all: the clamp exists because a peer
+/// must not choose an allocation size, and a catch-all would let the next
+/// variant that carries a size through unclamped without anyone having decided
+/// that. Adding a `Request` variant is a compile error here until it is listed
+/// either as sized (clamped) or as size-free (passed on).
 #[must_use]
 pub fn clamp_request_limits(req: Request) -> Request {
     match req {
@@ -106,7 +146,26 @@ pub fn clamp_request_limits(req: Request) -> Request {
         Request::GetAuditEntries { limit } => Request::GetAuditEntries {
             limit: limit.min(MAX_LIST_LIMIT),
         },
-        other => other,
+        Request::GetIngressAudit {
+            limit,
+            before_seq,
+            verify,
+        } => Request::GetIngressAudit {
+            limit: limit.min(MAX_LIST_LIMIT),
+            before_seq,
+            verify,
+        },
+        Request::GetStatus
+        | Request::ActivateProfile(_)
+        | Request::Deactivate(_)
+        | Request::ListProfiles
+        | Request::InspectFlow { .. }
+        | Request::TraceRoute(_)
+        | Request::VerifyAuditChain
+        | Request::RunDoctor
+        | Request::ExplainError(_)
+        | Request::SubscribeEvents(_)
+        | Request::SetIngress(_) => req,
     }
 }
 
@@ -141,13 +200,110 @@ fn next_timeout(subscribed: bool, limits: &ServeLimits) -> Option<Duration> {
     }
 }
 
+/// Backoff and give-up policy for an accept loop that keeps failing.
+///
+/// A single failed `accept()` is not a reason to stop serving: `EMFILE` and
+/// `ENFILE` are transient fd pressure (the daemon's own sockets can cause it),
+/// and `ECONNABORTED` is a peer that vanished while queued. The loop therefore
+/// sleeps and tries again, doubling the pause from [`Self::INITIAL_DELAY`] up
+/// to [`Self::MAX_DELAY`] so a persistent fault cannot spin a core, and resets
+/// on the next success so isolated errors never add up.
+///
+/// It is not unconditional: the [`Self::GIVE_UP_AFTER`]th *consecutive* error
+/// returns `None`, at which point the caller returns that last error and the
+/// daemon stops. That is a known limit, not a fix for exhaustion — a fault that
+/// outlasts the roughly 55 s of sleeping this allows still ends the process.
+///
+/// Pure (no clock, no I/O, no tokio) so the whole table is unit-testable; that
+/// the loop obeys it is pinned separately, through a scripted accept source on
+/// paused time (`unix_transport::tests`). No error classification on purpose:
+/// which errno is "transient" differs by OS, and an unrecognised one would
+/// again kill the daemon on its first occurrence.
+#[derive(Debug, Clone, Default)]
+pub struct AcceptRetry {
+    consecutive: u32,
+}
+
+impl AcceptRetry {
+    /// Pause after the first error in a run.
+    pub const INITIAL_DELAY: Duration = Duration::from_millis(50);
+    /// Ceiling the doubling pause is clamped to.
+    pub const MAX_DELAY: Duration = Duration::from_secs(1);
+    /// The consecutive error that gives up: errors 1 to 59 are retried, the
+    /// 60th is final.
+    pub const GIVE_UP_AFTER: u32 = 60;
+
+    #[must_use]
+    pub const fn new() -> Self {
+        Self { consecutive: 0 }
+    }
+
+    /// Record a failed accept. `Some(delay)`: sleep that long, then accept
+    /// again. `None`: give up and return the error.
+    #[must_use = "`None` means give up; dropping it retries forever"]
+    pub fn on_error(&mut self) -> Option<Duration> {
+        // Saturating, so a caller that keeps asking after `None` cannot
+        // overflow (overflow-checks is on in every profile).
+        self.consecutive = self.consecutive.saturating_add(1);
+        if self.consecutive >= Self::GIVE_UP_AFTER {
+            None
+        } else {
+            Some(Self::delay_for(self.consecutive))
+        }
+    }
+
+    /// Record a successful accept: the next error starts again at the floor.
+    pub fn on_success(&mut self) {
+        self.consecutive = 0;
+    }
+
+    /// Length of the current run of errors, for logging.
+    #[must_use]
+    pub const fn consecutive_errors(&self) -> u32 {
+        self.consecutive
+    }
+
+    /// Pause after the `n`th consecutive error (`n` of 1 is the floor).
+    fn delay_for(n: u32) -> Duration {
+        // `checked_shl` is `None` from 32 up; both that and the multiply
+        // saturate, then the clamp applies, so no `n` can overflow.
+        let factor = 1u32.checked_shl(n.saturating_sub(1)).unwrap_or(u32::MAX);
+        Self::INITIAL_DELAY
+            .saturating_mul(factor)
+            .min(Self::MAX_DELAY)
+    }
+}
+
 #[cfg(unix)]
 mod unix_transport {
-    use super::{clamp_request_limits, next_timeout, CommandHandler, Request, ServeLimits};
+    use super::{
+        clamp_request_limits, next_timeout, AcceptRetry, CommandHandler, Request, ServeLimits,
+    };
     use crate::auth::unix::check_peer_same_user;
     use crate::error::IpcError;
+    use std::future::Future;
     use std::sync::Arc;
     use tokio::sync::Semaphore;
+
+    /// Where the accept loop gets its connections: the bound listener in
+    /// production, a scripted source in the tests. A real `accept()` fails only
+    /// under descriptor exhaustion, which is process-wide state that a test
+    /// cannot take without breaking its neighbours, so the loop's handling of
+    /// 59 or 60 consecutive failures is exercised through this seam instead.
+    trait AcceptSource {
+        fn accept(
+            &mut self,
+        ) -> impl Future<Output = std::io::Result<tokio::net::UnixStream>> + Send;
+    }
+
+    impl AcceptSource for tokio::net::UnixListener {
+        async fn accept(&mut self) -> std::io::Result<tokio::net::UnixStream> {
+            // Spelled as a path: `self.accept()` would resolve to this method.
+            tokio::net::UnixListener::accept(self)
+                .await
+                .map(|(stream, _addr)| stream)
+        }
+    }
 
     /// Bind a Unix domain socket at `socket_path` and serve `handler` forever
     /// with [`ServeLimits::default`].
@@ -176,13 +332,45 @@ mod unix_transport {
         }
         let listener = tokio::net::UnixListener::bind(path)
             .map_err(|e| IpcError::new("Runtime", "IPC_BIND_FAILED", e.to_string()))?;
+        serve_accept_loop(listener, handler, limits).await
+    }
+
+    /// Accept connections from `source` and serve them, forever, until
+    /// [`AcceptRetry`] gives up and the last accept error is returned. Split
+    /// from the bind so the tests can drive the loop with a source that fails
+    /// on demand.
+    async fn serve_accept_loop<S: AcceptSource>(
+        mut source: S,
+        handler: Arc<dyn CommandHandler>,
+        limits: ServeLimits,
+    ) -> Result<(), IpcError> {
         let permits = Arc::new(Semaphore::new(limits.max_connections as usize));
+        let mut retry = AcceptRetry::new();
 
         loop {
-            let (stream, _addr) = listener
-                .accept()
-                .await
-                .map_err(|e| IpcError::new("Runtime", "IPC_ACCEPT_FAILED", e.to_string()))?;
+            let stream = match source.accept().await {
+                Ok(stream) => {
+                    retry.on_success();
+                    stream
+                }
+                Err(e) => {
+                    // The daemon exits when this function returns, so one
+                    // transient error (EMFILE under fd pressure, ECONNABORTED)
+                    // must not return: back off and accept again, and give up
+                    // only when the error will not clear.
+                    let Some(delay) = retry.on_error() else {
+                        return Err(IpcError::new("Runtime", "IPC_ACCEPT_FAILED", e.to_string()));
+                    };
+                    tracing::warn!(
+                        error = %e,
+                        consecutive = retry.consecutive_errors(),
+                        retry_in = ?delay,
+                        "ipc accept failed; backing off"
+                    );
+                    tokio::time::sleep(delay).await;
+                    continue;
+                }
+            };
             let permit = Arc::clone(&permits)
                 .acquire_owned()
                 .await
@@ -218,6 +406,242 @@ mod unix_transport {
             let resp = handler.handle(clamp_request_limits(req), &peer).await;
             crate::framing::write_frame(&mut stream, &resp).await?;
             timeout = next_timeout(subscribed, &limits);
+        }
+    }
+
+    /// The accept loop's wiring, driven through a scripted [`AcceptSource`] on
+    /// paused time. `AcceptRetry`'s own table is pinned in `server::tests`; a
+    /// loop that goes back to `accept().await?` leaves that table green, so
+    /// what is pinned here is that the loop actually obeys it.
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use crate::auth::PeerIdentity;
+        use crate::framing::{read_frame, write_frame, MAX_RESPONSE_FRAME_LEN};
+        use crate::server::{BoxFuture, Response};
+        use std::collections::VecDeque;
+        use std::io;
+        use std::sync::Mutex;
+        use std::time::Duration;
+        use tokio::net::UnixStream;
+        use tokio::sync::oneshot;
+        use tokio::time::Instant;
+
+        /// Virtual time a test grants the loop. The longest legitimate run
+        /// (the 60th failure) takes 55.55 s; a loop that never stops, or never
+        /// wakes, is cut off here with a message instead of hanging the suite.
+        const VIRTUAL_DEADLINE: Duration = Duration::from_secs(120);
+
+        /// `AcceptRetry::GIVE_UP_AFTER` as a count of `accept()` calls.
+        const GIVE_UP: usize = AcceptRetry::GIVE_UP_AFTER as usize;
+
+        /// One scripted outcome of `accept()`.
+        enum Step {
+            Fail,
+            Connect(UnixStream),
+        }
+
+        fn failures(n: u32) -> impl Iterator<Item = Step> {
+            (0..n).map(|_| Step::Fail)
+        }
+
+        /// Replays its steps as the outcomes of successive `accept()` calls,
+        /// then waits for ever like a listener nobody connects to.
+        struct Scripted {
+            steps: VecDeque<Step>,
+            /// When each `accept()` was called, on the paused clock.
+            calls: Arc<Mutex<Vec<Instant>>>,
+            /// Fired by the first call after the script has run out.
+            drained: Option<oneshot::Sender<()>>,
+        }
+
+        impl Scripted {
+            fn new(
+                steps: impl IntoIterator<Item = Step>,
+            ) -> (Self, Arc<Mutex<Vec<Instant>>>, oneshot::Receiver<()>) {
+                let calls = Arc::new(Mutex::new(Vec::new()));
+                let (drained, drained_rx) = oneshot::channel();
+                let source = Self {
+                    steps: steps.into_iter().collect(),
+                    calls: Arc::clone(&calls),
+                    drained: Some(drained),
+                };
+                (source, calls, drained_rx)
+            }
+        }
+
+        impl AcceptSource for Scripted {
+            async fn accept(&mut self) -> io::Result<UnixStream> {
+                let call = {
+                    let mut calls = self.calls.lock().expect("calls mutex");
+                    calls.push(Instant::now());
+                    calls.len()
+                };
+                match self.steps.pop_front() {
+                    Some(Step::Fail) => {
+                        Err(io::Error::other(format!("scripted accept failure #{call}")))
+                    }
+                    Some(Step::Connect(stream)) => Ok(stream),
+                    None => {
+                        if let Some(drained) = self.drained.take() {
+                            let _ = drained.send(());
+                        }
+                        std::future::pending().await
+                    }
+                }
+            }
+        }
+
+        /// Answers every request with `Ack`.
+        struct AckHandler;
+
+        impl CommandHandler for AckHandler {
+            fn handle<'a>(
+                &'a self,
+                _req: Request,
+                _peer: &'a PeerIdentity,
+            ) -> BoxFuture<'a, Response> {
+                Box::pin(async { Response::Ack })
+            }
+        }
+
+        fn call_count(calls: &Mutex<Vec<Instant>>) -> usize {
+            calls.lock().expect("calls mutex").len()
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn unix_accept_loop_keeps_serving_after_59_failures() {
+            let (server_end, mut client) = UnixStream::pair().expect("socketpair");
+            let steps = failures(AcceptRetry::GIVE_UP_AFTER - 1)
+                .chain(std::iter::once(Step::Connect(server_end)));
+            let (source, calls, _drained) = Scripted::new(steps);
+            let mut server = tokio::spawn(serve_accept_loop(
+                source,
+                Arc::new(AckHandler),
+                ServeLimits::default(),
+            ));
+
+            // The request is written before the loop has accepted anything and
+            // waits in the socket until the 60th call hands the connection over.
+            let exchange = async {
+                write_frame(&mut client, &Request::GetStatus).await?;
+                read_frame::<Response, _>(&mut client, MAX_RESPONSE_FRAME_LEN).await
+            };
+            let answer = tokio::time::timeout(VIRTUAL_DEADLINE, async {
+                // Biased, so that a loop that has already returned is reported
+                // as that and not as the broken connection it leaves behind.
+                tokio::select! {
+                    biased;
+                    ended = &mut server => {
+                        panic!("the accept loop returned instead of backing off: {ended:?}")
+                    }
+                    answer = exchange => answer.expect("the request was not answered"),
+                }
+            })
+            .await
+            .expect("the connection was never served");
+            assert!(matches!(answer, Response::Ack), "unexpected {answer:?}");
+
+            assert!(!server.is_finished(), "the loop must keep serving");
+            assert_eq!(
+                call_count(&calls),
+                GIVE_UP + 1,
+                "59 failures, the connection, then waiting for the next one"
+            );
+            server.abort();
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn unix_accept_loop_returns_ipc_accept_failed_on_the_60th() {
+            let (source, calls, _drained) = Scripted::new(failures(AcceptRetry::GIVE_UP_AFTER));
+            let started = Instant::now();
+            let outcome = tokio::time::timeout(
+                VIRTUAL_DEADLINE,
+                serve_accept_loop(source, Arc::new(AckHandler), ServeLimits::default()),
+            )
+            .await
+            .expect("the loop never gave up");
+
+            let err = outcome.expect_err("the 60th consecutive failure ends the loop");
+            assert_eq!(err.code, "IPC_ACCEPT_FAILED");
+            assert_eq!(err.class, "Runtime");
+            assert_eq!(
+                err.message, "scripted accept failure #60",
+                "the error returned is the last one, not the first"
+            );
+            assert_eq!(
+                call_count(&calls),
+                GIVE_UP,
+                "no 61st accept after giving up"
+            );
+            // 59 sleeps (50+100+200+400+800 ms, then 54 x 1 s) and none after
+            // the 60th error: the same 55.55 s the pure helper's test pins.
+            assert_eq!(
+                started.elapsed(),
+                Duration::from_millis(1550 + 54 * 1000),
+                "the loop sleeps between failures and not after the last"
+            );
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn delays_follow_accept_retry() {
+            // `true` is a failed accept. The success in the middle must send the
+            // back-off back to its 50 ms floor.
+            let outcomes = [
+                true, true, true, true, true, true, true, false, true, true, true,
+            ];
+            let steps = outcomes.iter().map(|&failed| {
+                if failed {
+                    Step::Fail
+                } else {
+                    // The peer end is dropped at once: the connection ends in
+                    // end-of-file and the loop is straight back to accept().
+                    let (server_end, client) = UnixStream::pair().expect("socketpair");
+                    drop(client);
+                    Step::Connect(server_end)
+                }
+            });
+            let (source, calls, drained) = Scripted::new(steps);
+            let mut server = tokio::spawn(serve_accept_loop(
+                source,
+                Arc::new(AckHandler),
+                ServeLimits::default(),
+            ));
+            tokio::time::timeout(VIRTUAL_DEADLINE, async {
+                tokio::select! {
+                    biased;
+                    ended = &mut server => {
+                        panic!("the accept loop returned instead of backing off: {ended:?}")
+                    }
+                    signal = drained => signal.expect("the source outlives the script"),
+                }
+            })
+            .await
+            .expect("the script was never used up");
+            assert!(!server.is_finished(), "the loop must keep serving");
+            server.abort();
+
+            // What a fresh `AcceptRetry` prescribes for the same outcomes: the
+            // gap before the next call is its delay after a failure and nothing
+            // after a success.
+            let mut model = AcceptRetry::new();
+            let want: Vec<Duration> = outcomes
+                .iter()
+                .map(|&failed| {
+                    if failed {
+                        model.on_error().expect("far below the give-up count")
+                    } else {
+                        model.on_success();
+                        Duration::ZERO
+                    }
+                })
+                .collect();
+            let times = calls.lock().expect("calls mutex").clone();
+            let got: Vec<Duration> = times
+                .windows(2)
+                .map(|w| w[1].duration_since(w[0]))
+                .collect();
+            assert_eq!(got, want);
         }
     }
 }
@@ -466,6 +890,161 @@ mod tests {
         }
     }
 
+    /// One request of every variant, the sized ones asking for the most a peer
+    /// can name.
+    fn one_of_each_request() -> Vec<Request> {
+        vec![
+            Request::GetStatus,
+            Request::ActivateProfile(crate::dto::ActivateProfileRequest {
+                profile_id: "p".into(),
+                dest_host: None,
+                dest_port: None,
+            }),
+            Request::Deactivate(crate::dto::DeactivateRequest {
+                release_kill_switch: false,
+            }),
+            Request::ListProfiles,
+            Request::InspectFlow {
+                flow_id: "f".into(),
+            },
+            Request::TraceRoute(crate::dto::RouteTraceRequest {
+                app_id: None,
+                dest_host: "example.org".into(),
+                dest_port: 443,
+                protocol: "tcp".into(),
+                risk: "low".into(),
+                profile_id: None,
+            }),
+            Request::ListRecentFlows { limit: usize::MAX },
+            Request::GetAuditEntries { limit: usize::MAX },
+            Request::VerifyAuditChain,
+            Request::RunDoctor,
+            Request::ExplainError(crate::dto::ExplainRequest { code: "C".into() }),
+            Request::SubscribeEvents(crate::dto::SubscribeEventsRequest { kinds: None }),
+            Request::SetIngress(crate::dto::SetIngressRequest {
+                armed: true,
+                profile_id: None,
+                client: None,
+                expect_profile: None,
+                expect_routing_digest: None,
+            }),
+            Request::GetIngressAudit {
+                limit: usize::MAX,
+                before_seq: Some(7),
+                verify: true,
+            },
+        ]
+    }
+
+    /// Where a request sits in `one_of_each_request`, and whether a peer chooses
+    /// a size with it. No wildcard: a new variant does not compile here until it
+    /// is listed, and the list is then checked against the variants it must cover.
+    fn position_and_sized(request: &Request) -> (usize, bool) {
+        match request {
+            Request::GetStatus => (0, false),
+            Request::ActivateProfile(_) => (1, false),
+            Request::Deactivate(_) => (2, false),
+            Request::ListProfiles => (3, false),
+            Request::InspectFlow { .. } => (4, false),
+            Request::TraceRoute(_) => (5, false),
+            Request::ListRecentFlows { .. } => (6, true),
+            Request::GetAuditEntries { .. } => (7, true),
+            Request::VerifyAuditChain => (8, false),
+            Request::RunDoctor => (9, false),
+            Request::ExplainError(_) => (10, false),
+            Request::SubscribeEvents(_) => (11, false),
+            Request::SetIngress(_) => (12, false),
+            Request::GetIngressAudit { .. } => (13, true),
+        }
+    }
+
+    /// The clamp exists because a peer must not name an allocation size
+    /// (`MAX_LIST_LIMIT`). A request that carries no size passes unchanged; one
+    /// that does is cut to the cap and keeps everything else it said.
+    #[test]
+    fn clamp_keeps_every_size_free_variant_and_clamps_the_sized_ones() {
+        let requests = one_of_each_request();
+        let mut covered: Vec<usize> = requests.iter().map(|r| position_and_sized(r).0).collect();
+        covered.sort_unstable();
+        assert_eq!(
+            covered,
+            (0..requests.len()).collect::<Vec<_>>(),
+            "the list must hold every variant of Request exactly once, in order"
+        );
+
+        for request in requests {
+            let (_, sized) = position_and_sized(&request);
+            let before = format!("{request:?}");
+            let after = format!("{:?}", clamp_request_limits(request));
+            if sized {
+                assert_ne!(before, after, "{before} was not clamped");
+                assert!(
+                    after.contains(&MAX_LIST_LIMIT.to_string()),
+                    "{after} is not cut to the cap"
+                );
+            } else {
+                assert_eq!(
+                    before, after,
+                    "{before} carries no size and must not change"
+                );
+            }
+        }
+
+        match clamp_request_limits(Request::GetIngressAudit {
+            limit: usize::MAX,
+            before_seq: Some(7),
+            verify: true,
+        }) {
+            Request::GetIngressAudit {
+                limit,
+                before_seq,
+                verify,
+            } => {
+                assert_eq!(limit, MAX_LIST_LIMIT);
+                assert_eq!(before_seq, Some(7), "the cursor is not a size");
+                assert!(verify, "the clamp changes the size and nothing else");
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
+    }
+
+    /// The exhaustive `match` is what turns "a new variant that carries a size"
+    /// into a compile error. A catch-all arm brings the silent pass-through
+    /// back (`other => other` let every new variant through unclamped), so no
+    /// arm may be a wildcard or a bare binding.
+    #[test]
+    fn clamp_request_limits_has_no_catch_all_arm() {
+        let source = include_str!("server.rs");
+        let start = source
+            .find("pub fn clamp_request_limits")
+            .expect("the clamp is in this file");
+        let body = &source[start..];
+        let body = &body[..body.find("\n}\n").expect("the function ends at column 0")];
+        let mut arms = 0;
+        for line in body.lines().map(str::trim) {
+            if line.starts_with("//") {
+                continue;
+            }
+            if let Some((pattern, _)) = line.split_once("=>") {
+                arms += 1;
+                let pattern = pattern.trim_start_matches('|').trim();
+                let binding = pattern
+                    .trim_start_matches("ref ")
+                    .trim_start_matches("mut ")
+                    .trim();
+                // An empty pattern is one that began on an earlier line.
+                assert!(
+                    binding.is_empty() || !binding.chars().all(|c| c.is_alphanumeric() || c == '_'),
+                    "a catch-all arm in the clamp: {line}"
+                );
+            }
+        }
+        assert!(
+            arms >= 4,
+            "found {arms} arms; the scan is looking at the wrong text"
+        );
+    }
+
     #[test]
     fn subscribe_exempts_a_connection_from_the_idle_timeout() {
         let limits = ServeLimits::default();
@@ -535,6 +1114,103 @@ mod tests {
             .await
             .expect_err("a silent peer must time out");
         assert_eq!(err.code, "IPC_READ_TIMEOUT");
+    }
+
+    fn ms(n: u64) -> Duration {
+        Duration::from_millis(n)
+    }
+
+    #[test]
+    fn accept_retry_backoff_table() {
+        let mut retry = AcceptRetry::new();
+        // 50 ms doubling, clamped at 1 s: 50, 100, 200, 400, 800, then 1000.
+        let table = [50, 100, 200, 400, 800, 1000, 1000, 1000, 1000];
+        for (i, want) in table.into_iter().enumerate() {
+            assert_eq!(retry.on_error(), Some(ms(want)), "error #{}", i + 1);
+            assert_eq!(
+                retry.consecutive_errors(),
+                u32::try_from(i + 1).unwrap_or(u32::MAX)
+            );
+        }
+    }
+
+    #[test]
+    fn accept_retry_gives_up_on_the_60th_consecutive_error() {
+        assert_eq!(AcceptRetry::GIVE_UP_AFTER, 60);
+        let mut retry = AcceptRetry::new();
+        let mut total = Duration::ZERO;
+        for n in 1..AcceptRetry::GIVE_UP_AFTER {
+            let delay = retry
+                .on_error()
+                .unwrap_or_else(|| panic!("error #{n} must still be retried"));
+            total += delay;
+        }
+        assert_eq!(
+            retry.on_error(),
+            None,
+            "the 60th consecutive error gives up"
+        );
+        // 59 sleeps: 50+100+200+400+800 ms, then 54 x 1 s. Bounds how long a
+        // sustained failure keeps the daemon alive before it stops.
+        assert_eq!(total, ms(1550 + 54 * 1000));
+        // Giving up is sticky: asking again never revives the loop.
+        assert_eq!(retry.on_error(), None);
+        assert_eq!(retry.on_error(), None);
+    }
+
+    #[test]
+    fn accept_retry_success_resets_the_sequence() {
+        let mut retry = AcceptRetry::new();
+        assert_eq!(retry.on_error(), Some(ms(50)));
+        assert_eq!(retry.on_error(), Some(ms(100)));
+        assert_eq!(retry.on_error(), Some(ms(200)));
+        retry.on_success();
+        assert_eq!(retry.consecutive_errors(), 0);
+        assert_eq!(
+            retry.on_error(),
+            Some(ms(50)),
+            "backoff restarts at the floor"
+        );
+    }
+
+    #[test]
+    fn accept_retry_success_resets_the_give_up_count() {
+        // Errors that are *not* consecutive never add up to a give-up, however
+        // many there are in total.
+        let mut retry = AcceptRetry::new();
+        for round in 0..5 {
+            for n in 1..AcceptRetry::GIVE_UP_AFTER {
+                assert!(retry.on_error().is_some(), "round {round}, error #{n}");
+            }
+            retry.on_success();
+        }
+        // A success with no preceding error changes nothing.
+        retry.on_success();
+        assert_eq!(retry.on_error(), Some(ms(50)));
+    }
+
+    #[test]
+    fn accept_retry_never_overflows() {
+        // Far past the threshold: the counter saturates and the delay never
+        // exceeds the cap (overflow-checks is on in every profile).
+        let mut retry = AcceptRetry::new();
+        for _ in 0..100_000 {
+            if let Some(delay) = retry.on_error() {
+                assert!(delay <= AcceptRetry::MAX_DELAY);
+            }
+        }
+        assert_eq!(retry.on_error(), None);
+
+        // The numeric edge itself, reached directly rather than by looping.
+        let mut edge = AcceptRetry {
+            consecutive: u32::MAX,
+        };
+        assert_eq!(edge.on_error(), None);
+        assert_eq!(edge.consecutive_errors(), u32::MAX);
+        assert_eq!(AcceptRetry::delay_for(u32::MAX), AcceptRetry::MAX_DELAY);
+        assert_eq!(AcceptRetry::delay_for(33), AcceptRetry::MAX_DELAY);
+        assert_eq!(AcceptRetry::delay_for(32), AcceptRetry::MAX_DELAY);
+        assert_eq!(AcceptRetry::delay_for(31), AcceptRetry::MAX_DELAY);
     }
 
     #[tokio::test]

@@ -7,9 +7,14 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
 jobs:
   desktop_ui:
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
@@ -24,6 +29,7 @@ jobs:
 
   desktop_host:
     runs-on: windows-latest
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
@@ -39,7 +45,7 @@ jobs:
       - run: cargo fmt --manifest-path apps/desktop/Cargo.toml -- --check
       - run: cargo clippy --manifest-path apps/desktop/Cargo.toml --all-targets --locked -- -D warnings
       - run: cargo build --manifest-path apps/desktop/Cargo.toml --locked
-      - run: cargo test --manifest-path apps/desktop/Cargo.toml --locked
+      - run: cargo test --no-fail-fast --manifest-path apps/desktop/Cargo.toml --locked
       # The explicit WebView startup smoke test needs an interactive Windows session.
 
   # ---------------------------------------------------------------------------
@@ -54,6 +60,7 @@ jobs:
   # ---------------------------------------------------------------------------
   fmt_lint:
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
@@ -65,10 +72,11 @@ jobs:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       - run: cargo fmt --all -- --check
-      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo clippy --locked --workspace --all-targets -- -D warnings
 
   build_test:
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
@@ -77,8 +85,15 @@ jobs:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-      - run: cargo build --workspace --all-targets
-      - run: cargo test --workspace
+      - run: cargo build --locked --workspace --all-targets
+      # `SSK_REQUIRE_IPV6=1` turns "this host has no `::1`" from a printed
+      # `SKIPPED:` into a failure, so the IPv6 literal dial cannot go unexercised
+      # unnoticed. It is set on the step because the `runner` context is not
+      # available in job-level `env:`. Whether the ubuntu runner has `::1` is
+      # UNVERIFIED: a red Linux leg here means "decide", not "ignore".
+      - run: cargo test --locked --no-fail-fast --workspace
+        env:
+          SSK_REQUIRE_IPV6: ${{ runner.os == 'Linux' && '1' || '0' }}
       - name: Check read-only VM host assessment with synthetic facts
         if: runner.os == 'Windows'
         shell: pwsh
@@ -89,6 +104,7 @@ jobs:
   # instead -- portable across every runner shell.
   proptest_smoke:
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
@@ -97,35 +113,38 @@ jobs:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-      - run: cargo test --workspace
+      - run: cargo test --locked --no-fail-fast --workspace
         env:
           PROPTEST_CASES: 32
 
   replay_vectors:
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-      - run: cargo test -p ssk-runtime --test replay_vectors
+      - run: cargo test --locked --no-fail-fast -p ssk-runtime --test replay_vectors
 
   interop_contracts:
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-      - run: cargo test -p ssk-interop
+      - run: cargo test --locked --no-fail-fast -p ssk-interop
 
   # Runs on both OSes: the schema export goes through the `ssk` CLI, which is a
   # shipped Windows binary, so a Windows-only break in that path must be caught
-  # here. The redirect + `test -s` are POSIX constructs, so the step declares
-  # `shell: bash` (available on GitHub's Windows runners via Git Bash). The
-  # export target is a relative path inside the checkout rather than the
-  # Unix-only `/tmp` -- and rather than `$RUNNER_TEMP`, which on Windows is a
-  # backslash-separated path that Git Bash would have to round-trip.
+  # here. The redirect, `test` and `cmp` are POSIX constructs, so the step
+  # declares `shell: bash` (available on GitHub's Windows runners via Git
+  # Bash). The export target is a relative path inside the checkout rather than
+  # the Unix-only `/tmp` -- and rather than `$RUNNER_TEMP`, which on Windows is
+  # a backslash-separated path that Git Bash would have to round-trip.
   config_schema_guard:
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
@@ -134,57 +153,109 @@ jobs:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-      - run: cargo test -p ssk-config schema_snapshot_stable
-      - name: Export config schema and assert it is non-empty
+      # No test-name filter: `cargo test <filter>` that matches nothing exits 0,
+      # so renaming the snapshot test would have turned this step into a no-op.
+      - run: cargo test --locked --no-fail-fast -p ssk-config
+      - name: Export config schema and assert it is the pinned schema
         shell: bash
         run: |
           cargo run -p ssk-cli -- config schema --json > ssk-config-schema.json
           test -s ssk-config-schema.json
+          # A non-empty file proves nothing: the shipped binary must print the
+          # golden schema byte for byte (the golden file is that output).
+          set -- crates/ssk-config/tests/golden/ssk-config-v*.schema.json
+          test "$#" -eq 1
+          cmp ssk-config-schema.json "$1"
           rm -f ssk-config-schema.json
 
+  # Fails a push or pull request that changes a contract surface
+  # (scripts/ci/contract_surfaces.txt) without a docs/COMPATIBILITY_MATRIX.md
+  # change or a `Compat-Impact: none (<reason>)` commit message line in the same
+  # range. It has no `if:` on purpose: a job that is skipped on `push` is read as
+  # success by `ci_gate`, so a direct push would never have been checked.
+  #
+  # `fetch-depth: 0` is required: `actions/checkout`'s default depth of 1 has no
+  # merge base. The old step then ran `git diff ... | tee`, whose status is tee's
+  # (GitHub's documented default shell, `bash -e`, has no pipefail), so git's exit
+  # 128 was swallowed and the step stayed green.
+  #
+  # UNVERIFIED until a pull request has run it (design 21.3): the checkout depth,
+  # the `github.event.*` fields below and the shell flags. Only the script's logic
+  # is exercised, by `contract_guard_selftest`.
   breaking_change_guard:
     runs-on: ubuntu-latest
-    if: github.event_name == 'pull_request'
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-      - name: Guard interop and config contract surfaces
+        with:
+          fetch-depth: 0
+      - name: Contract surfaces need a compatibility note
+        shell: bash
+        env:
+          EVENT: ${{ github.event_name }}
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD: ${{ github.event.pull_request.head.sha }}
+          PUSH_BEFORE: ${{ github.event.before }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
         run: |
-          git diff --name-only origin/${{ github.base_ref }}...HEAD | tee /tmp/changed_files.txt
-          if grep -Eq '^crates/ssk-interop/src/lib.rs|^crates/ssk-config/src/lib.rs|^docs/INTEROP_SPEC.md|^docs/COMPATIBILITY_MATRIX.md' /tmp/changed_files.txt; then
-            echo "Contract surface changed; ensure compatibility docs/tests are updated."
+          set -euo pipefail
+          if [ "$EVENT" = "pull_request" ]; then
+            base="$PR_BASE"; head="$PR_HEAD"
+          else
+            head="$GITHUB_SHA"; base="$PUSH_BEFORE"
+            # A new branch (all-zero `before`) or a force push (the old tip is gone):
+            # check everything the branch has beyond the default branch.
+            if ! git cat-file -e "${base}^{commit}" 2>/dev/null; then
+              base="$(git merge-base "origin/${DEFAULT_BRANCH}" "$head")"
+            fi
           fi
+          echo "contract guard: base=$base head=$head"
+          sh scripts/ci/contract_guard.sh "$base" "$head"
+
+  # The guard's logic against throw-away repositories. Runs on every push and
+  # pull request, so it is exercised even when no pull request exists.
+  contract_guard_selftest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - run: sh scripts/ci/tests/contract_guard.test.sh
 
   no_std_core:
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - uses: dtolnay/rust-toolchain@stable
-      - run: cargo check -p ssk-types --no-default-features
-      - run: cargo check -p ssk-core --no-default-features
+      - run: cargo check --locked -p ssk-types --no-default-features
+      - run: cargo check --locked -p ssk-core --no-default-features
 
   netadmin_contracts:
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-      - run: cargo test -p ssk-netadmin
+      - run: cargo test --locked --no-fail-fast -p ssk-netadmin
 
   conformance_suite:
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-      - run: cargo test -p ssk-interop conformance
+      - run: cargo test --locked --no-fail-fast -p ssk-interop conformance
 
   chaos_drills:
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-      - run: cargo test -p ssk-faultscan
+      - run: cargo test --locked --no-fail-fast -p ssk-faultscan
 
   # cargo-audit / cargo-deny are pinned to exact versions. An unpinned
   # `cargo install --locked` picks up whatever is newest at job start, which
@@ -192,6 +263,7 @@ jobs:
   # with no commit in this repo. Bump these deliberately.
   cargo_audit:
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - uses: dtolnay/rust-toolchain@stable
@@ -200,6 +272,7 @@ jobs:
 
   cargo_deny:
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - uses: dtolnay/rust-toolchain@stable
@@ -217,15 +290,16 @@ jobs:
   # is the operator validation documented in RUNBOOK_WINDOWS.md.
   windows_backends:
     runs-on: windows-latest
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-      - run: cargo build -p ssk-winhost -p ssk-cli
-      - run: cargo clippy -p ssk-winhost --all-targets -- -D warnings
-      - run: cargo test -p ssk-winhost
+      - run: cargo build --locked -p ssk-winhost -p ssk-cli
+      - run: cargo clippy --locked -p ssk-winhost --all-targets -- -D warnings
+      - run: cargo test --locked --no-fail-fast -p ssk-winhost
 
   # Per-crate Windows gates for the four crates that had never been compiled or
   # run on Windows in CI before this job existed: the IPC transport, the daemon,
@@ -244,6 +318,7 @@ jobs:
   # crates' results.
   windows_crate_gates:
     runs-on: windows-latest
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
@@ -254,6 +329,25 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-      - run: cargo build -p ${{ matrix.crate }} --all-targets
-      - run: cargo clippy -p ${{ matrix.crate }} --all-targets -- -D warnings
-      - run: cargo test -p ${{ matrix.crate }}
+      - run: cargo build --locked -p ${{ matrix.crate }} --all-targets
+      - run: cargo clippy --locked -p ${{ matrix.crate }} --all-targets -- -D warnings
+      - run: cargo test --locked --no-fail-fast -p ${{ matrix.crate }}
+
+  # One check name to require in branch protection. `needs` + `if: always()` makes
+  # it fail when ANY job failed or was cancelled, and a skipped job does not
+  # count as a failure (so no gated job may carry an `if:` that skips it on push
+  # or pull_request: it would then be read as green). Without
+  # one aggregate check, a red job that nobody marked "required" is easy to miss:
+  # the CI run on main for the 2026-10-04 merge had 9 of 25 jobs red.
+  ci_gate:
+    if: always()
+    needs: [desktop_ui, desktop_host, fmt_lint, build_test, proptest_smoke, replay_vectors, interop_contracts, config_schema_guard, breaking_change_guard, contract_guard_selftest, no_std_core, netadmin_contracts, conformance_suite, chaos_drills, cargo_audit, cargo_deny, windows_backends, windows_crate_gates]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Fail if any required job failed or was cancelled
+        env:
+          RESULTS: ${{ toJSON(needs) }}
+        run: |
+          echo "$RESULTS" | jq -r 'to_entries[] | "\(.value.result)\t\(.key)"' | sort
+          echo "$RESULTS" | jq -e 'all(.[]; .result == "success" or .result == "skipped")' > /dev/null

@@ -61,13 +61,13 @@
 //! # `view()` must not block
 //!
 //! A status read that blocks on a pipe connect is how `ssk status` hangs, and
-//! `Supervisor::handle` calls [`KillSwitchProvider::view`] while holding the
-//! supervisor's mutex inside an async task. So the trait's contract is
-//! *non-blocking*: [`CachedBrokerView`] answers from a cache and does its I/O in
-//! [`CachedBrokerView::refresh`], which the composition root drives from a
-//! background thread. A cached answer older than the staleness bound is
-//! `Unknown`, never the last good value — a stale "engaged" is a claim of
-//! protection nobody re-established.
+//! `Supervisor::handle` calls [`KillSwitchProvider::view`] inside an async task,
+//! with the supervisor's mutex held or, while an activation dials, without it.
+//! So the trait's contract is *non-blocking*: [`CachedBrokerView`] answers from
+//! a cache and does its I/O in [`CachedBrokerView::refresh`], which the
+//! composition root drives from a background thread. A cached answer older than
+//! the staleness bound is `Unknown`, never the last good value — a stale
+//! "engaged" is a claim of protection nobody re-established.
 
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -212,9 +212,11 @@ pub fn view_of(status: &KillSwitchStatus) -> KillSwitchView {
 ///
 /// # Contract
 ///
-/// `view` **must not block and must not perform I/O.** It is called while the
-/// supervisor's mutex is held, on an async task. An implementation that dials a
-/// pipe here turns `ssk status` into something that can hang.
+/// `view` **must not block and must not perform I/O.** It is called on an async
+/// task, with the supervisor's mutex held (an ordinary status read) and without
+/// it (the status answered while an activation holds the mutex across its dial).
+/// An implementation that dials a pipe here turns `ssk status` into something
+/// that can hang either way.
 pub trait KillSwitchProvider: Send + Sync {
     fn view(&self) -> KillSwitchView;
 }

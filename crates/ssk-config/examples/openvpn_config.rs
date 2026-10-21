@@ -1,4 +1,5 @@
-//! Generate a complete, valid v4 configuration. The OpenVPN adapter is reserved:
+//! Generate a complete, valid configuration of the current version
+//! (`ssk_config::CURRENT_CONFIG_VERSION`). The OpenVPN adapter is reserved:
 //! this config deliberately fails activation until broker integration ships.
 use ssk_config::routing::{AdapterTransport, RoutingAction, RoutingAdapter, RoutingRule};
 

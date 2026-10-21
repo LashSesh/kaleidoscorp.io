@@ -8,7 +8,7 @@
 > **Current status (2026-09-22):** Start with the
 > [restart assessment](docs/RESTART_ASSESSMENT_2026-09-21.md) and
 > [routing/OpenVPN implementation status](docs/ROUTING_AND_OPENVPN_STATUS.md).
-> The daemon now uses configured v4 routing profiles and enforced admission.
+> The daemon now uses configured v5 routing profiles and enforced admission.
 > The [OpenVPN management library](docs/OPENVPN_MANAGEMENT.md),
 > [protected profiles and Windows process containment](docs/OPENVPN_PROFILES_AND_PROCESS.md)
 > are now composed into a [verified, held startup](docs/OPENVPN_SECURE_START.md).
@@ -341,7 +341,7 @@ ssk [--json] <command>
 | `status` | Query the real daemon (`sskd`) state over its IPC endpoint — Unix domain socket on Unix, named pipe on Windows |
 | `activate --profile <p> --dest <host:port>` | Ask `sskd` to really connect to `host:port` via the policy-decided route; `Protected` only on real success. The connection is opened and held; no application bytes are written through it |
 | `deactivate` | Really tear down the live egress session and return to `Inactive` |
-| `list-profiles` | List profiles known to the daemon (currently one reference profile; a config-driven multi-profile model is future work) |
+| `list-profiles` | List the profiles of the daemon's validated startup configuration (without `SSK_CONFIG_PATH`: only the implicit `default` profile, which has no rules and denies everything) |
 | `system run` | Run the `ssk-system` Crown pipeline over a deterministic fixture and print the fail-closed verdict |
 | `winhost capture` | Enumerate real active TCP/UDP flows via IP Helper (Windows; works unelevated) |
 | `winhost killswitch engage` / `release` | Sever / restore outbound egress via `netsh` and persist a rollback receipt (Windows, Administrator) |
@@ -373,14 +373,15 @@ outstanding` (`docs/WINDOWS_PRODUCT_ROADMAP.md:383`).
 
 ## Configuration
 
-SSK Ω uses a versioned, fail-closed config model. The minimum valid configuration requires:
+SSK Ω uses a versioned, fail-closed config model; the current file is `version: 5`. A file
+states every top-level section (`ssk config schema --json` lists them), so start from a
+generated example instead of writing one by hand: `docs/examples/*.yaml`, or
 
-```yaml
-version: 2
-fail_closed: true
-runtime:
-  strict_mode: true
+```bash
+cargo run -p ssk-config --example ingress_config > ssk-config.yaml
 ```
+
+Keep `system.fail_closed: true` and `runtime.strict_mode: true`; both are refused otherwise.
 
 ```bash
 # Validate a config file
@@ -390,7 +391,8 @@ cargo run -p ssk-cli -- config lint --path ./ssk-config.yaml
 cargo run -p ssk-cli -- config schema --json
 ```
 
-Legacy v1 configs are automatically migrated on first load. Restart is blocked unless `config lint` succeeds.
+Configs of versions 1 to 4 are migrated in memory to v5 on load (files are never rewritten);
+the migrated `ingress` section is disabled. Restart is blocked unless `config lint` succeeds.
 
 ---
 
@@ -481,7 +483,7 @@ sskd (ssk-daemon)
 
 | Adapter | Protocol | Real execution |
 |---------|---------|---------|
-| `DirectAdapter` | Raw TCP | `ssk-netcore::direct` — real `TcpStream::connect` |
+| `DirectAdapter` | Raw TCP | `ssk-netcore::direct`, through `ssk-netcore::connector` — real `TcpStream::connect` |
 | `Socks5Adapter` | SOCKS5 | `ssk-netcore::socks5` — real RFC 1928/1929 client handshake |
 | `HttpConnectAdapter` | HTTP CONNECT tunnel | `ssk-netcore::http_connect` — real request/response handshake |
 | `TlsTunnelAdapter` | TLS-wrapped tunnel with SNI override | `ssk-netcore::tls` — real `rustls` handshake, OS-native trust store; mTLS client-cert wiring exists but has no config source yet |
@@ -504,7 +506,6 @@ Every traffic decision is BLAKE3 hash-chained into an immutable `AuditLedger`, e
 - **Traffic ingress of any kind.** No proxy listener, no WFP/WinDivert/LSP/TUN hook, no PAC, no proxy-settings writer. `ssk-capture` has no OS capture; its only production `TrafficSource` is a hardcoded CLI fixture. (`ssk winhost capture` does enumerate real live flows via IP Helper, but that is observation, not interception, and it does not feed this layer.)
 - **Byte transfer.** `EgressSession::transport_mut` (`crates/ssk-netcore/src/session.rs:63`) has zero callers, so no application data crosses an established session.
 - **Real flow classification.** The supervisor hardcodes `RiskLevel::Low` / `ProtocolKind::Tcp`, so every non-`Direct` executor path is structurally unreachable in production.
-- **Config-driven routing.** The loaded `AppConfig` is not passed into `Supervisor::new`; the adapter registry is hardcoded.
 - True multi-hop proxy chaining beyond two hops is implemented but lightly exercised.
 - A daemon-level "kill switch" only tears down the one session the daemon holds. The separate OS-level kill-switch (`ssk winhost killswitch`, netsh firewall rules) exists but has never been observed completing an engage→release cycle on any machine, in any locale.
 
@@ -557,7 +558,7 @@ Common incident scenarios and recovery steps are in [`docs/RUNBOOK.md`](docs/RUN
 
 - **Ledger mismatch** — stop writes, run `verify-ledger`, restore last good segment, re-verify before reopening.
 - **Replay drift** — compare `run_id`/`replay_id`/`seeded`/`epoch`; isolate regression via deterministic test bisect.
-- **Corrupted config** — run `config lint`; ensure `version=2`, `fail_closed=true`, `strict_mode=true`; restart only after lint success.
+- **Corrupted config** — run `config lint`; ensure `version: 5`, `fail_closed=true`, `strict_mode=true`; restart only after lint success.
 - **Capability mismatch** — align peer/local capability sets; keep strict mode; reattempt handshake.
 
 ---
@@ -567,13 +568,14 @@ Common incident scenarios and recovery steps are in [`docs/RUNBOOK.md`](docs/RUN
 | Job | What it checks |
 |-----|---------------|
 | `fmt_lint` | `cargo fmt` + `cargo clippy -D warnings` |
-| `build_test` | `cargo build` + `cargo test` workspace-wide |
+| `build_test` | `cargo build` + `cargo test` workspace-wide; the Linux leg sets `SSK_REQUIRE_IPV6=1`, so a runner without `::1` fails the IPv6 dial test instead of skipping it |
 | `proptest_smoke` | Property tests at `PROPTEST_CASES=32` |
 | `replay_vectors` | Deterministic replay integration tests |
 | `interop_contracts` | Interop golden, negative, and fuzz tests |
 | `conformance_suite` | 7-profile interop conformance suite |
-| `config_schema_guard` | Schema snapshot stability + schema export |
-| `breaking_change_guard` | Contract-surface change detection on PRs |
+| `config_schema_guard` | All `ssk-config` tests (the golden schema file and the schema-against-parser drift tests included, no name filter) + `ssk config schema --json` compared byte for byte with the golden file |
+| `breaking_change_guard` | Fails a push or pull request that changes a contract surface (`scripts/ci/contract_surfaces.txt`) without a `docs/COMPATIBILITY_MATRIX.md` entry or a `Compat-Impact: none (<reason>)` commit trailer |
+| `contract_guard_selftest` | `scripts/ci/tests/contract_guard.test.sh`: the guard's logic against throw-away repositories, on every push and pull request |
 | `netadmin_contracts` | Network administration layer contracts |
 | `chaos_drills` | Full fault-injection playbook via `ssk-faultscan` |
 | `no_std_core` | `ssk-types` + `ssk-core` no-default-features check |
@@ -607,8 +609,8 @@ Two caveats, so the badge is not over-read:
    [`docs/WINDOWS_PRODUCT_ROADMAP.md`](docs/WINDOWS_PRODUCT_ROADMAP.md) §5.2. A red result there is
    the answer being asked for, not a badge problem.
 2. `replay_vectors`, `interop_contracts`, `conformance_suite`, `netadmin_contracts`, `chaos_drills`,
-   `no_std_core`, `cargo_audit`, `cargo_deny` and `breaking_change_guard` still run on
-   `ubuntu-latest` only.
+   `no_std_core`, `cargo_audit`, `cargo_deny`, `breaking_change_guard` and `contract_guard_selftest`
+   still run on `ubuntu-latest` only.
 
 `.github/workflows/ci.yml` is authoritative for what actually runs.
 

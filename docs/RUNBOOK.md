@@ -15,7 +15,7 @@
 
 ## Corrupted Config
 1. Run `ssk config lint --path <config>`.
-2. Ensure `version=2`, `fail_closed=true`, `runtime.strict_mode=true`.
+2. Ensure `version: 5`, `fail_closed=true`, `runtime.strict_mode=true`.
 3. If legacy format is detected, migrate and re-validate.
 4. Restart only after lint success.
 
@@ -26,8 +26,12 @@
 `CONFIG_INVALID` (CLI exit 10) without a network attempt. `ssk --json status`
 reports the cause; the IPC `RunDoctor` response also includes a `config` check.
 Fix the file/path and restart `sskd`; `deactivate` does not clear this error.
-Routing now uses the validated v4 profile and adapter configuration. New and
+Routing now uses the validated v5 profile and adapter configuration. New and
 migrated configurations deny all connections until explicit rules are added.
+There is no reload: a configuration edit takes effect after a daemon restart. The
+`ingress` section is validated at load (a typo or an out-of-range value makes the
+whole file invalid), but this build opens no listener yet; once it does, a restart
+will bring the proxy back disarmed unless `ingress.arm_on_start` is true.
 See [routing and OpenVPN status](ROUTING_AND_OPENVPN_STATUS.md) for migration,
 configuration examples and the unavailable OpenVPN adapter.
 

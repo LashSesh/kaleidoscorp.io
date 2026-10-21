@@ -1,0 +1,737 @@
+{
+  "$id": "https://kaleidoscorp.io/schema/ssk-config-v5.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "bcik": {
+      "properties": {
+        "closure_threshold": {
+          "maximum": 1.0,
+          "minimum": 0.0,
+          "type": "number"
+        },
+        "require_boundary_operator": {
+          "const": true,
+          "type": "boolean"
+        },
+        "require_seam": {
+          "const": true,
+          "type": "boolean"
+        },
+        "tolerated_residue_threshold": {
+          "const": "policy_defined",
+          "type": "string"
+        }
+      },
+      "required": [
+        "require_seam",
+        "require_boundary_operator",
+        "closure_threshold",
+        "tolerated_residue_threshold"
+      ],
+      "type": "object"
+    },
+    "capabilities": {
+      "properties": {
+        "allowed_witnesses": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "require_scope_and_expiry": {
+          "const": true,
+          "type": "boolean"
+        },
+        "witness_required": {
+          "const": true,
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "witness_required",
+        "allowed_witnesses",
+        "require_scope_and_expiry"
+      ],
+      "type": "object"
+    },
+    "core": {
+      "properties": {
+        "canonicalization": {
+          "const": "deterministic",
+          "type": "string"
+        },
+        "expose_core_address": {
+          "const": false,
+          "type": "boolean"
+        },
+        "signature_policy": {
+          "const": "core_boundary_residue",
+          "type": "string"
+        }
+      },
+      "required": [
+        "canonicalization",
+        "signature_policy",
+        "expose_core_address"
+      ],
+      "type": "object"
+    },
+    "dissolution": {
+      "properties": {
+        "finalize_residues_on_expiry": {
+          "type": "boolean"
+        },
+        "ttl_required": {
+          "const": true,
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "ttl_required",
+        "finalize_residues_on_expiry"
+      ],
+      "type": "object"
+    },
+    "hypertorus": {
+      "properties": {
+        "deterministic_replay": {
+          "const": true,
+          "type": "boolean"
+        },
+        "dimension": {
+          "const": 7,
+          "type": "integer"
+        },
+        "mode": {
+          "enum": [
+            "deterministic",
+            "seeded"
+          ],
+          "type": "string"
+        },
+        "phase_axes": {
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 7,
+          "minItems": 7,
+          "type": "array"
+        }
+      },
+      "required": [
+        "dimension",
+        "phase_axes",
+        "mode",
+        "deterministic_replay"
+      ],
+      "type": "object"
+    },
+    "ingress": {
+      "additionalProperties": false,
+      "properties": {
+        "arm_on_start": {
+          "type": "boolean"
+        },
+        "audit": {
+          "additionalProperties": false,
+          "properties": {
+            "destination_logging": {
+              "enum": [
+                "plain",
+                "hashed"
+              ],
+              "type": "string"
+            },
+            "retain_segments": {
+              "maximum": 64,
+              "minimum": 2,
+              "type": "integer"
+            },
+            "segment_mib": {
+              "maximum": 256,
+              "minimum": 1,
+              "type": "integer"
+            }
+          },
+          "type": "object"
+        },
+        "direct_address_families": {
+          "enum": [
+            "ipv4_only",
+            "any"
+          ],
+          "type": "string"
+        },
+        "enabled": {
+          "type": "boolean"
+        },
+        "hardening": {
+          "enum": [
+            "required",
+            "best_effort"
+          ],
+          "type": "string"
+        },
+        "limits": {
+          "additionalProperties": false,
+          "properties": {
+            "accept_rate_per_s": {
+              "maximum": 10000,
+              "minimum": 1,
+              "type": "integer"
+            },
+            "connect_timeout_ms": {
+              "maximum": 120000,
+              "minimum": 100,
+              "type": "integer"
+            },
+            "handshake_timeout_ms": {
+              "maximum": 60000,
+              "minimum": 100,
+              "type": "integer"
+            },
+            "idle_timeout_ms": {
+              "maximum": 86400000,
+              "minimum": 100,
+              "type": "integer"
+            },
+            "max_connections": {
+              "maximum": 4096,
+              "minimum": 1,
+              "type": "integer"
+            }
+          },
+          "type": "object"
+        },
+        "listen": {
+          "additionalProperties": false,
+          "properties": {
+            "address": {
+              "pattern": "^127\\.[0-9]{1,3}\\.[0-9]{1,3}\\.[0-9]{1,3}$",
+              "type": "string"
+            },
+            "port": {
+              "maximum": 65535,
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "type": "object"
+        },
+        "protocols": {
+          "items": {
+            "enum": [
+              "socks5"
+            ],
+            "type": "string"
+          },
+          "maxItems": 1,
+          "minItems": 1,
+          "type": "array"
+        }
+      },
+      "type": "object"
+    },
+    "interop": {
+      "properties": {
+        "capabilities": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "max_clock_skew_secs": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "min_protocol": {
+          "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$",
+          "type": "string"
+        }
+      },
+      "required": [
+        "min_protocol",
+        "capabilities",
+        "max_clock_skew_secs"
+      ],
+      "type": "object"
+    },
+    "ledger": {
+      "properties": {
+        "append_only_audit": {
+          "const": true,
+          "type": "boolean"
+        },
+        "store_payload": {
+          "const": false,
+          "type": "boolean"
+        },
+        "store_trace_hash": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "append_only_audit",
+        "store_payload",
+        "store_trace_hash"
+      ],
+      "type": "object"
+    },
+    "locator_plane": {
+      "properties": {
+        "allowed_types": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "require_locator_reality_check": {
+          "const": true,
+          "type": "boolean"
+        },
+        "single_ip_external_privacy_claim": {
+          "const": "forbidden",
+          "type": "string"
+        }
+      },
+      "required": [
+        "allowed_types",
+        "require_locator_reality_check",
+        "single_ip_external_privacy_claim"
+      ],
+      "type": "object"
+    },
+    "policy": {
+      "properties": {
+        "fail_closed": {
+          "const": true,
+          "type": "boolean"
+        },
+        "gate_profile": {
+          "properties": {
+            "fail_closed": {
+              "const": true,
+              "type": "boolean"
+            },
+            "failure_policy": {
+              "const": "no_materialization",
+              "type": "string"
+            },
+            "hold_policy": {
+              "const": "diagnosable_non_persistent",
+              "type": "string"
+            },
+            "order": {
+              "items": {
+                "type": "string"
+              },
+              "minItems": 1,
+              "type": "array"
+            },
+            "pass_policy": {
+              "const": "materialize_only",
+              "type": "string"
+            }
+          },
+          "required": [
+            "order",
+            "fail_closed",
+            "failure_policy",
+            "hold_policy",
+            "pass_policy"
+          ],
+          "type": "object"
+        },
+        "name": {
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "name",
+        "fail_closed",
+        "gate_profile"
+      ],
+      "type": "object"
+    },
+    "privacy": {
+      "properties": {
+        "adversary_model": {
+          "enum": [
+            "PartialNetworkObserver"
+          ],
+          "type": "string"
+        },
+        "linkability_threshold": {
+          "const": "policy_defined",
+          "type": "string"
+        },
+        "require_residue_report": {
+          "const": true,
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "adversary_model",
+        "linkability_threshold",
+        "require_residue_report"
+      ],
+      "type": "object"
+    },
+    "projective_connection_hypercube": {
+      "properties": {
+        "axes": {
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 9,
+          "minItems": 9,
+          "type": "array"
+        },
+        "require_all_axis_projection": {
+          "const": true,
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "axes",
+        "require_all_axis_projection"
+      ],
+      "type": "object"
+    },
+    "replay": {
+      "properties": {
+        "deterministic_materialization_required": {
+          "const": true,
+          "type": "boolean"
+        },
+        "run_descriptor_required": {
+          "const": true,
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "run_descriptor_required",
+        "deterministic_materialization_required"
+      ],
+      "type": "object"
+    },
+    "routing": {
+      "additionalProperties": false,
+      "properties": {
+        "adapters": {
+          "items": {
+            "additionalProperties": false,
+            "properties": {
+              "id": {
+                "pattern": "^[a-z0-9][a-z0-9._-]{0,63}$",
+                "type": "string"
+              },
+              "transport": {
+                "oneOf": [
+                  {
+                    "additionalProperties": false,
+                    "properties": {
+                      "host": {
+                        "maxLength": 254,
+                        "minLength": 1,
+                        "type": "string"
+                      },
+                      "kind": {
+                        "const": "socks5"
+                      },
+                      "port": {
+                        "maximum": 65535,
+                        "minimum": 1,
+                        "type": "integer"
+                      }
+                    },
+                    "required": [
+                      "kind",
+                      "host",
+                      "port"
+                    ],
+                    "type": "object"
+                  },
+                  {
+                    "additionalProperties": false,
+                    "properties": {
+                      "host": {
+                        "maxLength": 254,
+                        "minLength": 1,
+                        "type": "string"
+                      },
+                      "kind": {
+                        "const": "http_connect"
+                      },
+                      "port": {
+                        "maximum": 65535,
+                        "minimum": 1,
+                        "type": "integer"
+                      }
+                    },
+                    "required": [
+                      "kind",
+                      "host",
+                      "port"
+                    ],
+                    "type": "object"
+                  },
+                  {
+                    "additionalProperties": false,
+                    "properties": {
+                      "host": {
+                        "maxLength": 254,
+                        "minLength": 1,
+                        "type": "string"
+                      },
+                      "kind": {
+                        "const": "tls_tunnel"
+                      },
+                      "port": {
+                        "maximum": 65535,
+                        "minimum": 1,
+                        "type": "integer"
+                      }
+                    },
+                    "required": [
+                      "kind",
+                      "host",
+                      "port"
+                    ],
+                    "type": "object"
+                  },
+                  {
+                    "additionalProperties": false,
+                    "properties": {
+                      "kind": {
+                        "const": "open_vpn"
+                      },
+                      "profile_id": {
+                        "pattern": "^[a-z0-9][a-z0-9._-]{0,63}$",
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "kind",
+                      "profile_id"
+                    ],
+                    "type": "object"
+                  }
+                ]
+              }
+            },
+            "required": [
+              "id",
+              "transport"
+            ],
+            "type": "object"
+          },
+          "type": "array"
+        },
+        "default_profile": {
+          "pattern": "^[a-z0-9][a-z0-9._-]{0,63}$",
+          "type": "string"
+        },
+        "profiles": {
+          "items": {
+            "additionalProperties": false,
+            "properties": {
+              "id": {
+                "pattern": "^[a-z0-9][a-z0-9._-]{0,63}$",
+                "type": "string"
+              },
+              "name": {
+                "minLength": 1,
+                "type": "string"
+              },
+              "rules": {
+                "items": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "action": {
+                      "oneOf": [
+                        {
+                          "additionalProperties": false,
+                          "properties": {
+                            "kind": {
+                              "enum": [
+                                "direct",
+                                "deny"
+                              ]
+                            }
+                          },
+                          "required": [
+                            "kind"
+                          ],
+                          "type": "object"
+                        },
+                        {
+                          "additionalProperties": false,
+                          "properties": {
+                            "adapter_id": {
+                              "pattern": "^[a-z0-9][a-z0-9._-]{0,63}$",
+                              "type": "string"
+                            },
+                            "kind": {
+                              "const": "adapter"
+                            }
+                          },
+                          "required": [
+                            "kind",
+                            "adapter_id"
+                          ],
+                          "type": "object"
+                        }
+                      ]
+                    },
+                    "destination": {
+                      "anyOf": [
+                        {
+                          "maxLength": 254,
+                          "minLength": 1,
+                          "type": "string"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ]
+                    },
+                    "domain_suffix": {
+                      "anyOf": [
+                        {
+                          "maxLength": 254,
+                          "minLength": 1,
+                          "type": "string"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ]
+                    },
+                    "id": {
+                      "pattern": "^[a-z0-9][a-z0-9._-]{0,63}$",
+                      "type": "string"
+                    },
+                    "port": {
+                      "anyOf": [
+                        {
+                          "maximum": 65535,
+                          "minimum": 1,
+                          "type": "integer"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ]
+                    },
+                    "priority": {
+                      "maximum": 4294967295,
+                      "minimum": 0,
+                      "type": "integer"
+                    },
+                    "require_attestation": {
+                      "default": false,
+                      "type": "boolean"
+                    }
+                  },
+                  "required": [
+                    "id",
+                    "priority",
+                    "action"
+                  ],
+                  "type": "object"
+                },
+                "type": "array"
+              }
+            },
+            "required": [
+              "id",
+              "name",
+              "rules"
+            ],
+            "type": "object"
+          },
+          "minItems": 1,
+          "type": "array"
+        }
+      },
+      "required": [
+        "default_profile",
+        "profiles",
+        "adapters"
+      ],
+      "type": "object"
+    },
+    "runtime": {
+      "properties": {
+        "metrics_path": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "strict_mode": {
+          "const": true,
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "strict_mode",
+        "metrics_path"
+      ],
+      "type": "object"
+    },
+    "system": {
+      "properties": {
+        "fail_closed": {
+          "const": true,
+          "type": "boolean"
+        },
+        "mode": {
+          "enum": [
+            "personal",
+            "enterprise",
+            "research_testbed",
+            "agent"
+          ],
+          "type": "string"
+        },
+        "name": {
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "name",
+        "fail_closed",
+        "mode"
+      ],
+      "type": "object"
+    },
+    "version": {
+      "const": 5,
+      "type": "integer"
+    }
+  },
+  "required": [
+    "version",
+    "policy",
+    "runtime",
+    "interop",
+    "system",
+    "core",
+    "locator_plane",
+    "projective_connection_hypercube",
+    "hypertorus",
+    "bcik",
+    "capabilities",
+    "privacy",
+    "replay",
+    "ledger",
+    "dissolution",
+    "routing",
+    "ingress"
+  ],
+  "title": "ScorpioSync Kaleidoscorp Config",
+  "type": "object"
+}

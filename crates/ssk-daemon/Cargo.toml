@@ -47,6 +47,18 @@ ssk-netd-helper = { path = "../ssk-netd-helper", version = "0.1.0" }
 ssk-diag = { path = "../ssk-diag", version = "0.1.0" }
 serde.workspace = true
 serde_json.workspace = true
+# The hash chain of the ingress flow ledger (`ingress/audit/record.rs`): the same
+# crate and major `ssk-types` and `ssk-netadmin` already use for the activation
+# ledger, so the workspace gains no hashing dependency.
+blake3.workspace = true
+# The operating system's random source: the per-command anti-replay nonces of the
+# privileged broker's protocol (a predictable nonce is one an attacker can burn
+# ahead of a legitimate client, `killswitch.rs`) and the key of the ingress ledger's
+# `hashed` destinations (`ingress/audit/dest.rs`). Same crate and major as
+# `ssk-diag`, `ssk-cli` and `ssk-winhost` -- no fourth `getrandom` major, no new
+# FFI here (this crate stays `forbid(unsafe_code)`). It was a Windows-only
+# dependency until the destination key needed it on every platform.
+getrandom = "0.3"
 thiserror.workspace = true
 tracing.workspace = true
 tokio = { version = "1", features = [
@@ -63,7 +75,13 @@ tokio = { version = "1", features = [
 # `flock` for the daemon lock. Same crate and version `ssk-ipc` already carries
 # for its peer-credential check; only the `fs` feature is new. A kernel-held
 # lock is released on `SIGKILL`, which a `create_new` lock file is not.
-rustix = { version = "0.38", default-features = false, features = ["fs"] }
+# `std` is required: without it rustix uses its own no_std `AsFd` polyfill and
+# `std::fs::File` does not implement it, so `flock(&file, ..)` in `lock.rs`
+# fails to compile (E0277) on Linux.
+#
+# `process` is `getrlimit` for the ingress descriptor budget (`ingress/budget.rs`):
+# the safe API, so `unsafe_code = "forbid"` holds. The limit is read, never raised.
+rustix = { version = "0.38", default-features = false, features = ["fs", "std", "process"] }
 
 [target.'cfg(windows)'.dependencies]
 # The composition root's Windows half. `ssk_ipc::server::serve_named_pipe`
@@ -83,16 +101,19 @@ ssk-winhost = { path = "../ssk-winhost", version = "0.1.0" }
 # what `killswitch::PrivilegedPipeStatus` dials — and, critically, the thing that
 # verifies the endpoint is owned by `S-1-5-18` before the first frame. Without
 # that check a squatter on the fixed pipe name could answer a forged "engaged".
-# `getrandom` supplies the per-command anti-replay nonces the broker's protocol
-# requires; a predictable nonce is one an attacker can burn ahead of a legitimate
-# client. Same crate and major `ssk-winhost` already carries — no fourth
-# `getrandom` major, no new FFI here (this crate stays `forbid(unsafe_code)`).
-getrandom = "0.3"
 
 [dev-dependencies]
 ssk-desktop-client = { path = "../ssk-desktop-client", version = "0.1.0" }
 tempfile.workspace = true
 serde_yaml.workspace = true
+proptest.workspace = true
+# Paused time for the pump and limiter tests: an idle timeout of 30 s is
+# asserted to the millisecond without waiting 30 s.
+tokio = { version = "1", features = ["test-util"] }
+# `tests/ui_receipts.rs`: the receipts of the flow ledger cannot be made, cloned or
+# imitated from outside the module that issues them. A compile-fail snapshot pins
+# the exact error; a `compile_fail` doctest would pass for any compile error.
+trybuild = "1"
 # `tests/kill_switch_status.rs` drives a REAL `ssk_netd_helper::Broker` behind a
 # real `PrivilegedServer` over an in-memory `FrameTransport` pair. Building that
 # broker needs its actuation manifest and its `(principal, verb)` table.

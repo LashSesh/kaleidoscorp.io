@@ -17,7 +17,12 @@ rustls-pki-types = "1"
 rustls-native-certs = "0.8"
 
 [dev-dependencies]
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "io-util"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "io-util", "test-util"] }
+# Test only: reads `SO_BINDTODEVICE` back from a dialled socket (`direct.rs`
+# tests, CO-1 of docs/M2_LOCAL_INGRESS_DESIGN.md 24.2.1). Already in the
+# lockfile through tokio; a dev edge does not enter the allow-list of
+# `dial_path_binds_nothing_static`, which lists what ships.
+socket2 = { version = "0.6", features = ["all"] }
 
 [lints]
 workspace = true

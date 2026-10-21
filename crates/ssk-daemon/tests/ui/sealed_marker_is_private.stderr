@@ -1,0 +1,13 @@
+error[E0603]: module `sealed` is private
+ --> tests/ui/sealed_marker_is_private.rs:3:33
+  |
+3 | use ssk_daemon::ingress::types::sealed::Sealed;
+  |                                 ^^^^^^  ------ trait `Sealed` is not publicly re-exported
+  |                                 |
+  |                                 private module
+  |
+note: the module `sealed` is defined here
+ --> src/ingress/types.rs
+  |
+  | pub(crate) mod sealed {
+  | ^^^^^^^^^^^^^^^^^^^^^

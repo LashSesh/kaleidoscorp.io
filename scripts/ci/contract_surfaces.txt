@@ -1,0 +1,22 @@
+# Contract surfaces guarded by scripts/ci/contract_guard.sh.
+#
+# One surface per line: <label> TAB <extended regex over repository-relative paths>.
+# The regex is matched against `git diff --name-only --no-renames` output, so a
+# deleted file and both ends of a move count. A change to any matching path needs
+# a docs/COMPATIBILITY_MATRIX.md change in the same range, or a commit message line
+# "Compat-Impact: none (<reason of at least 8 characters>)".
+#
+# These are the places where a byte or a key that a user, an older build, or a
+# persisted file depends on is defined. Add a row when a new such place appears.
+# scripts/ci/tests/contract_guard.test.sh pins the table: it lists a path for each
+# alternative of each regex that must fire and near misses that must not, so an
+# edit that drops an alternative, loosens an anchor or widens a group fails there.
+# It checks mechanically only that every row has both kinds of path; the paths for
+# a new row, or for a new alternative of an existing one, are added there by hand.
+config	^crates/ssk-config/(src|tests/golden)/
+ipc-wire	^crates/ssk-ipc/(src/|tests/wire_|tests/golden/)
+activation-ledger-and-wire-types	^crates/ssk-netadmin/src/(audit|route|policy|adapter)\.rs$
+ingress-ledger	^crates/ssk-daemon/src/ingress/audit/
+ui-contract	^crates/ssk-ui-contract/src/
+interop	^crates/ssk-interop/src/lib\.rs$
+interop-spec	^docs/INTEROP_SPEC\.md$

@@ -4370,7 +4370,10 @@ fn config_command(command: &ConfigCommand, json: bool) -> Result<(), AppError> {
                 );
             } else if report.ok {
                 if let Some(from) = report.migrated_from {
-                    println!("config-ok (migrated from v{from} to v2)");
+                    println!(
+                        "config-ok (migrated from v{from} to v{})",
+                        ssk_config::CURRENT_CONFIG_VERSION
+                    );
                 } else {
                     println!("config-ok");
                 }

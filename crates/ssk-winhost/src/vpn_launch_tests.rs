@@ -567,16 +567,32 @@ fn broker_worker_drives_real_held_child_with_locked_durable_intent_and_stop() {
 
 #[test]
 fn service_shutdown_cancels_real_child_during_management_startup_and_removes_secrets() {
-    use ssk_netd_helper::vpn;
+    use ssk_netd_helper::vpn::{
+        self,
+        journal::{Kind, Store},
+    };
     let (mut service, path, keep) = fixture_broker("never-connect");
     let b = service.broker();
     b.handle(&fixture_peer(), fixture_request(vpn::Verb::Prepare, 1, 1));
-    let deadline = Instant::now() + Duration::from_secs(3);
-    while fs::read_dir(&path).unwrap().count() < 3 {
-        assert!(Instant::now() < deadline);
+    // Wait until the child EXISTS, not for a guess about elapsed time: the run files
+    // appear before the process is created, so on a loaded machine a fixed sleep let the
+    // shutdown arrive first. That path is correct too (no process, nothing to confirm, so
+    // `exit_confirmed` is None) but it is not the one under test. `ProcessCreated` is durable
+    // before the child is resumed; the journal is read through a separate read-only handle.
+    let journal = path.join("openvpn-control.journal");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let created = fs::File::open(&journal)
+            .ok()
+            .and_then(|file| crate::vpn_service::FileJournal { file }.load().ok())
+            .is_some_and(|records| records.iter().any(|r| r.event.kind == Kind::ProcessCreated));
+        if created {
+            break;
+        }
+        assert!(Instant::now() < deadline, "the child was never created");
         thread::sleep(Duration::from_millis(10));
     }
-    // Let the contained fixture enter its wait loop; all startup phases accept cancellation.
+    // Let the contained fixture reach its wait loop; every startup phase accepts cancellation.
     thread::sleep(Duration::from_millis(100));
     service.request_shutdown();
     let stopped = service.shutdown();

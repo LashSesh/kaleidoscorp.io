@@ -40,8 +40,9 @@ pub enum AuditOutcome {
     /// Reserved: the kill switch was armed and blocked egress. Not yet
     /// produced until `ssk-netcore`/`ssk-daemon` ship (Phase 3/4).
     KillSwitchBlocked,
-    /// Reserved: a `RouteKind::Fallback` route executed its fallback branch.
-    /// Not yet produced until `ssk-netcore` ships (Phase 3).
+    /// Never produced: `RouteKind::Fallback` is not executable (the executor refuses
+    /// it without dialling), so no fallback branch can ever have been dispatched.
+    /// Kept because removing a variant would change this serialised audit type.
     FallbackDispatched,
 }
 
@@ -68,7 +69,14 @@ pub struct ForensicEntry {
     pub entry_hash: String,
 }
 
-fn summarise_route(route: &RouteKind) -> String {
+/// The text that [`ForensicEntry::route_kind_summary`] stores for a route.
+///
+/// Public so another crate that records a route can write the same text the
+/// activation ledger does. It names adapters and nothing else: a hop's
+/// address, port and `auth` never appear, because the text is persisted in the
+/// audit file and returned over IPC. It is hashed into the chain, so a change
+/// to its format is a change to the ledger format.
+pub fn summarise_route(route: &RouteKind) -> String {
     match route {
         RouteKind::OpenVpn {
             adapter_id,

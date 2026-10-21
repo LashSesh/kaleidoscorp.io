@@ -168,10 +168,57 @@ pub struct DaemonLock {
     _file: File,
 }
 
+/// Proof that this process held the daemon lock when the proof was made. A
+/// zero-sized `Copy` token that only [`DaemonLock::proof`] can mint, because the
+/// flow ledger's writer has to run on a blocking thread (`spawn_blocking` needs
+/// `'static`, and a borrowed `&DaemonLock` cannot move into it) and still has to
+/// show that the single-writer lock is held. It outlives the borrow, not the
+/// lock: the daemon gives the lock up only by exiting
+/// ([`DaemonLock::hold_until_exit`]), so a proof is never stale in a running
+/// `sskd`.
+#[derive(Debug, Clone, Copy)]
+pub struct LockProof {
+    _private: (),
+}
+
+impl LockProof {
+    /// For tests that open a writer without a real lock.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) const fn for_tests() -> Self {
+        Self { _private: () }
+    }
+}
+
 impl DaemonLock {
     #[must_use]
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// See [`LockProof`].
+    #[must_use]
+    pub const fn proof(&self) -> LockProof {
+        LockProof { _private: () }
+    }
+
+    /// Keep the lock until the process ends, when the kernel releases it.
+    ///
+    /// This is how `sskd` gives the lock up, in place of dropping it after its
+    /// runtime has been told to stop. `Runtime::shutdown_timeout` returns `()`
+    /// when it times out, and then "spawned work that did not stop in time and
+    /// threads running it are leaked ... the work continues to run": a blocking
+    /// task (name resolution, a ledger open or verification) or the audit
+    /// writer's thread can still write after the call. The lock is the only
+    /// thing that keeps a second daemon away from the one hash-chained ledger,
+    /// so it must not be released while any such thread can exist. Only the end
+    /// of the process ends them all. The cost is that a restart waits for the
+    /// old process to exit, which is what `--lock-wait` is for.
+    ///
+    /// Not a leak in any sense that matters: one open file, for the rest of a
+    /// process that is about to end.
+    pub fn hold_until_exit(self) {
+        std::mem::forget(self);
     }
 }
 
@@ -385,6 +432,45 @@ mod tests {
         let _held = acquire(&path, &info, Duration::ZERO).expect("first acquire");
         let err = acquire(&path, &info, Duration::ZERO)
             .expect_err("a second daemon against one state dir must be refused");
+        assert_eq!(err.code(), "DAEMON_ALREADY_RUNNING", "{err}");
+    }
+
+    #[test]
+    fn a_proof_is_a_copyable_token_of_a_held_lock_that_can_leave_the_borrow() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("sskd.lock");
+        let held = acquire(&path, &info_for(dir.path()), Duration::ZERO).expect("acquire");
+        let proof = held.proof();
+        let copy = proof;
+        // It is `'static`, `Send` and `Copy`: what a `spawn_blocking` closure needs.
+        fn moves_into_a_thread<T: Copy + Send + 'static>(token: T) {
+            std::thread::spawn(move || {
+                let _ = token;
+            })
+            .join()
+            .expect("joined");
+        }
+        moves_into_a_thread(proof);
+        moves_into_a_thread(copy);
+        assert_eq!(std::mem::size_of::<LockProof>(), 0, "zero-sized");
+        // While the lock is held, nobody else can get one.
+        assert!(acquire(&path, &info_for(dir.path()), Duration::ZERO).is_err());
+    }
+
+    #[test]
+    fn the_lock_is_still_held_after_hold_until_exit() {
+        // `hold_until_exit` consumes the lock and never drops it, so a second
+        // acquisition in the same process (a new open file description, which
+        // `flock` and the Windows share mode both arbitrate) is still refused.
+        // The handle stays open until this test process ends.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("sskd.lock");
+        let info = info_for(dir.path());
+        acquire(&path, &info, Duration::ZERO)
+            .expect("first acquire")
+            .hold_until_exit();
+        let err = acquire(&path, &info, Duration::ZERO)
+            .expect_err("a lock held until exit must not be acquirable again");
         assert_eq!(err.code(), "DAEMON_ALREADY_RUNNING", "{err}");
     }
 

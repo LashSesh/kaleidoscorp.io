@@ -48,6 +48,15 @@ impl StateMachine {
     pub fn subscribe(&self) -> broadcast::Receiver<Event> {
         self.events.subscribe()
     }
+
+    /// A second handle on this state machine's event bus. Every clone of a
+    /// `Sender` feeds every receiver, and `send` and `subscribe` take `&self`,
+    /// so a holder can publish and subscribe without owning or locking the
+    /// state machine; the supervisor keeps one outside the mutex around it.
+    #[must_use]
+    pub fn event_sender(&self) -> broadcast::Sender<Event> {
+        self.events.clone()
+    }
 }
 
 impl Default for StateMachine {

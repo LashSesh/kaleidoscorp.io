@@ -9,15 +9,28 @@ use serde::{Deserialize, Serialize};
 /// Defined here rather than in `ssk-daemon` so both `ssk-cli` and a future
 /// `ssk-tauri-bridge` can share this wire type without depending on the
 /// daemon binary crate (`ssk-daemon` depends on `ssk-ipc`, never the reverse).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// `Default` is `Inactive`, the state of a daemon that has done nothing; it lets
+/// `StatusDto` derive `Default`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DaemonState {
     /// Protection off, daemon idle.
+    #[default]
     Inactive,
     /// Bringing protection up.
     Activating,
     /// Protection on, routing engaged.
     Active,
-    /// Active and verified (route + DNS covered).
+    /// The daemon holds ONE open egress session that an activation
+    /// established through the profile's route to the requested destination,
+    /// and whose audit result is durable. It says nothing wider: it is not
+    /// system-wide coverage (other traffic on the machine is neither captured
+    /// nor routed by it, and the kill switch is a separate mechanism reported
+    /// in `StatusDto::kill_switch`), and it is not verified DNS
+    /// (`StatusDto::dns_protected` can be `false` here, e.g. for a hostname
+    /// destination reached without a DNS-override adapter). The session is
+    /// not monitored after activation, so this is the state at the moment it
+    /// was established, not a liveness guarantee.
     Protected,
     /// Active but a non-fatal issue reduced protection.
     Degraded,

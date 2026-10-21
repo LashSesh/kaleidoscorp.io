@@ -35,6 +35,14 @@ pub trait DataPlane: Send + Sync {
         &'a self,
         admission: AdmissionToken,
     ) -> BoxFuture<'a, Result<EgressSession, NetcoreError>>;
+
+    /// Whether this data plane checks every address a `Direct` host name
+    /// resolved to before dialling it. A caller that must not hand a client's
+    /// name to an unchecked dial asks first. A data plane that cannot say (a
+    /// test double, a plane that never resolves names itself) answers `false`.
+    fn guards_direct_names(&self) -> bool {
+        false
+    }
 }
 
 /// The production `DataPlane`: every probe/connect is a real `RouteExecutor`
@@ -68,5 +76,9 @@ impl DataPlane for NetcoreDataPlane {
                 .connect(admission.route(), admission.target())
                 .await
         })
+    }
+
+    fn guards_direct_names(&self) -> bool {
+        self.executor.has_direct_guard()
     }
 }

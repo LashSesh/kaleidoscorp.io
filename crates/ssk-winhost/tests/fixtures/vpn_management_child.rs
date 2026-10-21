@@ -31,15 +31,24 @@ fn main() {
     if received != secret { process::exit(6); }
     if mode == "reject-auth" { peer.get_mut().write_all(b"ERROR: bad password\n").unwrap(); thread::sleep(Duration::from_secs(5)); return; }
     peer.get_mut().write_all(b"SUCCESS: password is correct\n>HOLD:Waiting for hold release:0\n").unwrap();
+    let mut stop_ignored = false;
     loop {
-        received.clear(); if peer.read_line(&mut received).unwrap_or(0) == 0 { return; }
+        received.clear();
+        if peer.read_line(&mut received).unwrap_or(0) == 0 {
+            // A process that ignores the stop signal does not exit because its management
+            // peer went away; only OS termination may end it. Exiting on EOF here raced the
+            // controller's terminate (it closes the channel first) and could win under load
+            // with a clean exit code 0, which is not the scenario `ignore-stop` stands for.
+            if stop_ignored { thread::sleep(Duration::from_secs(5)); }
+            return;
+        }
         match received.as_str() {
             "pid\n" => { let pid = process::id() + u32::from(mode == "wrong-pid"); writeln!(peer.get_mut(), "SUCCESS: pid={pid}").unwrap(); }
             "state on\n" => {
                 peer.get_mut().write_all(b"SUCCESS: real-time state notification set to ON\n").unwrap();
                 if mode == "false-connected" { peer.get_mut().write_all(b">STATE:1,CONNECTED,SUCCESS,10.0.0.2\n").unwrap(); }
             }
-            "signal SIGTERM\n" => { peer.get_mut().write_all(b"SUCCESS: signal SIGTERM thrown\n").unwrap(); if mode != "ignore-stop" { return; } }
+            "signal SIGTERM\n" => { peer.get_mut().write_all(b"SUCCESS: signal SIGTERM thrown\n").unwrap(); if mode != "ignore-stop" { return; } stop_ignored = true; }
             // Receiving release in this fixture is a test failure, never a fake tunnel.
             _ => process::exit(99),
         }

@@ -18,7 +18,27 @@ routing:
     transport:
       kind: open_vpn
       profile_id: company-managed
-version: 4
+ingress:
+  enabled: false
+  listen:
+    address: 127.0.0.1
+    port: 10800
+  protocols:
+  - socks5
+  hardening: required
+  arm_on_start: false
+  direct_address_families: ipv4_only
+  limits:
+    max_connections: 256
+    accept_rate_per_s: 50
+    handshake_timeout_ms: 10000
+    connect_timeout_ms: 20000
+    idle_timeout_ms: 3600000
+  audit:
+    segment_mib: 32
+    retain_segments: 8
+    destination_logging: plain
+version: 5
 policy:
   name: default-fail-closed
   fail_closed: true

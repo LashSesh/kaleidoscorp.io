@@ -142,6 +142,51 @@ impl Layout {
     pub fn crash_dir(&self) -> PathBuf {
         self.root.join("crash")
     }
+
+    /// The directory of the local ingress's flow ledger (mode 0700, made by the
+    /// ledger store itself, never by a `create_dir_all`). The name is the one the
+    /// store uses: a test keeps the two together.
+    #[must_use]
+    pub fn flow_audit_dir(&self) -> PathBuf {
+        self.root.join("ingress-audit")
+    }
+
+    /// The key of `destination_logging: hashed` (mode 0600). Outside the ledger
+    /// directory on purpose: the ledger can be copied or purged without the key
+    /// going with it, and the key can be forgotten without touching the ledger.
+    #[must_use]
+    pub fn dest_key_path(&self) -> PathBuf {
+        self.root.join("ingress-dest.key")
+    }
+}
+
+/// Creates the state root if it is missing, private to the user (mode 0700 on
+/// Unix, whatever the umask), and leaves an existing one exactly as it is.
+///
+/// `create_dir_all` takes the mode from the umask: 0755 under 022 but 0775 under
+/// 002, which is what Debian and Ubuntu give a user with a private group. A root
+/// that is group-writable is refused by the ledger store, so the daemon must not
+/// make one. An existing root is never touched here: changing the mode of a
+/// directory that the user may have shared on purpose is not this function's
+/// decision (the store refuses it and says what to do, design 6.4.9).
+///
+/// # Errors
+/// Whatever creating the directory returns.
+pub fn ensure_state_root(root: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(root)
+    }
+    #[cfg(not(unix))]
+    {
+        // The ACL of a Windows state root is `C-WIN3`'s; until then the ledger
+        // store refuses to open there at all.
+        std::fs::create_dir_all(root)
+    }
 }
 
 /// The endpoint this build will actually bind.
@@ -284,6 +329,77 @@ mod tests {
         assert_eq!(layout.audit_path(), root.join("audit.json"));
         assert_eq!(layout.logs_dir(), root.join("logs"));
         assert_eq!(layout.crash_dir(), root.join("crash"));
+        assert_eq!(layout.flow_audit_dir(), root.join("ingress-audit"));
+        assert_eq!(layout.dest_key_path(), root.join("ingress-dest.key"));
+    }
+
+    /// The store derives its directory name on its own; if the two ever drift the
+    /// doctor would look in one place and the ledger would write in another.
+    #[test]
+    fn the_ledger_directory_name_is_the_one_the_store_uses() {
+        let layout = Layout::at(std::env::temp_dir().join("ssk-layout-store"));
+        assert_eq!(
+            layout.flow_audit_dir(),
+            layout.root().join(crate::ingress::audit::fs::LEDGER_DIR)
+        );
+    }
+
+    /// Same for the key file: the store writes `KEY_FILE_NAME`, and the doctor and
+    /// the CLI look where `Layout` says.
+    #[test]
+    fn the_key_file_name_is_the_one_the_store_uses() {
+        let layout = Layout::at(std::env::temp_dir().join("ssk-layout-key-name"));
+        assert_eq!(
+            layout.dest_key_path(),
+            layout.root().join(crate::ingress::audit::fs::KEY_FILE_NAME)
+        );
+    }
+
+    /// The key is a sibling of the ledger directory, not a file in it: a segment
+    /// listing must never meet it, and purging the ledger must not remove it.
+    #[test]
+    fn the_destination_key_is_outside_the_ledger_directory() {
+        let layout = Layout::at(std::env::temp_dir().join("ssk-layout-key"));
+        assert!(!layout.dest_key_path().starts_with(layout.flow_audit_dir()));
+        assert_eq!(layout.dest_key_path().parent(), Some(layout.root()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_missing_state_root_is_made_private_and_an_existing_one_is_left_alone() {
+        use std::os::unix::fs::PermissionsExt;
+        let holder = tempfile::tempdir().expect("tempdir");
+        let root = holder.path().join("a").join("b").join("state");
+        ensure_state_root(&root).expect("creates the missing chain");
+        for dir in [
+            &root,
+            &holder.path().join("a").join("b"),
+            &holder.path().join("a"),
+        ] {
+            let mode = std::fs::metadata(dir)
+                .expect("metadata")
+                .permissions()
+                .mode()
+                & 0o7777;
+            assert_eq!(mode, 0o700, "{}", dir.display());
+        }
+        // An existing root is not touched, whatever its mode.
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o775)).expect("chmod");
+        ensure_state_root(&root).expect("existing is fine");
+        let mode = std::fs::metadata(&root)
+            .expect("metadata")
+            .permissions()
+            .mode()
+            & 0o7777;
+        assert_eq!(mode, 0o775, "never repaired");
+        // A root that is a symlink to a directory is accepted as it is.
+        let link = holder.path().join("link");
+        std::os::unix::fs::symlink(&root, &link).expect("symlink");
+        ensure_state_root(&link).expect("a symlink to a directory is an existing root");
+        // A file in the way is an error, not a replacement.
+        let file = holder.path().join("file");
+        std::fs::write(&file, b"x").expect("write");
+        assert!(ensure_state_root(&file).is_err());
     }
 
     #[test]

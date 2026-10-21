@@ -11,6 +11,7 @@ fn status(state: DaemonState) -> StatusDto {
         audit_head: Some("claimed-head".into()),
         version: "0.1.0".into(),
         last_error: None,
+        ..Default::default()
     }
 }
 
@@ -34,6 +35,33 @@ fn reported_states_never_promote_daemon_claims_to_protection() {
         assert!(value.get("kill_switch").is_none());
         assert!(value.get("audit").is_none());
         assert!(value.get("connections").is_none());
+    }
+}
+
+/// The v2 contract projects only the fields it knows (design 11.3). A daemon
+/// that announces protocol 1 and answers an ingress block is read exactly as
+/// one that does not, and nothing of the block reaches the webview until the
+/// v3 contract replaces this one.
+#[test]
+fn a_daemon_that_reports_an_ingress_block_is_read_as_before() {
+    let plain = status(DaemonState::Inactive);
+    let mut announcing = status(DaemonState::Inactive);
+    announcing.protocol = ssk_ipc::IPC_PROTOCOL_VERSION;
+    announcing.ingress = Some(ssk_ipc::IngressStatusDto {
+        state: "armed".into(),
+        coverage: "proxy_clients_only".into(),
+        armed_profile: Some("office".into()),
+        ..Default::default()
+    });
+    let plain = serde_json::to_value(project_status(plain).unwrap()).unwrap();
+    let announcing = serde_json::to_value(project_status(announcing).unwrap()).unwrap();
+    assert_eq!(plain, announcing);
+    let text = announcing.to_string();
+    for word in ["ingress", "proxy_clients_only", "armed", "protocol"] {
+        assert!(
+            !text.contains(word),
+            "`{word}` reached the v2 snapshot: {text}"
+        );
     }
 }
 

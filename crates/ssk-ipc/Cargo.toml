@@ -32,6 +32,10 @@ rustix = { version = "0.38", default-features = false, features = ["process"] }
 
 [dev-dependencies]
 tempfile.workspace = true
+# `start_paused` for the accept-loop tests, so the 55 s of back-off is virtual
+# time. Test-only, and the feature adds no crate (`ssk-desktop-client` already
+# enables it the same way).
+tokio = { version = "1", features = ["test-util"] }
 
 [lints]
 workspace = true
